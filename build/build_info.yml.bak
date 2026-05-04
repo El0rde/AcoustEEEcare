@@ -1,0 +1,4 @@
+west:
+  command: D:\zephyrdev\.venv\Scripts\west build -b xiao_ble/nrf52840/sense -p
+  topdir: D:\zephyrdev
+  version: 1.5.0

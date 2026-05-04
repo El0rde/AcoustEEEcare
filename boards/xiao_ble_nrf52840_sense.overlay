@@ -1,0 +1,26 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * v5.3: Removed &adc { status = "okay" } node.
+ * When CONFIG_ADC=n, the Zephyr ADC driver is not compiled and the
+ * devicetree node has no driver to bind to.  Enabling it caused a
+ * spurious Zephyr DTS warning and is unnecessary — nrfx_saadc accesses
+ * the SAADC peripheral directly without the Zephyr ADC subsystem.
+ */
+
+&xiao_spi {
+    status = "okay";
+    cs-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
+
+    sdhc0: sdhc@0 {
+        compatible = "zephyr,sdhc-spi-slot";
+        reg = <0>;
+        status = "okay";
+        spi-max-frequency = <10000000>;
+        mmc {
+            compatible = "zephyr,sdmmc-disk";
+            disk-name = "SD";
+            status = "okay";
+        };
+    };
+};

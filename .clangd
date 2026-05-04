@@ -1,0 +1,7 @@
+CompileFlags:
+  CompilationDatabase: ../build
+  Remove:
+    - -fno-printf-return-value
+    - -mfp16-format*
+    - -fno-reorder-functions
+    - -mabi=aapcs

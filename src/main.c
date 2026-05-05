@@ -4,13 +4,6 @@
  * v6.6 — Fixed Zephyr FS API usage (fat_fs type, fs_data pointer)
  *
  * CHANGES FROM v6.5:
- *   Fixed init_sd_card():
- *     mp.fs_data = &FS_FATFS  →  mp.fs_data = &fat_fs
- *     FS_FATFS is an enum/integer type ID — assigning its address to
- *     fs_data is a silent bug that causes fs_mount() to corrupt memory
- *     or hard-fault. fat_fs is the FATFS work-area struct that ELM
- *     FatFs actually needs.
- *
  *   Added #include <ff.h> back under USE_SD (was removed in v6.5).
  *     Zephyr's own shell.c (subsys/fs/shell.c) includes <ff.h> when
  *     CONFIG_FAT_FILESYSTEM_ELM is set.  The FATFS typedef lives in
@@ -52,7 +45,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
+// #include <math.h>
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -69,7 +62,7 @@
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/sys/byteorder.h>
 #include "zephyr/kernel/thread_stack.h"
-#include "zephyr/sys/time_units.h"
+// #include "zephyr/sys/time_units.h"
 
 #include <nrfx.h>
 #include <drivers/nrfx_errors.h>
@@ -165,7 +158,7 @@ static void ble_tx_thread_fn(void *a, void *b, void *c);
  * ══════════════════════════════════════════════════════════════════ */
 #if USE_SD
 
-#define AUDIO_FILE_PATH      "/SD:/audio.pcm"
+#define AUDIO_FILE_PATH      "/SD:/analog.pcm"
 #define SD_CARD_MOUNT_POINT  "/SD:"
 #define CHECKSUM_SIZE        sizeof(uint32_t)
 
@@ -740,7 +733,7 @@ static void on_mfcc_frame(int frame_idx, const float *coeffs)
  * RECORD AND STREAM
  *
  * USE_SD true:
- *   1. Open /SD:/audio.pcm
+ *   1. Open /SD:/analog.pcm
  *   2. Give sd_data_sem ONCE to wake the SD writer thread
  *   3. SAADC runs — ISR fills both sd_ring and audio_ring in parallel
  *   4. BLE TX thread streams audio live over NUS

@@ -8995,3 +8995,238 @@ events:
         - "C:\\Users\\JM\\AppData\\Local\\GitHubDesktop\\bin"
         - "C:\\Users\\JM\\AppData\\Local\\Programs\\Microsoft VS Code\\bin"
         - "C:\\Users\\JM\\AppData\\Roaming\\Python\\Python311\\Scripts"
+
+---
+events:
+  -
+    kind: "find_package-v1"
+    backtrace:
+      - "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/zephyr_package_search.cmake:73 (find_package)"
+      - "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/ZephyrConfigVersion.cmake:118 (check_zephyr_package)"
+      - "CMakeLists.txt:5 (find_package)"
+    name: "Zephyr"
+    configs:
+      -
+        filename: "Zephyr.cps"
+        kind: "cps"
+      -
+        filename: "zephyr.cps"
+        kind: "cps"
+      -
+        filename: "ZephyrConfig.cmake"
+        kind: "cmake"
+      -
+        filename: "zephyr-config.cmake"
+        kind: "cmake"
+    version_request:
+      version: "0.0.0"
+      version_complete: "0.0.0"
+      exact: true
+    settings:
+      required: "optional"
+      quiet: true
+      global: false
+      policy_scope: true
+      bypass_provider: false
+      names:
+        - "Zephyr"
+      search_paths:
+        - "C:/Users/JM/zephyrproject/zephyr"
+        - "C:/Users/JM/zephyrproject"
+      path_suffixes:
+        - ""
+      paths:
+        CMAKE_FIND_USE_CMAKE_PATH: false
+        CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+        CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+        CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+        CMAKE_FIND_USE_INSTALL_PREFIX: true
+        CMAKE_FIND_USE_PACKAGE_ROOT_PATH: true
+        CMAKE_FIND_USE_CMAKE_PACKAGE_REGISTRY: true
+        CMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY: true
+        CMAKE_FIND_ROOT_PATH_MODE: "BOTH"
+    candidates:
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/lib/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/lib/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/share/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/acousteeecare/build/CMakeFiles/pkgRedirects/share/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/lib/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/lib/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "insufficient_version"
+        message: "The version found is not compatible with the version requested."
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/lib/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/lib/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/share/cps/Zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/share/cps/zephyr.cps"
+        mode: "cps"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyrunittest-package/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/ZephyrConfig.cmake"
+        mode: "config"
+        reason: "insufficient_version"
+        message: "The version found is not compatible with the version requested."
+      -
+        path: "C:/Users/JM/zephyrproject/zephyr/share/zephyr-package/cmake/zephyr-config.cmake"
+        mode: "config"
+        reason: "no_exist"
+    found: null
+    search_context:
+      ENV{PATH}:
+        - "C:\\WINDOWS\\system32"
+        - "C:\\WINDOWS"
+        - "C:\\WINDOWS\\System32\\Wbem"
+        - "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\"
+        - "C:\\WINDOWS\\System32\\OpenSSH\\"
+        - "C:\\Program Files\\CMake\\bin"
+        - "C:\\ProgramData\\chocolatey\\bin"
+        - "C:\\Program Files\\Git\\cmd"
+        - "C:\\Program Files\\PowerToys\\DSCModules\\"
+        - "C:\\Program Files\\PuTTY\\"
+        - "C:\\Program Files\\MATLAB\\R2026a\\bin"
+        - "C:\\Program Files\\dotnet\\"
+        - "C:\\Users\\JM\\.cargo\\bin"
+        - "C:\\Python311\\Scripts"
+        - "C:\\Python311"
+        - "C:\\Users\\JM\\AppData\\Local\\Microsoft\\WindowsApps"
+        - "C:\\Users\\JM\\AppData\\Local\\GitHubDesktop\\bin"
+        - "C:\\Users\\JM\\AppData\\Local\\Programs\\Microsoft VS Code\\bin"
+        - "C:\\Users\\JM\\AppData\\Roaming\\Python\\Python311\\Scripts"

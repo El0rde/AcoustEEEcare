@@ -60,6 +60,166 @@ REC_TIMEOUT  = 120.0
 SEND_TIMEOUT = 60.0
 
 
+# ── Packet / data-loss tracker ────────────────────────────────────────────────
+
+class PacketStats:
+    """
+    Accumulates per-stream packet and byte counts so we can print a
+    detailed loss report at the end of each session.
+
+    Terminology
+    -----------
+    received   — packets / bytes we actually saw arrive over BLE
+    expected   — what the firmware header said we should see
+    lost_pkts  — gap events we detected (estimated missing packets)
+    lost_bytes — bytes we zero-filled due to those gaps
+    overhead   — 4-byte seq+len header on every chunk (not payload)
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        # ── Audio ──────────────────────────────────────────────────
+        self.audio_pkts_rx    = 0   # packets actually received
+        self.audio_bytes_rx   = 0   # payload bytes actually received
+        self.audio_pkts_exp   = 0   # expected packet count (derived from expected_bytes / chunk_size)
+        self.audio_bytes_exp  = 0   # from START:<n>
+        self.audio_pkts_lost  = 0   # gap events (packets)
+        self.audio_bytes_lost = 0   # zero-fill bytes added
+        self.audio_overhead   = 0   # seq+len header bytes (4 per packet)
+
+        # ── MFCC ───────────────────────────────────────────────────
+        self.mfcc_pkts_rx     = 0
+        self.mfcc_bytes_rx    = 0
+        self.mfcc_pkts_exp    = 0   # = n_frames (one packet per frame)
+        self.mfcc_bytes_exp   = 0   # from MFCC_START header
+        self.mfcc_pkts_lost   = 0
+        self.mfcc_bytes_lost  = 0
+        self.mfcc_overhead    = 0
+
+        # ── Session-level BLE totals ───────────────────────────────
+        self.total_notifications = 0   # every handle_notification call
+        self.total_raw_bytes     = 0   # sum of len(data) for all notifications
+        self.session_start_time  = None
+        self.session_end_time    = None
+
+    def start_session(self):
+        self.session_start_time = time.monotonic()
+
+    def end_session(self):
+        self.session_end_time = time.monotonic()
+
+    @property
+    def session_duration(self):
+        if self.session_start_time and self.session_end_time:
+            return self.session_end_time - self.session_start_time
+        return 0.0
+
+    # ── Derived ───────────────────────────────────────────────────
+
+    @property
+    def audio_loss_pct(self):
+        if self.audio_pkts_exp == 0:
+            return 0.0
+        total = self.audio_pkts_rx + self.audio_pkts_lost
+        return self.audio_pkts_lost * 100.0 / max(total, 1)
+
+    @property
+    def mfcc_loss_pct(self):
+        if self.mfcc_pkts_exp == 0:
+            return 0.0
+        total = self.mfcc_pkts_rx + self.mfcc_pkts_lost
+        return self.mfcc_pkts_lost * 100.0 / max(total, 1)
+
+    @property
+    def audio_throughput_kbps(self):
+        dur = self.session_duration
+        if dur <= 0:
+            return 0.0
+        return (self.audio_bytes_rx * 8) / dur / 1000.0
+
+    @property
+    def mfcc_throughput_kbps(self):
+        dur = self.session_duration
+        if dur <= 0:
+            return 0.0
+        return (self.mfcc_bytes_rx * 8) / dur / 1000.0
+
+    # ── Report printer ────────────────────────────────────────────
+
+    def print_report(self):
+        dur = self.session_duration
+        sep = "━" * 58
+
+        print(f"\n{sep}")
+        print("  BLE SESSION STATISTICS")
+        print(sep)
+        print(f"  Duration              : {dur:.2f} s")
+        print(f"  Total notifications   : {self.total_notifications} pkts")
+        print(f"  Total raw BLE bytes   : {self.total_raw_bytes:,} B "
+              f"({self.total_raw_bytes / 1024:.1f} kB)")
+        print()
+
+        # ── Audio stream ──────────────────────────────────────────
+        print("  ── Audio stream ──────────────────────────────────")
+        _pct_rx = (self.audio_bytes_rx * 100 // max(self.audio_bytes_exp, 1))
+        print(f"  Packets received      : {self.audio_pkts_rx}")
+        print(f"  Packets lost (gaps)   : {self.audio_pkts_lost}"
+              f"  ({self.audio_loss_pct:.2f}% loss)")
+        print(f"  Payload bytes received: {self.audio_bytes_rx:,} B "
+              f"({self.audio_bytes_rx / 1024:.1f} kB)")
+        print(f"  Payload bytes expected: {self.audio_bytes_exp:,} B "
+              f"({self.audio_bytes_exp / 1024:.1f} kB)  → {_pct_rx}% received")
+        print(f"  Bytes lost / zero-pad : {self.audio_bytes_lost:,} B")
+        print(f"  Header overhead       : {self.audio_overhead:,} B "
+              f"(4 B × {self.audio_pkts_rx} pkts)")
+        print(f"  Throughput (payload)  : {self.audio_throughput_kbps:.1f} kbps")
+        print()
+
+        # ── MFCC stream ───────────────────────────────────────────
+        print("  ── MFCC stream ───────────────────────────────────")
+        _mpct_rx = (self.mfcc_bytes_rx * 100 // max(self.mfcc_bytes_exp, 1))
+        print(f"  Packets received      : {self.mfcc_pkts_rx}")
+        print(f"  Packets lost (gaps)   : {self.mfcc_pkts_lost}"
+              f"  ({self.mfcc_loss_pct:.2f}% loss)")
+        print(f"  Payload bytes received: {self.mfcc_bytes_rx:,} B "
+              f"({self.mfcc_bytes_rx / 1024:.1f} kB)")
+        print(f"  Payload bytes expected: {self.mfcc_bytes_exp:,} B "
+              f"({self.mfcc_bytes_exp / 1024:.1f} kB)  → {_mpct_rx}% received")
+        print(f"  Bytes lost / zero-pad : {self.mfcc_bytes_lost:,} B")
+        print(f"  Header overhead       : {self.mfcc_overhead:,} B "
+              f"(4 B × {self.mfcc_pkts_rx} pkts)")
+        print(f"  Throughput (payload)  : {self.mfcc_throughput_kbps:.1f} kbps")
+        print()
+
+        # ── Combined ──────────────────────────────────────────────
+        total_payload_rx  = self.audio_bytes_rx  + self.mfcc_bytes_rx
+        total_payload_exp = self.audio_bytes_exp + self.mfcc_bytes_exp
+        total_pkts_rx     = self.audio_pkts_rx   + self.mfcc_pkts_rx
+        total_pkts_lost   = self.audio_pkts_lost  + self.mfcc_pkts_lost
+        total_pkts_all    = total_pkts_rx + total_pkts_lost
+        total_overhead    = self.audio_overhead   + self.mfcc_overhead
+        combined_loss_pct = total_pkts_lost * 100.0 / max(total_pkts_all, 1)
+        combined_pct_rx   = total_payload_rx * 100 // max(total_payload_exp, 1)
+        combined_kbps     = (total_payload_rx * 8) / max(dur, 0.001) / 1000.0
+
+        print("  ── Combined ──────────────────────────────────────")
+        print(f"  Total packets rx      : {total_pkts_rx}")
+        print(f"  Total packets lost    : {total_pkts_lost}"
+              f"  ({combined_loss_pct:.2f}% loss)")
+        print(f"  Total payload rx      : {total_payload_rx:,} B "
+              f"({total_payload_rx / 1024:.1f} kB)")
+        print(f"  Total payload expected: {total_payload_exp:,} B "
+              f"({total_payload_exp / 1024:.1f} kB)  → {combined_pct_rx}% received")
+        print(f"  Total overhead        : {total_overhead:,} B")
+        print(f"  Effective throughput  : {combined_kbps:.1f} kbps")
+        print(sep)
+
+
+pstats = PacketStats()
+
+
 # ── Stream state machine ──────────────────────────────────────────────────────
 
 class StreamMode:
@@ -103,6 +263,10 @@ class State:
         # Progress display throttle
         self.last_progress   = 0.0
 
+        # Reset packet stats for the new session
+        pstats.reset()
+        pstats.start_session()
+
 
 state = State()
 
@@ -125,6 +289,10 @@ def _is_data_chunk(data: bytearray) -> bool:
 
 
 def handle_notification(_sender, data: bytearray):
+    # ── Session-level BLE accounting ──────────────────────────────
+    pstats.total_notifications += 1
+    pstats.total_raw_bytes     += len(data)
+
     if _is_data_chunk(data):
         if state.mode == StreamMode.AUDIO:
             _handle_audio_chunk(data)
@@ -151,13 +319,17 @@ def _handle_text(data: bytearray):
     elif text.startswith("START:"):
         try:
             n = int(text.split(":")[1])
-            state.expected_bytes = n
-            state.audio_samples  = bytearray()
-            state.audio_seq      = 0
-            state.audio_gaps     = 0
-            state.audio_chunks   = 0
-            state.audio_done     = False
-            state.mode           = StreamMode.AUDIO
+            state.expected_bytes        = n
+            state.audio_samples         = bytearray()
+            state.audio_seq             = 0
+            state.audio_gaps            = 0
+            state.audio_chunks          = 0
+            state.audio_done            = False
+            state.mode                  = StreamMode.AUDIO
+
+            # Packet stats
+            pstats.audio_bytes_exp      = n
+
             dur = n / 2 / SAMPLE_RATE
             print(f"\n  [AUDIO ] START — expecting {n} B "
                   f"({n // 2} samples, {dur:.1f} s)")
@@ -171,7 +343,9 @@ def _handle_text(data: bytearray):
         exp = state.expected_bytes
         pct = min(got * 100 // max(exp, 1), 100)
         print(f"\n  [AUDIO ] finished — {got}/{exp} B ({pct}%)"
-              f"  chunks={state.audio_chunks}  gaps={state.audio_gaps}")
+              f"  pkts_rx={pstats.audio_pkts_rx}"
+              f"  lost={pstats.audio_pkts_lost}"
+              f"  ({pstats.audio_loss_pct:.2f}% loss)")
         state.mode = StreamMode.IDLE
 
     # ── MFCC stream header ──
@@ -180,17 +354,23 @@ def _handle_text(data: bytearray):
             parts = text.split(":")
             nf    = int(parts[1])
             nc    = int(parts[2])
-            state.mfcc_n_frames   = nf
-            state.mfcc_n_coeffs   = nc
-            state.mfcc_expected_b = nf * nc * 4   # float32
-            state.mfcc_bytes      = bytearray()
-            state.mfcc_seq        = 0
-            state.mfcc_gaps       = 0
-            state.mfcc_chunks     = 0
-            state.mfcc_done       = False
-            state.mode            = StreamMode.MFCC
+            state.mfcc_n_frames         = nf
+            state.mfcc_n_coeffs         = nc
+            state.mfcc_expected_b       = nf * nc * 4   # float32
+            state.mfcc_bytes            = bytearray()
+            state.mfcc_seq              = 0
+            state.mfcc_gaps             = 0
+            state.mfcc_chunks           = 0
+            state.mfcc_done             = False
+            state.mode                  = StreamMode.MFCC
+
+            # Packet stats — one packet per MFCC frame
+            pstats.mfcc_pkts_exp        = nf
+            pstats.mfcc_bytes_exp       = nf * nc * 4
+
             print(f"\n  [MFCC  ] START — {nf} frames × {nc} coeffs "
-                  f"= {state.mfcc_expected_b} B")
+                  f"= {state.mfcc_expected_b} B  "
+                  f"(expecting {nf} pkts)")
         except (ValueError, IndexError):
             print(f"  [WARN  ] Malformed MFCC_START: {text!r}")
 
@@ -201,7 +381,9 @@ def _handle_text(data: bytearray):
         exp = state.mfcc_expected_b
         pct = min(got * 100 // max(exp, 1), 100)
         print(f"\n  [MFCC  ] MFCC_END — {got}/{exp} B ({pct}%)"
-              f"  chunks={state.mfcc_chunks}  gaps={state.mfcc_gaps}")
+              f"  pkts_rx={pstats.mfcc_pkts_rx}"
+              f"  lost={pstats.mfcc_pkts_lost}"
+              f"  ({pstats.mfcc_loss_pct:.2f}% loss)")
         state.mode = StreamMode.IDLE
 
     # ── Firmware error ──
@@ -224,14 +406,21 @@ def _handle_audio_chunk(data: bytearray):
     ln      = struct.unpack_from("<H", data, 2)[0]
     payload = data[4: 4 + ln]
 
+    # ── Packet-stats accounting ────────────────────────────────────
+    pstats.audio_pkts_rx  += 1
+    pstats.audio_bytes_rx += ln
+    pstats.audio_overhead += 4   # seq u16 + len u16
+
     if seq != state.audio_seq:
         gap_pkts  = (seq - state.audio_seq) & 0xFFFF
         gap_bytes = gap_pkts * ln
         print(f"\n  [GAP   ] audio seq {state.audio_seq}→{seq} "
-              f"({gap_pkts} missing, ~{gap_bytes} B zero-filled)")
+              f"({gap_pkts} pkt(s) missing, ~{gap_bytes} B zero-filled)")
         # Zero-fill the gap so the WAV timestamp stays correct
-        state.audio_samples += b"\x00\x00" * (gap_bytes // 2)
-        state.audio_gaps    += gap_pkts
+        state.audio_samples        += b"\x00\x00" * (gap_bytes // 2)
+        state.audio_gaps           += gap_pkts
+        pstats.audio_pkts_lost     += gap_pkts
+        pstats.audio_bytes_lost    += gap_bytes
 
     state.audio_samples += payload
     state.audio_seq      = (seq + 1) & 0xFFFF
@@ -244,12 +433,14 @@ def _print_audio_progress():
     if now - state.last_progress < 0.25:
         return
     state.last_progress = now
-    got = len(state.audio_samples)
-    exp = state.expected_bytes
-    pct = min(got * 100 // max(exp, 1), 100)
-    bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+    got  = len(state.audio_samples)
+    exp  = state.expected_bytes
+    pct  = min(got * 100 // max(exp, 1), 100)
+    bar  = "█" * (pct // 5) + "░" * (20 - pct // 5)
+    loss = pstats.audio_loss_pct
     print(f"\r  [{bar}] {pct:3d}%  {got:>7}/{exp} B  "
-          f"chunks={state.audio_chunks}  gaps={state.audio_gaps}",
+          f"pkts={pstats.audio_pkts_rx}  lost={pstats.audio_pkts_lost}"
+          f"  ({loss:.1f}% loss)",
           end="", flush=True)
 
 
@@ -260,13 +451,20 @@ def _handle_mfcc_chunk(data: bytearray):
     ln      = struct.unpack_from("<H", data, 2)[0]
     payload = data[4: 4 + ln]
 
+    # ── Packet-stats accounting ────────────────────────────────────
+    pstats.mfcc_pkts_rx  += 1
+    pstats.mfcc_bytes_rx += ln
+    pstats.mfcc_overhead += 4   # seq u16 + len u16
+
     if seq != state.mfcc_seq:
         gap_pkts  = (seq - state.mfcc_seq) & 0xFFFF
         gap_bytes = gap_pkts * ln
         print(f"\n  [GAP   ] MFCC seq {state.mfcc_seq}→{seq} "
-              f"({gap_pkts} missing, ~{gap_bytes} B zero-filled)")
-        state.mfcc_bytes += b"\x00" * gap_bytes
-        state.mfcc_gaps  += gap_pkts
+              f"({gap_pkts} pkt(s) missing, ~{gap_bytes} B zero-filled)")
+        state.mfcc_bytes         += b"\x00" * gap_bytes
+        state.mfcc_gaps          += gap_pkts
+        pstats.mfcc_pkts_lost    += gap_pkts
+        pstats.mfcc_bytes_lost   += gap_bytes
 
     state.mfcc_bytes += payload
     state.mfcc_seq    = (seq + 1) & 0xFFFF
@@ -275,12 +473,14 @@ def _handle_mfcc_chunk(data: bytearray):
     now = time.monotonic()
     if now - state.last_progress >= 0.25:
         state.last_progress = now
-        got = len(state.mfcc_bytes)
-        exp = state.mfcc_expected_b
-        pct = min(got * 100 // max(exp, 1), 100)
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        got  = len(state.mfcc_bytes)
+        exp  = state.mfcc_expected_b
+        pct  = min(got * 100 // max(exp, 1), 100)
+        bar  = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        loss = pstats.mfcc_loss_pct
         print(f"\r  [MFCC  ][{bar}] {pct:3d}%  {got:>7}/{exp} B  "
-              f"chunks={state.mfcc_chunks}  gaps={state.mfcc_gaps}",
+              f"pkts={pstats.mfcc_pkts_rx}  lost={pstats.mfcc_pkts_lost}"
+              f"  ({loss:.1f}% loss)",
               end="", flush=True)
 
 
@@ -372,6 +572,8 @@ async def _wait_for_completion(timeout: float, use_sd_mode: bool) -> bool:
 # ── Save session outputs ──────────────────────────────────────────────────────
 
 def _save_session(rec_num: int) -> None:
+    pstats.end_session()
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if state.audio_samples and state.expected_bytes > 0:
@@ -385,6 +587,9 @@ def _save_session(rec_num: int) -> None:
         save_mfcc(bytearray(state.mfcc_bytes), npy_fn)
     else:
         print("  [WARN  ] No MFCC data received — .npy not saved.")
+
+    # ── Print full packet / loss report ───────────────────────────
+    pstats.print_report()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -487,4 +692,3 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
-    

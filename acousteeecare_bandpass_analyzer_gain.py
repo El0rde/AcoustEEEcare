@@ -4,31 +4,29 @@ AcoustEEEcare — Bandpass Filter & Diagnostic Visualizer
 Just press Run in VS Code — no terminal arguments needed.
 
 - Automatically picks the LATEST .wav file in RECORDINGS_DIR
-- Applies a Butterworth bandpass filter
-- Amplifies the result so it is actually audible on headphones/speakers
-- Optionally pitch-shifts up so infrasonic pulse content becomes hearable
-- Saves the FILTERED audio as a new .wav file
+- Applies TWO Butterworth bandpass filters:
+    • Main bandpass  (LOWCUT_HZ  – HIGHCUT_HZ,  default 10–200 Hz)
+    • Respiratory    (RESP_LOWCUT_HZ – RESP_HIGHCUT_HZ, default 100–1000 Hz)
+- Amplifies each result so it is actually audible on headphones/speakers
+- Optionally pitch-shifts the MAIN bandpass output for infrasonic content
+- Saves the MAIN FILTERED audio as a new .wav file
 - Saves a side-by-side analysis PNG into a subfolder:
-    <RECORDINGS_DIR>/analysis/
+    <RECORDINGS_DIR>/analysis_bandpass_gain_for_mfcc/
 
 Settings to change:
-    RECORDINGS_DIR  →  folder where your .wav files are saved
-    WAV_FILE        →  set to a specific filename to override auto-latest,
-                       leave as None to always use the newest file
-    LOWCUT_HZ       →  lower bandpass edge
-    HIGHCUT_HZ      →  upper bandpass edge
-    FILTER_ORDER    →  Butterworth filter order
-    EXPECTED_RATE   →  must match firmware SAMPLING_RATE
-
-    AMPLIFY_GAIN    →  linear gain applied AFTER bandpass before saving
-                       (try 20–100 — clipping is auto-handled).  Use this
-                       when the filtered RMS is too low to hear.
-    PITCH_SHIFT     →  multiplier for output sample rate header.
-                       1.0 = no shift (default).
-                       4.0 = pitch up by 2 octaves so 20 Hz → 80 Hz
-                       (audible on most devices but plays 4× faster).
-                       Use this when most of the signal is below 50 Hz
-                       and your speakers cannot reproduce it.
+    RECORDINGS_DIR    → folder where your .wav files are saved
+    WAV_FILE          → pin a specific filename, or None = auto-newest
+    LOWCUT_HZ         → main bandpass lower edge
+    HIGHCUT_HZ        → main bandpass upper edge
+    RESP_LOWCUT_HZ    → respiratory bandpass lower edge  (default 100 Hz)
+    RESP_HIGHCUT_HZ   → respiratory bandpass upper edge  (default 1000 Hz)
+    FILTER_ORDER      → Butterworth filter order (shared)
+    EXPECTED_RATE     → must match firmware SAMPLING_RATE
+    AMPLIFY_GAIN      → linear gain for MAIN (heart) bandpass — applied to
+                        BOTH the saved WAV and the figure plots
+    RESP_AMPLIFY_GAIN → linear gain for RESPIRATORY bandpass — applied to
+                        the figure plots (resp WAV is not saved separately)
+    PITCH_SHIFT       → output sample-rate multiplier for MAIN bandpass WAV
 
 Heart sound presets:
     Pulse-only (carotid/wrist):    LOW=10,  HIGH=200,  GAIN=50,  PITCH=4.0
@@ -58,21 +56,28 @@ RECORDINGS_DIR = r"C:\Users\JM\zephyrproject\AcoustEEEcare\recordings_v64"
 # Leave as None to always auto-pick the newest .wav in RECORDINGS_DIR
 WAV_FILE = None
 
+# ── Main bandpass ──────────────────────────────────────────────
 LOWCUT_HZ    = 10     # lower bandpass edge in Hz
 HIGHCUT_HZ   = 200    # upper bandpass edge in Hz
-FILTER_ORDER = 4      # Butterworth order (higher = steeper roll-off)
-EXPECTED_RATE = 8000  # must match firmware SAMPLING_RATE
 
-# ── New audio-output settings ──────────────────────────────────
-AMPLIFY_GAIN = 200.0   # linear gain applied to filtered audio before saving
-                      # 1.0 = no amplification.  Clipping is handled by np.clip.
-                      # Pulse signal is tiny (RMS ~125 of 32768) — needs ~50×.
+# ── Respiratory bandpass (shown as 3rd column in figures) ──────
+RESP_LOWCUT_HZ  = 100   # lower edge  (100 Hz = start of lung-sound band)
+RESP_HIGHCUT_HZ = 1000  # upper edge  (1000 Hz = covers wheeze/crackle)
 
-PITCH_SHIFT  = 1.0    # output sample-rate multiplier.  1.0 = normal speed.
-                      # >1.0 makes the WAV play faster AND higher-pitched,
-                      # which lifts infrasonic content into audible range.
-                      # 4.0 lifts a 20 Hz pulse component up to 80 Hz audio.
-                      # The captured timing/rhythm is preserved relative to itself.
+FILTER_ORDER  = 4      # Butterworth order (shared by both filters)
+EXPECTED_RATE = 8000   # must match firmware SAMPLING_RATE
+
+# ── Gain settings — applied to figures AND saved WAV ──────────
+AMPLIFY_GAIN      = 500.0  # linear gain for MAIN (heart) bandpass.
+                            # Applied to figure plots AND the saved WAV.
+                            # Clipping is auto-handled by np.clip.
+
+RESP_AMPLIFY_GAIN = 500.0  # linear gain for RESPIRATORY bandpass.
+                            # Applied to figure plots only
+                            # (resp band is not saved as a separate WAV).
+
+PITCH_SHIFT  = 1.0     # output sample-rate multiplier.  1.0 = normal speed.
+                       # >1.0 makes the WAV play faster AND higher-pitched.
 
 # ══════════════════════════════════════════════════════════════
 # ▲▲▲  EDIT THESE SETTINGS  ▲▲▲
@@ -99,23 +104,30 @@ def resolve_wav_path() -> str:
 
 # ── Output paths ───────────────────────────────────────────────────────────────
 def make_output_paths(wav_path: str):
-    """Returns (png_path, filtered_wav_path)."""
+    """Returns (png_path, heart_wav_path, resp_wav_path)."""
     folder     = os.path.dirname(wav_path)
     out_folder = os.path.join(folder, "analysis_bandpass_gain_for_mfcc")
     os.makedirs(out_folder, exist_ok=True)
     basename   = os.path.splitext(os.path.basename(wav_path))[0]
+
     png_path   = os.path.join(out_folder, f"{basename}_bandpass_analysis.png")
 
-    # Build a descriptive filename so multiple settings don't overwrite each other
-    suffix_parts = [f"{LOWCUT_HZ}-{HIGHCUT_HZ}Hz"]
-    if AMPLIFY_GAIN != 1.0:
-        suffix_parts.append(f"x{AMPLIFY_GAIN:g}")
+    # Heart / main bandpass WAV  e.g.  …_heart_10-200Hz_x500.wav  (or _pitch4 suffix)
+    heart_parts = [f"heart_{LOWCUT_HZ}-{HIGHCUT_HZ}Hz", f"x{AMPLIFY_GAIN:g}"]
     if PITCH_SHIFT != 1.0:
-        suffix_parts.append(f"pitch{PITCH_SHIFT:g}")
-    suffix = "_".join(suffix_parts)
+        heart_parts.append(f"pitch{PITCH_SHIFT:g}")
+    heart_wav_path = os.path.join(
+        out_folder, f"{basename}_{'_'.join(heart_parts)}.wav"
+    )
 
-    filt_path  = os.path.join(out_folder, f"{basename}_bandpass_{suffix}.wav")
-    return png_path, filt_path
+    # Respiratory bandpass WAV  e.g.  …_resp_100-1000Hz_x500.wav
+    resp_parts = [f"resp_{RESP_LOWCUT_HZ}-{RESP_HIGHCUT_HZ}Hz",
+                  f"x{RESP_AMPLIFY_GAIN:g}"]
+    resp_wav_path = os.path.join(
+        out_folder, f"{basename}_{'_'.join(resp_parts)}.wav"
+    )
+
+    return png_path, heart_wav_path, resp_wav_path
 
 
 # ── Audio loading ──────────────────────────────────────────────────────────────
@@ -139,17 +151,11 @@ def save_wav(path: str, samples: np.ndarray, sample_rate: int,
     Save a float32 array back to a 16-bit signed WAV.
 
     gain        — linear amplification applied before clipping.
-    pitch_shift — output sample-rate multiplier; >1.0 plays the file faster
-                  and higher-pitched (useful for making infrasonic pulses
-                  audible).  Does NOT resample the audio data — it just
-                  changes the rate written into the WAV header, which causes
-                  the player to step through samples faster.
+    pitch_shift — output sample-rate multiplier; changes the rate written
+                  into the WAV header so the player steps through samples
+                  faster (no resampling of audio data).
     """
-    # Apply gain, then clip to int16 range
     pcm = np.clip(samples * gain, -32768, 32767).astype(np.int16)
-
-    # Pitch shift = lying about the sample rate in the WAV header.
-    # Cheap, lossless, no resampling artifacts.
     output_rate = int(round(sample_rate * pitch_shift))
 
     with wave.open(path, "wb") as wf:
@@ -158,7 +164,6 @@ def save_wav(path: str, samples: np.ndarray, sample_rate: int,
         wf.setframerate(output_rate)
         wf.writeframes(pcm.tobytes())
 
-    # Report what we did
     clipped = np.sum(np.abs(samples * gain) > 32767)
     if clipped > 0:
         pct = 100.0 * clipped / len(samples)
@@ -170,13 +175,10 @@ def bandpass_filter(samples: np.ndarray, sample_rate: int,
                     lowcut: float, highcut: float, order: int = 4) -> np.ndarray:
     """Apply a zero-phase Butterworth bandpass filter."""
     nyq  = sample_rate / 2.0
-    low  = lowcut  / nyq
-    high = highcut / nyq
-    # Clamp to valid range
-    low  = max(low,  1e-4)
-    high = min(high, 1.0 - 1e-4)
+    low  = max(lowcut  / nyq, 1e-4)
+    high = min(highcut / nyq, 1.0 - 1e-4)
     b, a = signal.butter(order, [low, high], btype="band")
-    return signal.filtfilt(b, a, samples)   # zero-phase (no delay)
+    return signal.filtfilt(b, a, samples)
 
 
 # ── FFT helper ─────────────────────────────────────────────────────────────────
@@ -204,6 +206,17 @@ def detect_gaps(samples: np.ndarray, threshold=50, min_gap_samples=8):
     return gaps
 
 
+# ── Axis style helper ──────────────────────────────────────────────────────────
+def style_ax(ax, title, xlabel, ylabel):
+    ax.set_facecolor("#1a1a1a")
+    ax.set_title(title, fontsize=9, color="#cccccc", pad=6)
+    ax.set_xlabel(xlabel, fontsize=8, color="#999999")
+    ax.set_ylabel(ylabel, fontsize=8, color="#999999")
+    ax.tick_params(colors="#888888", labelsize=7)
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#333333")
+
+
 # ── Main analysis ──────────────────────────────────────────────────────────────
 def analyze(wav_path: str):
     print(f"\n{'='*62}")
@@ -219,25 +232,44 @@ def analyze(wav_path: str):
     print(f"  Duration  : {duration:.3f} s")
     print(f"  RMS (raw) : {np.sqrt(np.mean(samples**2)):.1f}")
 
-    # ── Apply bandpass ─────────────────────────────────────────────────────────
-    print(f"\n  Applying Butterworth bandpass  {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  "
+    # ── Apply main bandpass ────────────────────────────────────────────────────
+    print(f"\n  Applying main bandpass  {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  "
           f"(order {FILTER_ORDER}) …")
-    filtered = bandpass_filter(samples, file_rate, LOWCUT_HZ, HIGHCUT_HZ, FILTER_ORDER)
-    rms_filt = np.sqrt(np.mean(filtered**2))
-    print(f"  RMS (filtered)         : {rms_filt:.1f}")
-    print(f"  RMS (after gain x{AMPLIFY_GAIN:g}) : "
-          f"{rms_filt * AMPLIFY_GAIN:.1f}  (clipped at 32767)")
+    filtered_raw  = bandpass_filter(samples, file_rate, LOWCUT_HZ, HIGHCUT_HZ, FILTER_ORDER)
+    rms_filt      = np.sqrt(np.mean(filtered_raw**2))
+    # Gain-amplified version used for BOTH the saved WAV and all figure plots
+    filtered      = np.clip(filtered_raw * AMPLIFY_GAIN, -32768, 32767)
+    rms_filt_gain = np.sqrt(np.mean(filtered**2))
+    print(f"  RMS (filtered, pre-gain)       : {rms_filt:.1f}")
+    print(f"  RMS (filtered, gain x{AMPLIFY_GAIN:g})  : {rms_filt_gain:.1f}  (clipped at 32767)")
+
+    # ── Apply respiratory bandpass ─────────────────────────────────────────────
+    print(f"\n  Applying respiratory bandpass  {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz  "
+          f"(order {FILTER_ORDER}) …")
+    resp_filtered_raw = bandpass_filter(samples, file_rate,
+                                        RESP_LOWCUT_HZ, RESP_HIGHCUT_HZ, FILTER_ORDER)
+    rms_resp          = np.sqrt(np.mean(resp_filtered_raw**2))
+    # Gain-amplified version used for all figure plots
+    resp_filtered     = np.clip(resp_filtered_raw * RESP_AMPLIFY_GAIN, -32768, 32767)
+    rms_resp_gain     = np.sqrt(np.mean(resp_filtered**2))
+    print(f"  RMS (resp, pre-gain)           : {rms_resp:.1f}")
+    print(f"  RMS (resp, gain x{RESP_AMPLIFY_GAIN:g})      : {rms_resp_gain:.1f}  (clipped at 32767)")
 
     if PITCH_SHIFT != 1.0:
-        print(f"  Pitch shift            : x{PITCH_SHIFT:g}  "
+        print(f"  Pitch shift (main WAV)     : x{PITCH_SHIFT:g}  "
               f"(WAV header rate = {int(round(file_rate * PITCH_SHIFT))} Hz)")
 
-    # ── Save filtered WAV ──────────────────────────────────────────────────────
-    png_path, filt_wav_path = make_output_paths(wav_path)
-    save_wav(filt_wav_path, filtered, file_rate,
-             gain=AMPLIFY_GAIN, pitch_shift=PITCH_SHIFT)
-    print(f"\n  Filtered WAV saved to:")
-    print(f"  {filt_wav_path}")
+    # ── Save main filtered WAV ─────────────────────────────────────────────────
+    png_path, heart_wav_path, resp_wav_path = make_output_paths(wav_path)
+
+    # Both filtered arrays already have gain baked in; pass gain=1.0 to avoid double-amplification
+    save_wav(heart_wav_path, filtered, file_rate,
+             gain=1.0, pitch_shift=PITCH_SHIFT)
+    print(f"\n  Heart WAV saved to:\n  {heart_wav_path}")
+
+    save_wav(resp_wav_path, resp_filtered, file_rate,
+             gain=1.0, pitch_shift=1.0)   # no pitch shift for respiratory band
+    print(f"  Respiratory WAV saved to:\n  {resp_wav_path}")
 
     # ── Gap detection on raw signal ────────────────────────────────────────────
     gaps = detect_gaps(samples)
@@ -249,23 +281,34 @@ def analyze(wav_path: str):
         print(f"    … and {len(gaps)-5} more")
 
     # ── Compute FFTs ───────────────────────────────────────────────────────────
-    time_axis   = np.arange(len(samples))  / file_rate
-    time_filt   = np.arange(len(filtered)) / file_rate
+    time_axis      = np.arange(len(samples))       / file_rate
+    time_filt      = np.arange(len(filtered))      / file_rate
+    time_resp      = np.arange(len(resp_filtered)) / file_rate
 
-    raw_freqs,  raw_fft  = compute_fft(samples,  file_rate)
-    filt_freqs, filt_fft = compute_fft(filtered, file_rate)
+    raw_freqs,  raw_fft  = compute_fft(samples,       file_rate)
+    filt_freqs, filt_fft = compute_fft(filtered,      file_rate)
+    resp_freqs, resp_fft = compute_fft(resp_filtered,  file_rate)
 
-    # Spectrograms
+    # ── Spectrograms ───────────────────────────────────────────────────────────
     nperseg = min(256, len(samples))
-    f_r, t_r, Sxx_r = signal.spectrogram(samples,  fs=file_rate,
+    f_r, t_r, Sxx_r = signal.spectrogram(samples,       fs=file_rate,
                                           nperseg=nperseg, noverlap=nperseg//2)
-    f_f, t_f, Sxx_f = signal.spectrogram(filtered, fs=file_rate,
+    f_f, t_f, Sxx_f = signal.spectrogram(filtered,      fs=file_rate,
                                           nperseg=nperseg, noverlap=nperseg//2)
+    f_p, t_p, Sxx_p = signal.spectrogram(resp_filtered, fs=file_rate,
+                                          nperseg=nperseg, noverlap=nperseg//2)
+
     Sxx_r_db = 10 * np.log10(Sxx_r + 1e-10)
     Sxx_f_db = 10 * np.log10(Sxx_f + 1e-10)
+    Sxx_p_db = 10 * np.log10(Sxx_p + 1e-10)
 
-    # ── Figure ─────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(18, 15))
+    # ── Figure layout ──────────────────────────────────────────────────────────
+    # Rows:
+    #   0  – Waveforms       (3 cols: Raw | Main BP | Respiratory BP)
+    #   1  – FFT spectra     (3 cols: Raw | Main BP | Respiratory BP)
+    #   2  – Filter response (1 col spanning all 3: both BP curves overlaid)
+    #   3  – Spectrograms    (3 cols: Raw | Main BP | Respiratory BP)
+    fig = plt.figure(figsize=(22, 16))
     fig.patch.set_facecolor("#0f0f0f")
 
     title_extras = []
@@ -279,24 +322,16 @@ def analyze(wav_path: str):
         f"AcoustEEEcare — Bandpass Filter Analysis\n"
         f"{os.path.basename(wav_path)}   |   "
         f"{file_rate} Hz  ·  {duration:.2f} s  ·  "
-        f"Bandpass {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  (Butterworth order {FILTER_ORDER})"
-        f"{extra_str}",
+        f"Main: {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  ·  "
+        f"Respiratory: {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz  "
+        f"(Butterworth order {FILTER_ORDER}){extra_str}",
         fontsize=13, fontweight="bold", color="white", y=0.98
     )
 
-    gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.52, wspace=0.32,
+    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.52, wspace=0.30,
                            top=0.93, bottom=0.06)
 
-    def style_ax(ax, title, xlabel, ylabel):
-        ax.set_facecolor("#1a1a1a")
-        ax.set_title(title, fontsize=9, color="#cccccc", pad=6)
-        ax.set_xlabel(xlabel, fontsize=8, color="#999999")
-        ax.set_ylabel(ylabel, fontsize=8, color="#999999")
-        ax.tick_params(colors="#888888", labelsize=7)
-        for spine in ax.spines.values():
-            spine.set_edgecolor("#333333")
-
-    # ── Row 0: Full waveforms side-by-side ────────────────────────────────────
+    # ── Row 0: Waveforms ───────────────────────────────────────────────────────
     ax_raw = fig.add_subplot(gs[0, 0])
     ax_raw.plot(time_axis, samples, color="#2196F3", linewidth=0.35, alpha=0.85)
     ax_raw.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
@@ -310,24 +345,36 @@ def analyze(wav_path: str):
     ax_flt.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
     ax_flt.set_xlim(0, duration)
     style_ax(ax_flt,
-             f"2  Filtered Waveform  ({LOWCUT_HZ}–{HIGHCUT_HZ} Hz bandpass)",
-             "Time (s)", "Amplitude (int16)")
+             f"2  Main Bandpass  ({LOWCUT_HZ}–{HIGHCUT_HZ} Hz)  ×gain {AMPLIFY_GAIN:g}",
+             "Time (s)", "Amplitude (gain-scaled)")
+
+    ax_res = fig.add_subplot(gs[0, 2])
+    ax_res.plot(time_resp, resp_filtered, color="#FF9800", linewidth=0.35, alpha=0.85)
+    ax_res.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
+    ax_res.set_xlim(0, duration)
+    style_ax(ax_res,
+             f"3  Respiratory Bandpass  ({RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz)  ×gain {RESP_AMPLIFY_GAIN:g}",
+             "Time (s)", "Amplitude (gain-scaled)")
 
     # ── Row 1: FFT spectra ─────────────────────────────────────────────────────
     ax_rfft = fig.add_subplot(gs[1, 0])
     ax_rfft.plot(raw_freqs, raw_fft, color="#9C27B0", linewidth=0.8)
-    ax_rfft.axvspan(0,          LOWCUT_HZ,  color="#FF5722", alpha=0.18, label="filtered out")
-    ax_rfft.axvspan(HIGHCUT_HZ, file_rate/2, color="#FF5722", alpha=0.18)
-    ax_rfft.axvline(LOWCUT_HZ,  color="#FF5722", linewidth=1.2, linestyle="--",
-                    label=f"{LOWCUT_HZ} Hz")
-    ax_rfft.axvline(HIGHCUT_HZ, color="#FF9800", linewidth=1.2, linestyle="--",
-                    label=f"{HIGHCUT_HZ} Hz")
+    ax_rfft.axvspan(0,           LOWCUT_HZ,   color="#FF5722", alpha=0.18, label="main filtered out")
+    ax_rfft.axvspan(HIGHCUT_HZ,  file_rate/2, color="#FF5722", alpha=0.18)
+    ax_rfft.axvline(LOWCUT_HZ,   color="#FF5722",  linewidth=1.2, linestyle="--",
+                    label=f"main {LOWCUT_HZ} Hz")
+    ax_rfft.axvline(HIGHCUT_HZ,  color="#FF9800",  linewidth=1.2, linestyle="--",
+                    label=f"main {HIGHCUT_HZ} Hz")
+    ax_rfft.axvline(RESP_LOWCUT_HZ,  color="#00BCD4", linewidth=1.0, linestyle=":",
+                    label=f"resp {RESP_LOWCUT_HZ} Hz")
+    ax_rfft.axvline(RESP_HIGHCUT_HZ, color="#4CAF50", linewidth=1.0, linestyle=":",
+                    label=f"resp {RESP_HIGHCUT_HZ} Hz")
     ax_rfft.set_xlim(0, file_rate / 2)
-    ax_rfft.legend(fontsize=7, facecolor="#222222", labelcolor="white")
-    style_ax(ax_rfft, "3  FFT Spectrum — Raw", "Frequency (Hz)", "Magnitude")
+    ax_rfft.legend(fontsize=6, facecolor="#222222", labelcolor="white")
+    style_ax(ax_rfft, "4  FFT Spectrum — Raw", "Frequency (Hz)", "Magnitude")
 
     ax_ffft = fig.add_subplot(gs[1, 1])
-    ax_ffft.plot(filt_freqs, filt_fft, color="#4CAF50", linewidth=0.8)
+    ax_ffft.plot(filt_freqs, filt_fft, color="#00BCD4", linewidth=0.8)
     ax_ffft.axvline(LOWCUT_HZ,  color="#FF5722", linewidth=1.2, linestyle="--",
                     label=f"{LOWCUT_HZ} Hz")
     ax_ffft.axvline(HIGHCUT_HZ, color="#FF9800", linewidth=1.2, linestyle="--",
@@ -335,30 +382,59 @@ def analyze(wav_path: str):
     ax_ffft.set_xlim(0, file_rate / 2)
     ax_ffft.legend(fontsize=7, facecolor="#222222", labelcolor="white")
     style_ax(ax_ffft,
-             f"4  FFT Spectrum — Filtered ({LOWCUT_HZ}–{HIGHCUT_HZ} Hz)",
+             f"5  FFT Spectrum — Main Bandpass ({LOWCUT_HZ}–{HIGHCUT_HZ} Hz)",
              "Frequency (Hz)", "Magnitude")
 
-    # ── Row 2: Filter frequency response ──────────────────────────────────────
-    nyq = file_rate / 2.0
-    b, a = signal.butter(FILTER_ORDER,
-                         [LOWCUT_HZ / nyq, HIGHCUT_HZ / nyq], btype="band")
-    w, h = signal.freqz(b, a, worN=4096, fs=file_rate)
+    ax_rfft2 = fig.add_subplot(gs[1, 2])
+    ax_rfft2.plot(resp_freqs, resp_fft, color="#FF9800", linewidth=0.8)
+    ax_rfft2.axvline(RESP_LOWCUT_HZ,  color="#00BCD4", linewidth=1.2, linestyle="--",
+                     label=f"{RESP_LOWCUT_HZ} Hz")
+    ax_rfft2.axvline(RESP_HIGHCUT_HZ, color="#4CAF50", linewidth=1.2, linestyle="--",
+                     label=f"{RESP_HIGHCUT_HZ} Hz")
+    ax_rfft2.set_xlim(0, file_rate / 2)
+    ax_rfft2.legend(fontsize=7, facecolor="#222222", labelcolor="white")
+    style_ax(ax_rfft2,
+             f"6  FFT Spectrum — Respiratory ({RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz)",
+             "Frequency (Hz)", "Magnitude")
 
-    ax_resp = fig.add_subplot(gs[2, :])
-    ax_resp.plot(w, 20 * np.log10(np.abs(h) + 1e-10),
-                 color="#FF9800", linewidth=1.3)
-    ax_resp.axvline(LOWCUT_HZ,  color="#FF5722", linewidth=1.2, linestyle="--",
-                    label=f"Low cut  {LOWCUT_HZ} Hz")
-    ax_resp.axvline(HIGHCUT_HZ, color="#4CAF50", linewidth=1.2, linestyle="--",
-                    label=f"High cut {HIGHCUT_HZ} Hz")
-    ax_resp.axhline(-3, color="#888888", linewidth=0.8, linestyle=":",
-                    label="-3 dB")
-    ax_resp.set_xlim(0, min(file_rate / 2, 500))   # zoom to 0–500 Hz for clarity
-    ax_resp.set_ylim(-80, 5)
-    ax_resp.legend(fontsize=8, facecolor="#222222", labelcolor="white")
-    style_ax(ax_resp,
-             f"5  Filter Frequency Response — Butterworth Bandpass "
-             f"{LOWCUT_HZ}–{HIGHCUT_HZ} Hz  (order {FILTER_ORDER})",
+    # ── Row 2: Filter frequency responses (both overlaid, full-width) ──────────
+    nyq = file_rate / 2.0
+
+    b_main, a_main = signal.butter(FILTER_ORDER,
+                                   [LOWCUT_HZ / nyq, HIGHCUT_HZ / nyq],
+                                   btype="band")
+    w_main, h_main = signal.freqz(b_main, a_main, worN=4096, fs=file_rate)
+
+    b_resp, a_resp = signal.butter(FILTER_ORDER,
+                                   [RESP_LOWCUT_HZ / nyq, RESP_HIGHCUT_HZ / nyq],
+                                   btype="band")
+    w_resp, h_resp = signal.freqz(b_resp, a_resp, worN=4096, fs=file_rate)
+
+    ax_resp_curve = fig.add_subplot(gs[2, :])   # spans all 3 columns
+    ax_resp_curve.plot(w_main, 20 * np.log10(np.abs(h_main) + 1e-10),
+                       color="#00BCD4", linewidth=1.5,
+                       label=f"Main bandpass  {LOWCUT_HZ}–{HIGHCUT_HZ} Hz")
+    ax_resp_curve.plot(w_resp, 20 * np.log10(np.abs(h_resp) + 1e-10),
+                       color="#FF9800", linewidth=1.5, linestyle="--",
+                       label=f"Respiratory bandpass  {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz")
+
+    for freq, col in [(LOWCUT_HZ, "#FF5722"), (HIGHCUT_HZ, "#4CAF50"),
+                      (RESP_LOWCUT_HZ, "#FF9800"), (RESP_HIGHCUT_HZ, "#FFEB3B")]:
+        ax_resp_curve.axvline(freq, color=col, linewidth=0.9, linestyle=":",
+                              alpha=0.7, label=f"{freq} Hz")
+    ax_resp_curve.axhline(-3, color="#888888", linewidth=0.8, linestyle=":",
+                          label="-3 dB")
+
+    # Zoom x-axis to cover both passbands comfortably
+    x_max = min(file_rate / 2, max(HIGHCUT_HZ, RESP_HIGHCUT_HZ) * 1.3)
+    ax_resp_curve.set_xlim(0, x_max)
+    ax_resp_curve.set_ylim(-80, 5)
+    ax_resp_curve.legend(fontsize=8, facecolor="#222222", labelcolor="white",
+                         ncol=3)
+    style_ax(ax_resp_curve,
+             f"7  Filter Frequency Responses — Butterworth (order {FILTER_ORDER})  "
+             f"|  Main: {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  ·  "
+             f"Respiratory: {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz",
              "Frequency (Hz)", "Gain (dB)")
 
     # ── Row 3: Spectrograms ────────────────────────────────────────────────────
@@ -369,21 +445,37 @@ def analyze(wav_path: str):
                               cmap="inferno", vmin=vmin)
     fig.colorbar(im1, ax=ax_sg_r).ax.yaxis.set_tick_params(
         color="#888888", labelsize=7)
-    ax_sg_r.set_ylim(0, min(file_rate / 2, 500))
-    style_ax(ax_sg_r, "6  Spectrogram — Raw", "Time (s)", "Frequency (Hz)")
+    ax_sg_r.set_ylim(0, min(file_rate / 2, 1100))
+    style_ax(ax_sg_r, "8  Spectrogram — Raw", "Time (s)", "Frequency (Hz)")
 
     ax_sg_f = fig.add_subplot(gs[3, 1])
     im2 = ax_sg_f.pcolormesh(t_f, f_f, Sxx_f_db, shading="gouraud",
                               cmap="inferno", vmin=vmin)
     fig.colorbar(im2, ax=ax_sg_f).ax.yaxis.set_tick_params(
         color="#888888", labelsize=7)
-    ax_sg_f.axhline(LOWCUT_HZ,  color="cyan",   linewidth=0.9,
+    ax_sg_f.axhline(LOWCUT_HZ,  color="cyan",    linewidth=0.9,
                     linestyle="--", alpha=0.8)
     ax_sg_f.axhline(HIGHCUT_HZ, color="#00FF88", linewidth=0.9,
                     linestyle="--", alpha=0.8)
-    ax_sg_f.set_ylim(0, min(file_rate / 2, 500))
+    ax_sg_f.set_ylim(0, min(file_rate / 2, 1100))
     style_ax(ax_sg_f,
-             f"7  Spectrogram — Filtered  (cyan={LOWCUT_HZ} Hz  green={HIGHCUT_HZ} Hz)",
+             f"9  Spectrogram — Main BP  "
+             f"(cyan={LOWCUT_HZ} Hz  green={HIGHCUT_HZ} Hz)",
+             "Time (s)", "Frequency (Hz)")
+
+    ax_sg_p = fig.add_subplot(gs[3, 2])
+    im3 = ax_sg_p.pcolormesh(t_p, f_p, Sxx_p_db, shading="gouraud",
+                              cmap="inferno", vmin=vmin)
+    fig.colorbar(im3, ax=ax_sg_p).ax.yaxis.set_tick_params(
+        color="#888888", labelsize=7)
+    ax_sg_p.axhline(RESP_LOWCUT_HZ,  color="#FF9800", linewidth=0.9,
+                    linestyle="--", alpha=0.8)
+    ax_sg_p.axhline(RESP_HIGHCUT_HZ, color="#FFEB3B", linewidth=0.9,
+                    linestyle="--", alpha=0.8)
+    ax_sg_p.set_ylim(0, min(file_rate / 2, 1100))
+    style_ax(ax_sg_p,
+             f"10  Spectrogram — Respiratory BP  "
+             f"(orange={RESP_LOWCUT_HZ} Hz  yellow={RESP_HIGHCUT_HZ} Hz)",
              "Time (s)", "Frequency (Hz)")
 
     # ── Bottom summary bar ─────────────────────────────────────────────────────
@@ -391,20 +483,21 @@ def analyze(wav_path: str):
         f"Rate: {file_rate} Hz  |  Duration: {duration:.2f} s  |  "
         f"Samples: {len(samples)}  |  "
         f"RMS raw: {np.sqrt(np.mean(samples**2)):.1f}  |  "
-        f"RMS filtered: {rms_filt:.1f}  |  "
+        f"RMS main BP (pre-gain): {rms_filt:.1f}  →  x{AMPLIFY_GAIN:g}  →  {rms_filt_gain:.1f}  |  "
+        f"RMS resp BP (pre-gain): {rms_resp:.1f}  →  x{RESP_AMPLIFY_GAIN:g}  →  {rms_resp_gain:.1f}  |  "
         f"Gaps (raw): {len(gaps)}  |  "
-        f"Bandpass: {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  order {FILTER_ORDER}  |  "
-        f"Gain: x{AMPLIFY_GAIN:g}  |  "
+        f"Main BP: {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  |  "
+        f"Resp BP: {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz  |  "
+        f"Order: {FILTER_ORDER}  |  "
         f"Pitch: x{PITCH_SHIFT:g}"
     )
-    fig.text(0.5, 0.005, summary, ha="center", fontsize=8.5, color="#aaaaaa",
+    fig.text(0.5, 0.005, summary, ha="center", fontsize=8, color="#aaaaaa",
              bbox=dict(boxstyle="round", facecolor="#1e1e1e", alpha=0.9))
 
     # ── Save plot ──────────────────────────────────────────────────────────────
     plt.savefig(png_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
-    print(f"\n  Plot saved to:")
-    print(f"  {png_path}")
+    print(f"\n  Plot saved to:\n  {png_path}")
     print(f"{'='*62}\n")
     plt.show()
 

@@ -37,7 +37,7 @@
  * ============================================================
  */
 
-#define USE_SD  false   /* set false for BLE-only mode */
+#define USE_SD  true   /* set false for BLE-only mode */
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES

@@ -37,7 +37,7 @@ LOG_MODULE_REGISTER(hr_infer);
  * at ~235 KB total — just inside the limit. After trimming the arena
  * to the real minimum you will recover 20–35 KB of headroom.
  * ────────────────────────────────────────────────────────────────── */
-#define TENSOR_ARENA_SIZE  (82 * 1024)
+#define TENSOR_ARENA_SIZE  (90 * 1024)
 
 /* Static storage — no heap needed */
 static uint8_t tensor_arena[TENSOR_ARENA_SIZE] __attribute__((aligned(16)));

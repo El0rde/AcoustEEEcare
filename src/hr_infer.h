@@ -19,9 +19,18 @@ typedef struct {
 extern "C" {
 #endif
 
-int hr_infer_init(void);
-int hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out);
-int hr_infer_run_int8(const int8_t *mfcc_q8, int n_frames, hr_result_t *out);
+int      hr_infer_init(void);
+int      hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out);
+int      hr_infer_run_int8(const int8_t *mfcc_q8, int n_frames, hr_result_t *out);
+
+/*
+ * hr_infer_arena_used() — returns interpreter->arena_used_bytes().
+ * Call after a successful hr_infer_run_int8() to find the real arena
+ * floor. Set TENSOR_ARENA_SIZE = returned value + 4096 in hr_infer.cpp
+ * and rebuild to recover RAM.
+ * Returns 0 if called before hr_infer_init() succeeds.
+ */
+uint32_t hr_infer_arena_used(void);
 
 #ifdef __cplusplus
 }

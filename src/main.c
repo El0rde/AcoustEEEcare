@@ -1,15 +1,8 @@
 /*
  * AcoustEEEcare — SAADC BLE + SD Card + HR TFLite Edition
  * ============================================================
- * v7.0 — Integrated HR_trial_144_int8.tflite
- *
- * CHANGES FROM v6.6:
- *   + hr_infer_init() called in main() after dsp_mfcc_init()
- *   + s_mfcc_flat[] accumulates frames in on_mfcc_frame() callback
- *   + s_mfcc_collected tracks how many frames were received
- *   + After dsp_mfcc_finish(), hr_infer_run() predicts BPM
- *   + Result sent over BLE as "BPM:72.3\n"
- *   + Result logged via LOG_INF
+ * v7.2 — Fixed: removed direct interpreter/TENSOR_ARENA_SIZE access
+ *               from main.c; arena logging now via hr_infer_arena_used()
  *
  * MODEL FACTS (HR_trial_144_int8.tflite):
  *   Input  [1, 1331, 20, 1] INT8 — 1331 MFCC frames × 20 coefficients
@@ -19,7 +12,7 @@
  *
  * IMPORTANT — MFCC CONFIG:
  *   Your dsp_mfcc must be configured with MFCC_N_MFCC = 20.
- *   MFCC_N_FRAMES should equal 1331; if it differs, hr_infer_run()
+ *   MFCC_N_FRAMES should equal 1331; if it differs, hr_infer_run_int8()
  *   will zero-pad (fewer frames) or truncate (more frames) automatically.
  *
  * TARGET HARDWARE
@@ -29,7 +22,8 @@
  * ============================================================
  */
 
-#define USE_SD  true   /* set false for BLE-only mode */
+#define USE_SD           true   /* set false for BLE-only mode          */
+#define INTEGRATE_MODEL  true   /* set false to disable TFLite inference */
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -59,7 +53,10 @@
 #include <nrfx_saadc.h>
 
 #include "dsp_mfcc.h"
-#include "hr_infer.h"   /* ← NEW: HR TFLite inference interface */
+
+#if INTEGRATE_MODEL
+#include "hr_infer.h"   /* HR TFLite inference interface */
+#endif
 
 #if USE_SD
 #include <zephyr/fs/fs.h>
@@ -115,7 +112,7 @@ static uint16_t          nus_chunk_size   = 244;
 /* ══════════════════════════════════════════════════════════════════
  * BLE AUDIO RING BUFFER + TX THREAD
  * ══════════════════════════════════════════════════════════════════ */
-#define AUDIO_RING_BYTES  (8 * 1024)
+#define AUDIO_RING_BYTES  (2 * 1024)
 RING_BUF_DECLARE(audio_ring, AUDIO_RING_BYTES);
 
 static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
@@ -135,42 +132,22 @@ static struct k_thread ble_tx_thread_data;
 static void ble_tx_thread_fn(void *a, void *b, void *c);
 
 /* ══════════════════════════════════════════════════════════════════
- * MFCC ACCUMULATION BUFFER  ← NEW
+ * MFCC ACCUMULATION BUFFER  (INTEGRATE_MODEL only)
  *
- * on_mfcc_frame() fills this flat array as dsp_mfcc_finish() calls
- * it frame by frame.  After finish(), hr_infer_run() reads it.
+ * on_mfcc_frame() fills this flat array frame-by-frame as
+ * dsp_mfcc_finish() calls it. After finish(), hr_infer_run_int8()
+ * reads the complete buffer.
  *
  * Layout: row-major [frame][coeff]
- *   s_mfcc_flat[f * MFCC_N_MFCC + c] = coeff c of frame f
+ *   s_mfcc_flat_q8[f * HR_MODEL_MFCC + c] = coeff c of frame f (INT8)
  *
- * Size: HR_MODEL_FRAMES * HR_MODEL_MFCC * 4 bytes
- *       = 1331 * 20 * 4 = 106 480 bytes ≈ 104 KB
- *
- * MEMORY WARNING:
- *   This is the single largest allocation in the firmware.
- *   If you run out of RAM, options are:
- *     (a) Quantize on the fly in on_mfcc_frame() and store INT8
- *         (saves 75%: 26 620 bytes instead of 106 480).
- *     (b) Reduce DURATION_S so fewer frames are produced.
- *     (c) Use a smaller MFCC_N_FRAMES in your dsp_mfcc config.
- *
- *   Option (a) is shown commented out below — swap the arrays if needed.
+ * Size: 1331 × 20 × 1 = 26 620 bytes ≈ 26.6 KB
  * ══════════════════════════════════════════════════════════════════ */
-
-/* Option A (default): store as float — easy, uses 104 KB RAM */
+#if INTEGRATE_MODEL
 static int8_t s_mfcc_flat_q8[HR_MODEL_FRAMES * HR_MODEL_MFCC];
 static int    s_mfcc_collected = 0;
-
-/*
- * Option B (RAM-saving alternative): store pre-quantized INT8.
- * Uncomment this block and comment out Option A above.
- * Then in on_mfcc_frame(), call float_to_int8_input() per coefficient
- * and store into s_mfcc_flat_q8[] instead.
- * Pass s_mfcc_flat_q8 directly to a modified hr_infer_run_int8().
- *
- * static int8_t  s_mfcc_flat_q8[HR_MODEL_FRAMES * HR_MODEL_MFCC];
- * static int     s_mfcc_collected = 0;
- */
+static bool   hr_model_ready  = false;
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  * SD CARD GLOBALS  (USE_SD true only)
@@ -223,6 +200,8 @@ static int init_sd_card(void)
     uint32_t block_count, block_size;
 
     LOG_INF("Initialising SD card...");
+
+    k_sleep(K_MSEC(5000));
 
     if (disk_access_init(disk_pdrv) != 0) {
         LOG_ERR("disk_access_init failed");
@@ -304,7 +283,8 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 
         LOG_INF("SD writer: %u audio bytes written, checksum=0x%08X",
                 total_written, sd_checksum);
-        LOG_INF("SD writer: sd_ring high water = %u / %u", sd_ring_high_water, SD_RING_BYTES);
+        LOG_INF("SD writer: sd_ring high water = %u / %u",
+                sd_ring_high_water, SD_RING_BYTES);
 
         k_sem_give(&sd_done_sem);
     }
@@ -627,11 +607,15 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * MFCC FRAME CALLBACK  ← MODIFIED for v7.0
+ * MFCC FRAME CALLBACK
  *
- * Two jobs per frame:
- *   1. Accumulate into s_mfcc_flat[] for TFLite inference.
- *   2. Stream frame over BLE NUS (unchanged from v6.6).
+ * When INTEGRATE_MODEL true:
+ *   Job 1 — quantize float coeffs to INT8 and accumulate into
+ *            s_mfcc_flat_q8[] for later TFLite inference.
+ *   Job 2 — stream the raw float frame over BLE NUS.
+ *
+ * When INTEGRATE_MODEL false:
+ *   Job 2 only — stream frame over BLE NUS (v6.6 behaviour).
  * ══════════════════════════════════════════════════════════════════ */
 static int s_mfcc_n_frames_total = MFCC_N_FRAMES;
 
@@ -639,29 +623,27 @@ static void on_mfcc_frame(int frame_idx, const float *coeffs)
 {
     int err;
 
-   /* ── Job 1: Accumulate as INT8 for TFLite ── */
-    if (frame_idx < HR_MODEL_FRAMES) {
-        int n_copy = MFCC_N_MFCC < HR_MODEL_MFCC ? MFCC_N_MFCC : HR_MODEL_MFCC;
-        for (int i = 0; i < n_copy; i++) {
-            /* Quantize: clamp float to int8 range using model's scale/zero_point */
-            float quantized = coeffs[i] / HR_INPUT_SCALE + HR_INPUT_ZP;
-            int32_t q = (int32_t)(quantized + (quantized >= 0 ? 0.5f : -0.5f));
-            if (q < -128) q = -128;
-            if (q >  127) q =  127;
-            s_mfcc_flat_q8[frame_idx * HR_MODEL_MFCC + i] = (int8_t)q;
-        }
-        if (n_copy < HR_MODEL_MFCC) {
-            memset(&s_mfcc_flat_q8[frame_idx * HR_MODEL_MFCC + n_copy],
-                   HR_INPUT_ZP,
-                   HR_MODEL_MFCC - n_copy);
+#if INTEGRATE_MODEL
+    /*
+     * Quantize float MFCC coefficient to INT8 using the model's input
+     * quantization params (scale, zero-point) from hr_infer.h.
+     * We write directly into s_mfcc_flat_q8[] here; hr_infer_run_int8()
+     * will memcpy the whole buffer into the tensor after all frames
+     * are collected.
+     */
+    if (hr_model_ready && frame_idx < HR_MODEL_FRAMES) {
+        int n = MFCC_N_MFCC < HR_MODEL_MFCC ? MFCC_N_MFCC : HR_MODEL_MFCC;
+        for (int i = 0; i < n; i++) {
+            float   q  = coeffs[i] / HR_INPUT_SCALE + (float)HR_INPUT_ZP;
+            int32_t qi = (int32_t)(q >= 0.0f ? q + 0.5f : q - 0.5f);
+            s_mfcc_flat_q8[frame_idx * HR_MODEL_MFCC + i] =
+                (int8_t)(qi < -128 ? -128 : qi > 127 ? 127 : qi);
         }
         s_mfcc_collected = frame_idx + 1;
-    } else {
-        /* More frames than HR_MODEL_FRAMES — ignore excess */
-        LOG_WRN("on_mfcc_frame: ignoring frame %d (max %d)", frame_idx, HR_MODEL_FRAMES);
     }
+#endif /* INTEGRATE_MODEL */
 
-    /* ── Job 2: BLE NUS stream (unchanged) ── */
+    /* ── Job 2: BLE NUS stream ── */
     if (frame_idx == 0) {
         char hdr[48];
         int hdr_len = snprintf(hdr, sizeof(hdr),
@@ -689,11 +671,11 @@ static void on_mfcc_frame(int frame_idx, const float *coeffs)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * RECORD AND STREAM  ← MODIFIED for v7.0
+ * RECORD AND STREAM
  *
- * Stage 1: Record audio → SD + BLE stream (unchanged)
- * Stage 2: Compute MFCC + stream over BLE (unchanged)
- * Stage 3: Run TFLite HR inference → send BPM over BLE  ← NEW
+ * Stage 1: Record audio → SD (USE_SD) + BLE stream
+ * Stage 2: Compute MFCC + stream over BLE
+ * Stage 3: TFLite HR inference → BPM over BLE  (INTEGRATE_MODEL only)
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
@@ -708,9 +690,11 @@ static void record_and_stream(void)
     k_sem_reset(&half_produced_sem);
     k_sem_reset(&tx_done_sem);
 
+#if INTEGRATE_MODEL
     /* ── Reset MFCC accumulation buffer ── */
     s_mfcc_collected = 0;
     memset(s_mfcc_flat_q8, 0, sizeof(s_mfcc_flat_q8));
+#endif
 
 #if USE_SD
     ring_buf_reset(&sd_ring);
@@ -756,8 +740,10 @@ static void record_and_stream(void)
         return;
     }
 
-    LOG_INF("Recording %d s @ %d Hz (USE_SD=%s)...", DURATION_S, SAMPLING_RATE,
-            USE_SD ? "true" : "false");
+    LOG_INF("Recording %d s @ %d Hz (USE_SD=%s, INTEGRATE_MODEL=%s)...",
+            DURATION_S, SAMPLING_RATE,
+            USE_SD          ? "true" : "false",
+            INTEGRATE_MODEL ? "true" : "false");
 
     for (uint32_t h = 0; h < total_halves; h++) {
         if (k_sem_take(&half_produced_sem, K_MSEC(200)) != 0) {
@@ -795,7 +781,6 @@ static void record_and_stream(void)
     led_set_purple();
 
     s_mfcc_n_frames_total = MFCC_N_FRAMES;
-    /* on_mfcc_frame() called here for each frame — fills s_mfcc_flat[] */
     int n_frames = dsp_mfcc_finish(on_mfcc_frame);
 
     if (n_frames <= 0) {
@@ -813,32 +798,36 @@ static void record_and_stream(void)
         if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
     } while (err == -ENOMEM || err == -EAGAIN);
 
-    LOG_INF("MFCC stream complete: %d frames x %d coeffs (collected %d for TFLite)",
-            n_frames, MFCC_N_MFCC, s_mfcc_collected);
+    LOG_INF("MFCC stream complete: %d frames x %d coeffs"
+#if INTEGRATE_MODEL
+            " (collected %d for TFLite)"
+#endif
+            , n_frames, MFCC_N_MFCC
+#if INTEGRATE_MODEL
+            , s_mfcc_collected
+#endif
+    );
 
-    /* ── Stage 3: TFLite HR inference ← NEW ── */
-    /*
-     * s_mfcc_flat[] now contains s_mfcc_collected frames of MFCC data.
-     * hr_infer_run() zero-pads to HR_MODEL_FRAMES (1331) if needed.
-     *
-     * Inference runs on the main thread (not BLE TX or SD writer).
-     * On nRF52840 @ 64 MHz with int8 ops, expect ~200–600 ms.
-     * The BLE connection is alive but no audio is being streamed,
-     * so this does not cause a BLE timeout.
-     */
+#if INTEGRATE_MODEL
+    /* ── Stage 3: TFLite HR inference ── */
     led_set_yellow();   /* Yellow = inference running */
 
     hr_result_t hr_result;
     if (hr_infer_run_int8(s_mfcc_flat_q8, s_mfcc_collected, &hr_result) == 0) {
 
-
         LOG_INF("HR inference complete: %.1f BPM (raw_int8=%d)",
                 (double)hr_result.bpm, (int)hr_result.raw_output);
 
         /*
-         * Send BPM over BLE as "BPM:72.3\n"
-         * Host parser: look for "BPM:" prefix, read float until '\n'.
+         * Log arena usage so you can tune TENSOR_ARENA_SIZE in hr_infer.cpp.
+         * hr_infer_arena_used() is a thin C wrapper around
+         * interpreter->arena_used_bytes() defined in hr_infer.cpp.
+         * Once you have a stable number, set TENSOR_ARENA_SIZE to
+         * that value + 4096 and rebuild.
          */
+        LOG_INF("Arena used: %u bytes — set TENSOR_ARENA_SIZE to this + 4096",
+                hr_infer_arena_used());
+
         char bpm_msg[24];
         int  bpm_len = snprintf(bpm_msg, sizeof(bpm_msg),
                                 "BPM:%.1f\n", (double)hr_result.bpm);
@@ -851,6 +840,7 @@ static void record_and_stream(void)
         LOG_ERR("HR inference failed");
         bt_nus_send(NULL, "ERR:INFER\n", 10);
     }
+#endif /* INTEGRATE_MODEL */
 
     led_set_green();
     LOG_INF("record_and_stream() complete.");
@@ -877,19 +867,20 @@ int main(void)
         return -1;
     }
 
+#if INTEGRATE_MODEL
     /*
-     * TFLite HR model init  ← NEW
-     *
-     * Loads model from flash (hr_model_data.h C array),
-     * allocates tensor arena, verifies input/output shapes.
-     * Non-fatal: if it fails, BLE stream and SD still work;
-     * inference attempts will return ERR:INFER.
+     * TFLite HR model init.
+     * Non-fatal: if it fails, hr_model_ready stays false and inference
+     * is skipped. BLE stream and SD card still work normally.
      */
     if (hr_infer_init() != 0) {
         LOG_ERR("HR TFLite init failed — inference disabled");
         led_error_flash(led_set_yellow);
-        /* Continue booting — BLE + SD still functional */
+    } else {
+        hr_model_ready = true;
+        LOG_INF("HR model ready");
     }
+#endif
 
     err = saadc_init();
     if (err < 0) {
@@ -928,8 +919,10 @@ int main(void)
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.0 ready (USE_SD=%s) — waiting for BLE connection",
-            USE_SD ? "true" : "false");
+    LOG_INF("AcoustEEEcare v7.2 ready (USE_SD=%s, INTEGRATE_MODEL=%s) "
+            "— waiting for BLE connection",
+            USE_SD          ? "true" : "false",
+            INTEGRATE_MODEL ? "true" : "false");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -945,93 +938,60 @@ int main(void)
 
 /*
  * ════════════════════════════════════════════════════════════════════
- * REQUIRED prj.conf  (additions on top of v6.6)
+ * FEATURE FLAG COMBINATIONS
  * ════════════════════════════════════════════════════════════════════
  *
- * # --- existing v6.6 options ---
+ *  USE_SD  INTEGRATE_MODEL   Behaviour
+ *  ──────  ───────────────   ─────────────────────────────────────────
+ *  false   false             BLE audio + MFCC stream only (v6.6)
+ *  false   true              BLE audio + MFCC + TFLite BPM (no SD)
+ *  true    false             BLE audio + MFCC + SD write (no inference)
+ *  true    true              Full v7.2: all features enabled
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * REQUIRED prj.conf
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * # --- always required ---
+ * CONFIG_HEAP_MEM_POOL_SIZE=8192
+ * CONFIG_MAIN_STACK_SIZE=2048
+ *
+ * # --- USE_SD true ---
  * CONFIG_SPI=y
  * CONFIG_DISK_ACCESS=y
  * CONFIG_DISK_DRIVER_SDMMC=y
  * CONFIG_FAT_FILESYSTEM_ELM=y
  * CONFIG_FILE_SYSTEM=y
  * CONFIG_FILE_SYSTEM_MAX_TYPES=2
- * CONFIG_HEAP_MEM_POOL_SIZE=8192
- * CONFIG_MAIN_STACK_SIZE=4096
  *
- * # --- NEW for TFLite Micro ---
+ * # --- INTEGRATE_MODEL true ---
  * CONFIG_TENSORFLOW_LITE_MICRO=y
  * CONFIG_FPU=y
  * CONFIG_FPU_SHARING=y
- * CONFIG_CPP_EXCEPTIONS_MINIMAL=y  # TFLM needs minimal C++ support
- * CONFIG_REQUIRES_FLOAT_PRINTF=y   # for snprintf("%.1f") in BPM message
+ * CONFIG_CPP_EXCEPTIONS_MINIMAL=y
+ * CONFIG_REQUIRES_FLOAT_PRINTF=y
  *
  * ════════════════════════════════════════════════════════════════════
- * REQUIRED CMakeLists.txt addition
+ * MEMORY BUDGET (USE_SD true, INTEGRATE_MODEL true)
  * ════════════════════════════════════════════════════════════════════
  *
- * target_sources(app PRIVATE
- *     src/main.c
- *     src/dsp_mfcc.c
- *     src/hr_infer.cpp       # ← new
- * )
- *
- * ════════════════════════════════════════════════════════════════════
- * FILE LAYOUT
- * ════════════════════════════════════════════════════════════════════
- *
- * src/
- *   main.c              ← this file
- *   hr_infer.h          ← C interface header
- *   hr_infer.cpp        ← TFLite Micro implementation (C++)
- *   hr_model_data.h     ← C array from HR_trial_144_int8.tflite
- *   dsp_mfcc.h/.c       ← existing
- *
- * ════════════════════════════════════════════════════════════════════
- * MEMORY BUDGET (approximate, USE_SD true + TFLite)
- * ════════════════════════════════════════════════════════════════════
- *
- *   Zephyr kernel + BLE stack         ~90 KB
- *   s_decimated[20000] (dsp_mfcc)      40 KB
+ *   Zephyr kernel + BLE stack         ~92 KB
+ *   s_decimated (dsp_mfcc)             40 KB
  *   DSP scratch                         ~7 KB
- *   audio_ring  (BLE)                   16 KB
- *   sd_ring     (SD writer)             32 KB
+ *   audio_ring                           2 KB
+ *   sd_ring                              8 KB
  *   ping_pong[2][512]                    2 KB
- *   s_mfcc_flat[1331*20] float         ~104 KB  ← NEW
- *   tensor_arena (TFLite)               80 KB   ← NEW
- *   hr_model_tflite[] (flash, not RAM)  16 KB flash only
+ *   s_mfcc_flat_q8[1331*20] INT8      ~26.6 KB
+ *   tensor_arena (TFLite, hr_infer.cpp) 80 KB  ← trim after reading arena log
  *   BLE TX thread stack                  2 KB
- *   SD writer thread stack               2 KB
- *   sd_write_buf                       512  B
- *   fat_fs (FATFS work area)            ~4 KB
+ *   SD writer thread stack             1.5 KB
+ *   misc globals                        ~1 KB
  *   ─────────────────────────────────────────
- *   Total RAM                         ~379 KB  ← EXCEEDS nRF52840's 256 KB!
+ *   Total (before arena trim)        ~262 KB
  *
- * ⚠️  RAM OVERFLOW — see MEMORY REDUCTION STRATEGIES below.
- *
+ *   After first successful inference, check the log:
+ *     "Arena used: XXXXX bytes"
+ *   Set TENSOR_ARENA_SIZE = XXXXX + 4096 in hr_infer.cpp and rebuild.
+ *   Typical final total: ~220–240 KB.
  * ════════════════════════════════════════════════════════════════════
- * MEMORY REDUCTION STRATEGIES  (pick one or combine)
- * ════════════════════════════════════════════════════════════════════
- *
- * Strategy 1 — Store MFCC as INT8 instead of float  [saves 78 KB]
- *   s_mfcc_flat uses float (4 bytes/coeff).
- *   Pre-quantize in on_mfcc_frame() and store INT8 (1 byte/coeff).
- *   s_mfcc_flat[1331*20] → s_mfcc_flat_q8[1331*20] = 26.6 KB
- *   Modify hr_infer_run() to accept int8_t* and skip quantization step.
- *   This is the recommended approach — saves 78 KB with no quality loss.
- *
- * Strategy 2 — Reduce tensor arena  [saves 20–40 KB]
- *   Run once with LOG_INF of arena_used_bytes after AllocateTensors().
- *   Add to hr_infer_init(): interpreter->arena_used_bytes()
- *   Set TENSOR_ARENA_SIZE to (used + 4 KB margin).
- *   Typical actual use: 40–60 KB for this model.
- *
- * Strategy 3 — Shrink sd_ring  [saves 16 KB]
- *   16 KB is still 1 s of headroom at 16 000 bytes/s.
- *   SD_RING_BYTES = (16 * 1024)
- *
- * Strategy 4 — Eliminate s_decimated in dsp_mfcc  [saves 40 KB]
- *   Use streaming MFCC computation instead of full buffer.
- *   Requires dsp_mfcc redesign.
- *
- * Applying Strategy 1 + 2 + 3 brings total to ~245 KB — fits in 256 KB.
  */

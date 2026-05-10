@@ -28,24 +28,21 @@
 LOG_MODULE_REGISTER(hr_infer);
 
 /* ── Tensor arena ──────────────────────────────────────────────────
- * The arena must hold all intermediate activation tensors.
- * This model's largest intermediate tensor is [1, 261, 17, 24] INT8
- * ≈ 106 KB — however TFLM reuses memory across layers (scratch-pad
- * style), so the actual arena needed is much smaller.
+ * Start at 80 KB. After the first successful inference, read the
+ * "Arena used: XXXXX bytes" log line printed by hr_infer_arena_used()
+ * in main.c, then set this to that value + 4096 and rebuild.
  *
- * Start with 80 KB. If AllocateTensors() returns kTfLiteError, raise
- * by 8 KB until it succeeds. Then lower by 4 KB until it fails again
- * — that gives your minimum safe size.
- *
- * nRF52840 has 256 KB RAM; BLE stack + OS + buffers use ~100 KB,
- * leaving ~156 KB free.  80 KB arena leaves ~76 KB headroom.
+ * nRF52840 has 256 KB RAM total. With the rest of the firmware using
+ * ~155 KB (kernel + BLE + DSP + MFCC buffer + rings), 80 KB fits
+ * at ~235 KB total — just inside the limit. After trimming the arena
+ * to the real minimum you will recover 20–35 KB of headroom.
  * ────────────────────────────────────────────────────────────────── */
-#define TENSOR_ARENA_SIZE  (36 * 1024)
+#define TENSOR_ARENA_SIZE  (82 * 1024)
 
 /* Static storage — no heap needed */
 static uint8_t tensor_arena[TENSOR_ARENA_SIZE] __attribute__((aligned(16)));
 
-/* Resolver: only 4 op types used by this model (verified by inspection) */
+/* Resolver: only the 4 op types used by this model */
 using HRResolver = tflite::MicroMutableOpResolver<4>;
 static HRResolver resolver;
 
@@ -62,12 +59,10 @@ static bool initialised = false;
 /*
  * float_to_int8_input() — quantize one float MFCC coefficient to INT8.
  * Formula: q = round(f / scale) + zero_point, clamped to [-128, 127].
- * Constants match the model's input quantization params from flatbuffers.
  */
 static inline int8_t float_to_int8_input(float f)
 {
     float q = (f / HR_INPUT_SCALE) + (float)HR_INPUT_ZP;
-    /* round-to-nearest */
     int32_t qi = (int32_t)(q >= 0.0f ? (q + 0.5f) : (q - 0.5f));
     if (qi < -128) qi = -128;
     if (qi >  127) qi =  127;
@@ -76,8 +71,7 @@ static inline int8_t float_to_int8_input(float f)
 
 /*
  * int8_output_to_bpm() — dequantize the single INT8 output to BPM.
- * Formula: bpm = (raw - zero_point) * scale.
- * Params from model's output quantization: scale=0.474156, zp=-128.
+ * Params from model output quantization: scale=0.474156, zp=-128.
  * Range: 0.0 BPM (raw=-128) to ~120.9 BPM (raw=+127).
  */
 static inline float int8_output_to_bpm(int8_t raw)
@@ -92,7 +86,6 @@ int hr_infer_init(void)
 {
     tflite::InitializeTarget();
 
-    /* Load model from flash (C array in hr_model_data.h) */
     model_ptr = tflite::GetModel(hr_model_tflite);
     if (model_ptr->version() != TFLITE_SCHEMA_VERSION) {
         LOG_ERR("HR model schema mismatch: model=%u runtime=%u",
@@ -102,8 +95,6 @@ int hr_infer_init(void)
 
     /*
      * Register ONLY the 4 ops this model uses.
-     * Each unneeded AddXxx() call wastes flash — TFLM links the op
-     * implementation even if it is never invoked.
      * Ops confirmed by flatbuffers inspection of HR_trial_144_int8.tflite:
      *   builtin_code 3  → CONV_2D
      *   builtin_code 17 → MAX_POOL_2D
@@ -165,7 +156,22 @@ int hr_infer_init(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * hr_infer_run()
+ * hr_infer_arena_used()
+ *
+ * Returns the number of tensor arena bytes actually used after
+ * AllocateTensors() + Invoke(). Call this from main.c after a
+ * successful hr_infer_run_int8() to find the real minimum arena size.
+ * ══════════════════════════════════════════════════════════════════ */
+uint32_t hr_infer_arena_used(void)
+{
+    if (!initialised || !interpreter) {
+        return 0;
+    }
+    return (uint32_t)interpreter->arena_used_bytes();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * hr_infer_run()  — float input path
  * ══════════════════════════════════════════════════════════════════ */
 int hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out)
 {
@@ -177,18 +183,8 @@ int hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out)
     TfLiteTensor *input_tensor = interpreter->input(0);
     int8_t *input_data = input_tensor->data.int8;
 
-    /*
-     * Quantize float MFCC coefficients → INT8 and fill input tensor.
-     *
-     * The model expects exactly HR_MODEL_FRAMES (1331) frames.
-     * If dsp_mfcc produced fewer (e.g. at end of recording), we
-     * zero-pad the tail — quantized 0.0 maps to zero_point=23, but
-     * silence is better represented as 0 (DC-removed baseline).
-     * We fill with HR_INPUT_ZP (23) to represent 0.0 float correctly.
-     */
     int frames_to_copy = n_frames < HR_MODEL_FRAMES ? n_frames : HR_MODEL_FRAMES;
 
-    /* Copy and quantize available frames */
     for (int f = 0; f < frames_to_copy; f++) {
         for (int c = 0; c < HR_MODEL_MFCC; c++) {
             input_data[f * HR_MODEL_MFCC + c] =
@@ -201,19 +197,16 @@ int hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out)
         int pad_start = frames_to_copy * HR_MODEL_MFCC;
         int pad_count = (HR_MODEL_FRAMES - frames_to_copy) * HR_MODEL_MFCC;
         memset(&input_data[pad_start], HR_INPUT_ZP, pad_count);
-        LOG_WRN("hr_infer_run: only %d/%d frames available — "
-                "padded %d frames with silence",
+        LOG_WRN("hr_infer_run: only %d/%d frames — padded %d with silence",
                 frames_to_copy, HR_MODEL_FRAMES,
                 HR_MODEL_FRAMES - frames_to_copy);
     }
 
-    /* Run inference */
     if (interpreter->Invoke() != kTfLiteOk) {
         LOG_ERR("hr_infer_run: Invoke() failed");
         return -1;
     }
 
-    /* Dequantize output */
     TfLiteTensor *output_tensor = interpreter->output(0);
     int8_t raw = output_tensor->data.int8[0];
 
@@ -224,6 +217,13 @@ int hr_infer_run(const float *mfcc_flat, int n_frames, hr_result_t *out)
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ * hr_infer_run_int8()  — pre-quantized INT8 input path (preferred)
+ *
+ * main.c fills s_mfcc_flat_q8[] frame-by-frame during on_mfcc_frame(),
+ * then passes the complete buffer here. We memcpy it straight into the
+ * input tensor — no float conversion needed.
+ * ══════════════════════════════════════════════════════════════════ */
 int hr_infer_run_int8(const int8_t *mfcc_q8, int n_frames, hr_result_t *out)
 {
     if (!initialised || !interpreter || !out) {
@@ -239,14 +239,14 @@ int hr_infer_run_int8(const int8_t *mfcc_q8, int n_frames, hr_result_t *out)
     /* Copy pre-quantized data directly — no float conversion needed */
     memcpy(input_data,
            mfcc_q8,
-           frames_to_copy * HR_MODEL_MFCC * sizeof(int8_t));
+           (size_t)frames_to_copy * HR_MODEL_MFCC * sizeof(int8_t));
 
     /* Zero-pad remaining frames using zero_point to represent 0.0 float */
     if (frames_to_copy < HR_MODEL_FRAMES) {
         int pad_start = frames_to_copy * HR_MODEL_MFCC;
         int pad_count = (HR_MODEL_FRAMES - frames_to_copy) * HR_MODEL_MFCC;
         memset(&input_data[pad_start], (uint8_t)HR_INPUT_ZP, pad_count);
-        LOG_WRN("hr_infer_run_int8: padded %d frames",
+        LOG_WRN("hr_infer_run_int8: padded %d frames with silence",
                 HR_MODEL_FRAMES - frames_to_copy);
     }
 

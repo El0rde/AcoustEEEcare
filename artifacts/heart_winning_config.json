@@ -1,0 +1,8 @@
+{
+  "target_rate": 2000,
+  "frame_ms": 25,
+  "hop_pct": 0.3,
+  "fft_size": 512,
+  "num_mel": 20,
+  "num_mfcc": 20
+}

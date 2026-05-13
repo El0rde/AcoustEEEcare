@@ -1,68 +1,125 @@
 /*
- * AcoustEEEcare — SAADC BLE + SD Card + TFLite Micro Edition
+ * AcoustEEEcare — SAADC BLE + SD Card Edition
  * ============================================================
- * v7.1 — Sequential heart + lung inference on shared 104 KB arena
+ * v6.8 — Fixed ERR:SD_OPEN (fs_open -2 / ENOENT after fs_mount)
  *
- * CHANGES FROM v6.8:
+ * CHANGES FROM v6.7:
  *
- *   [INF 1] Shared 104 KB tensor arena, sized to the reported
- *     requirement of the heart model.  Reused sequentially by lung
- *     inference (when ENABLE_LUNG_MODEL=1) on the same backing bytes.
+ *   [FIX 7] ERR:SD_OPEN / fs_open -2 after successful fs_mount.
+ *     Root cause: fs_mount() can return 0 (success) even when the FAT
+ *     volume is present but the directory structure is not ready for
+ *     file creation — for example when the card was ejected uncleanly,
+ *     the FAT root is valid but the working area is in an unexpected
+ *     state, or (on some SD/FatFs builds) the mount-point directory
+ *     entry itself does not exist yet.
  *
- *   [INF 1a] Genuine RAM reclamation via #if guards.
- *     When DSP_OFFLINE=1 and BLE_AUDIO_LIVE=0 the following ring
- *     buffers and helper allocations are no longer declared at all:
+ *     Three sub-fixes:
  *
- *       audio_ring        16 KB
- *       dsp_ring          32 KB
- *       heart_mfcc_ring    8 KB
- *       lung_mfcc_ring    16 KB
- *       dsp_pop_buf        1 KB
- *       DSP thread stack   3 KB (shrunk 4→1 KB; thread sleeps forever)
- *       ───────────────────────
- *       Total saved       76 KB
+ *     a) verify_sd_writable() — called once at the end of init_sd_card().
+ *        Creates and immediately deletes a small sentinel file
+ *        ("/SD:/acoustchk") to confirm the filesystem actually accepts
+ *        writes.  If this fails, sd_mounted is set to false so the
+ *        firmware returns ERR:NOSD (safe, informative) rather than
+ *        reaching ERR:SD_OPEN later.
  *
- *     This makes room for the 104 KB tensor_arena while keeping
- *     headroom for the kernel heap and remaining thread stacks.
+ *        NOTE: The sentinel filename must NOT start with '~'.  ELM FatFs
+ *        treats '~' as reserved for Windows 8.3 short-name generation and
+ *        returns FR_INVALID_NAME (-ENOENT / -2) — the same error we were
+ *        trying to catch.  Plain ASCII alphanumeric names are safe.
  *
- *     If you switch BLE_AUDIO_LIVE back to 1 or DSP_OFFLINE back to 0
- *     you must shrink TENSOR_ARENA_BYTES or RAM will overflow.
+ *     b) Per-file error logging in record_and_stream().
+ *        Each fs_open() call is now separate with its own LOG_ERR that
+ *        prints the exact path and errno, making future diagnosis easier.
  *
- *   [INF 2] Five-phase execution in record_and_stream():
- *     Phase 1: SAADC → audio.pcm        (~10 s)
- *     Phase 2: audio.pcm → MFCCs        (~23 s)
- *     Phase 3: heart_mfcc.f32 → hr.txt  (~few s)
- *     Phase 4: lung_mfcc.f32  → rr.txt  (~few s, same arena)
- *     Phase 5: BLE upload all files      (~24 s)
+ *     c) fs_mkdir(SD_CARD_MOUNT_POINT) guard before file opens.
+ *        Harmless on healthy cards (returns -EEXIST which is ignored);
+ *        on cards where the mount point directory entry is missing it
+ *        creates it so fs_open can succeed.
  *
- *   [INF 3] Heart and lung inference are independently enabled by
- *     ENABLE_HEART_MODEL and ENABLE_LUNG_MODEL.  When a model is
- *     disabled, that phase is skipped but the MFCC file is still
- *     captured and uploaded so you can validate the feature pipeline.
+ * CHANGES FROM v6.6 (carried forward from v6.7):
+ *   [FIX 1] DSP moved out of SAADC ISR into a dedicated dsp_thread.
+ *   [FIX 2] Eliminated double saadc_init() + next_dma_buf race.
+ *   [FIX 3] USE_SD set to true.
+ *   [FIX 4] half_produced_sem timeout raised 200 ms -> 500 ms.
+ *   [FIX 5] Stale reference to sd_file removed.
+ *   [FIX 6] SD ring buffer declarations moved above frame callbacks.
  *
- *   [INF 4] BLE file streaming extended.
- *     hr.txt and rr.txt are appended to the stream_list (only when
- *     the corresponding inference succeeded).  Protocol:
- *       RESULT_HEART_START:<bytes>\n … RESULT_HEART_END\n
- *       RESULT_LUNG_START:<bytes>\n  … RESULT_LUNG_END\n
+ * OVERLAY NOTE (xiao_ble.overlay):
+ *   spi-max-frequency = <4000000> is recommended for broad SD card
+ *   compatibility.  10 MHz works with most modern cards but some cheaper
+ *   cards mis-behave above 4–8 MHz, especially during write bursts.
+ *   If you see SD write errors during recording, drop to 4000000 first.
  *
- * ALL PREVIOUS FIXES (v6.8) ARE PRESERVED UNCHANGED.
+ * REMAINING DESIGN (unchanged from v6.7):
+ *   - No fs_write() in ISR — only ring_buf_put() + k_sem_give()
+ *   - Three ring buffers: audio_ring (16 KB BLE), audio_sd_ring
+ *     (32 KB SD audio), heart_mfcc_ring (8 KB), lung_mfcc_ring (16 KB)
+ *   - New dsp_ring (32 KB) for ISR->DSP thread handoff
+ *   - SD writer thread drains sd rings in 512-byte aligned sectors
+ *   - XOR checksum appended at end of audio file
+ *
+ * TARGET HARDWARE
+ *   Seeed XIAO nRF52840
+ *   Analog MEMS microphone on AIN0 (P0.02), cap-coupled
+ *   SD card on SPI2, CS on P0.28 (adjust overlay to your wiring)
  * ============================================================
  */
 
-#define USE_SD  true
+#define USE_SD  true   /* must be true — MFCC callbacks discard data when false */
 
-#define BLE_AUDIO_LIVE  0   /* must stay 0 for arena RAM to be available */
-#define DSP_OFFLINE     1   /* must stay 1 for arena RAM to be available */
+/* ────────────────────────────────────────────────────────────────────
+ * BLE_AUDIO_LIVE — controls when audio is streamed over BLE.
+ *
+ *   1 = OLD behavior. Audio is pushed to audio_ring in the SAADC ISR
+ *       and streamed over BLE in real time while recording.  This
+ *       competes with SD writer + DSP thread for CPU and was found to
+ *       starve all consumers when the lung MFCC pipeline at hop=5
+ *       takes ~50% of the M4F.
+ *
+ *   0 = NEW behavior. Audio is NOT pushed to audio_ring during the
+ *       SAADC capture window.  The SAADC ISR pushes only to dsp_ring
+ *       (for MFCC) and audio_sd_ring (for SD).  After SAADC stops and
+ *       the SD writer finishes, the audio file is opened from SD and
+ *       streamed back over BLE just like the heart/lung MFCC files.
+ *
+ * Why 0 is the current default: this gives the SD writer and DSP
+ * thread full CPU during the 10-second recording window, so we can
+ * capture the winning-config ground-truth audio + MFCCs cleanly.
+ * Once the MFCC params are tuned for the live workload, this can be
+ * re-enabled.
+ * ──────────────────────────────────────────────────────────────────── */
+#define BLE_AUDIO_LIVE  0
 
-/* ── Model enable flags ──────────────────────────────────────────
- * Set to 1 when the compiled-in model is ready.
- * Set to 0 to skip inference for that channel entirely —
- * the MFCC file is still captured and uploaded over BLE so you
- * can validate the feature extraction pipeline independently.
- * ─────────────────────────────────────────────────────────────── */
-#define ENABLE_HEART_MODEL  1   /* set to 0 while heart model absent */
-#define ENABLE_LUNG_MODEL   0   /* set to 1 once lung model is ready */
+/* ────────────────────────────────────────────────────────────────────
+ * DSP_OFFLINE — controls WHEN the MFCC pipelines process audio.
+ *
+ *   0 = OLD behavior. SAADC ISR pushes every half-buffer into dsp_ring;
+ *       the DSP thread drains the ring and runs both MFCC pipelines
+ *       in real time, concurrently with audio capture.  Heart and lung
+ *       MFCC frames are emitted to ring buffers and the SD writer
+ *       drains those rings into heart_mfcc.f32 / lung_mfcc.f32 as the
+ *       recording progresses.
+ *
+ *   1 = NEW (decoupled) behavior. The SAADC ISR does NOT push to
+ *       dsp_ring during the recording window.  The DSP thread stays
+ *       asleep.  Only audio capture + SD audio write happen during the
+ *       10-second recording.  After SAADC stops and the audio file
+ *       closes, the main thread re-reads the audio file from SD and
+ *       feeds it through both MFCC pipelines at maximum CPU speed
+ *       (no real-time constraint).  Frame callbacks write coefficients
+ *       directly to the open heart/lung MFCC files via fs_write.
+ *
+ * Why 1 is the current default: the lung pipeline at hop=5 needs
+ * ~48% of one M4F core to keep up in real time, which causes dsp_ring
+ * to overflow and ~36% of frames to be lost.  Decoupling the MFCC
+ * compute from real time gives bit-identical results with zero frame
+ * loss, at the cost of ~15-30 s extra wall-clock per recording.
+ * Total: ~10 s capture + ~30 s offline MFCC + ~12 s BLE upload.
+ *
+ * The MFCC math is IDENTICAL between modes: same dsp_mfcc.c, same
+ * RFFT, same mel filterbank, same DCT.  Only the timing differs.
+ * ──────────────────────────────────────────────────────────────────── */
+#define DSP_OFFLINE  1
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -95,9 +152,6 @@
 #include "heart_mfcc_config.h"
 #include "lung_mfcc_config.h"
 
-/* TFLite Micro inference (C-linkage wrapper around .cc implementation) */
-#include "tflm_inference.h"
-
 #if USE_SD
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
@@ -107,78 +161,12 @@
 LOG_MODULE_REGISTER(AcoustEEEcare);
 
 /* ══════════════════════════════════════════════════════════════════
- * [INF 1] SHARED TENSOR ARENA
- *
- * 104 KB static array — sized to the heart model's reported arena
- * requirement.  Used sequentially: heart inference runs first, then
- * (when ENABLE_LUNG_MODEL=1) lung inference reuses the same bytes.
- *
- * This fits because BLE_AUDIO_LIVE=0 and DSP_OFFLINE=1 cause the
- * audio_ring (16 KB), dsp_ring (32 KB), heart_mfcc_ring (8 KB) and
- * lung_mfcc_ring (16 KB) declarations to be skipped — freeing ~72 KB
- * of BSS that was previously occupied by them.  See the matching
- * #if guards on RING_BUF_DECLARE further down.
- *
- * Size budget after reclamation (rough):
- *   Old BSS usage              ~205 KB
- *   - audio_ring                -16 KB
- *   - dsp_ring                  -32 KB
- *   - heart_mfcc_ring            -8 KB
- *   - lung_mfcc_ring            -16 KB
- *   - dsp_pop_buf                -1 KB
- *   - DSP thread stack (4→1 KB)  -3 KB
- *   ───────────────────────────────
- *   New baseline BSS           ~129 KB
- *   + tensor_arena              104 KB
- *   ───────────────────────────────
- *   Total BSS                  ~233 KB
- *   Free for heap + stacks       23 KB   (256 - 233)
- *
- * If AllocateTensors() reports a different actual arena_used, log it
- * via tflm_inference and adjust TENSOR_ARENA_BYTES accordingly.
- * ══════════════════════════════════════════════════════════════════ */
-#define TENSOR_ARENA_BYTES  (135u * 1024u)
-
-/* Align to 16 bytes — TFLite Micro requires natural alignment for
- * its internal structs and SIMD scratch buffers. */
-static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __attribute__((aligned(16)));
-
-/* ══════════════════════════════════════════════════════════════════
- * [INF 2] STATIC MFCC LOAD BUFFER (inference input staging)
- *
- * Sized for the LARGER of heart and lung MFCC files:
- *   Heart: 1331 frames × 25 mfcc × 4 B = 133100 B ≈ 130 KB  ❌ too big
- *   Lung:  7981 frames × 13 mfcc × 4 B = 415012 B ≈ 405 KB  ❌ way too big
- *
- * Neither fits in RAM!  We CANNOT load the whole MFCC matrix into a
- * staging buffer — it has to go directly into the model's input
- * tensor (which is sized for whatever sequence length the model
- * expects, typically a downsampled summary of the full MFCC matrix).
- *
- * Strategy: read MFCC data from SD straight into input->data.raw.
- * The model's expected input size (typically a few KB) is the cap.
- *
- * If the model wants a smaller window than n_frames, the inference
- * code in tflm_inference.cc does the sub-sampling / windowing.
- *
- * No separate staging buffer is needed → we save the RAM that the
- * tail-of-arena trick was trying to claim.
- * ══════════════════════════════════════════════════════════════════ */
-
-/* ══════════════════════════════════════════════════════════════════
  * RAM USAGE REPORT
  * ══════════════════════════════════════════════════════════════════ */
 extern char _end;
 
 #define BLE_TX_STACK_SIZE     2048
-/* DSP thread stack: 1 KB is plenty when DSP_OFFLINE=1 — the thread
- * just sleeps on dsp_data_sem forever and never runs feed_chunk.
- * If you flip DSP_OFFLINE to 0, bump this back to 4096. */
-#if DSP_OFFLINE
-#define DSP_THREAD_STACK_SIZE 1024
-#else
-#define DSP_THREAD_STACK_SIZE 4096
-#endif
+#define DSP_THREAD_STACK_SIZE 4096   /* DSP thread needs room for RFFT scratch */
 #define SD_WRITER_STACK_SIZE  2048
 
 static struct k_thread ble_tx_thread_data;
@@ -201,8 +189,7 @@ static void report_ram_usage(void)
     LOG_INF("==================== RAM USAGE REPORT ====================");
     LOG_INF("BSS+data used:   %u bytes (%u KB)", bss_used,  bss_used  / 1024);
     LOG_INF("Free above BSS:  %u bytes (%u KB)", free_above, free_above / 1024);
-    LOG_INF("Tensor arena:    %u KB (declared, not all used until inference)",
-            TENSOR_ARENA_BYTES / 1024);
+    LOG_INF("  (heap + stacks live here; TFLM arena ceiling is a fraction of this)");
 
     size_t unused;
 
@@ -212,12 +199,14 @@ static void report_ram_usage(void)
                 (unsigned)BLE_TX_STACK_SIZE,
                 (unsigned)(unused * 100u / BLE_TX_STACK_SIZE));
     }
+
     if (k_thread_stack_space_get(&dsp_thread_data, &unused) == 0) {
         LOG_INF("DSP thread stack:%u / %u bytes used  (%u%% headroom)",
                 (unsigned)(DSP_THREAD_STACK_SIZE - unused),
                 (unsigned)DSP_THREAD_STACK_SIZE,
                 (unsigned)(unused * 100u / DSP_THREAD_STACK_SIZE));
     }
+
 #if USE_SD
     if (k_thread_stack_space_get(&sd_writer_thread_data, &unused) == 0) {
         LOG_INF("SD writer stack: %u / %u bytes used  (%u%% headroom)",
@@ -226,17 +215,19 @@ static void report_ram_usage(void)
                 (unsigned)(unused * 100u / SD_WRITER_STACK_SIZE));
     }
 #endif
+
     LOG_INF("Heart frames:    %u  (expected %d)",
             heart_frame_count, heart_pipeline.cfg->n_frames_expected);
     LOG_INF("Lung  frames:    %u  (expected %d)",
             lung_frame_count,  lung_pipeline.cfg->n_frames_expected);
+
     LOG_INF("==========================================================");
 }
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC CONFIG
  * ══════════════════════════════════════════════════════════════════ */
-#define SAADC_CC_VALUE      2000U
+#define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz */
 #define SAADC_IRQ_PRIORITY  6
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
@@ -256,6 +247,8 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
 
 static volatile uint32_t saadc_dma_overruns = 0;
 
+/* DC removal: high-pass IIR, alpha = 1/256.
+ * Init to 0 — converges within ~256 samples (~32 ms at 8 kHz). */
 #define ENABLE_DC_REMOVAL
 static int32_t dc_estimate = 0;
 
@@ -277,20 +270,11 @@ static uint16_t          nus_chunk_size   = 244;
 
 /* ══════════════════════════════════════════════════════════════════
  * BLE AUDIO RING BUFFER + TX THREAD
- *
- * Only declared when BLE_AUDIO_LIVE=1.  When 0 the 16 KB backing
- * array is NOT allocated, freeing that RAM for the tensor arena.
- *
- * half_produced_sem is kept unconditionally because the main thread
- * uses it to wait for SAADC half-buffer completions even in the
- * offline / non-live audio path.
  * ══════════════════════════════════════════════════════════════════ */
-static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
-
-#if BLE_AUDIO_LIVE
 #define AUDIO_RING_BYTES  (16 * 1024)
 RING_BUF_DECLARE(audio_ring, AUDIO_RING_BYTES);
 
+static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(audio_data_sem,    0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(tx_done_sem,       0, 1);
 
@@ -298,29 +282,42 @@ static atomic_t  ring_drops;
 static uint32_t  ring_high_water = 0;
 
 static uint16_t tx_seq = 0;
-#endif /* BLE_AUDIO_LIVE */
-
 #define CHUNK_HEADER_BYTES  4
 
 /* ══════════════════════════════════════════════════════════════════
  * DSP RING BUFFER + DSP THREAD
  *
- * Only declared when DSP_OFFLINE=0.  When 1 the 32 KB ring + 1 KB
- * pop buffer are NOT allocated, freeing 33 KB for the tensor arena.
- * The DSP thread stack is shrunk to 1 KB (it just sleeps forever).
+ * The ISR pushes raw int16 half-buffers here (ISR-safe ring_buf_put).
+ * The DSP thread drains them and calls dsp_mfcc_feed_chunk() — keeping
+ * all FPU-heavy work (RFFT, mel filterbank, DCT) out of interrupt context.
+ *
+ * Size: 32 KB = 20 half-buffers of headroom at 8 kHz (160 ms).
+ * That is far more than the DSP thread scheduling latency.
  * ══════════════════════════════════════════════════════════════════ */
-#if !DSP_OFFLINE
 #define DSP_RING_BYTES  (32 * 1024)
 RING_BUF_DECLARE(dsp_ring, DSP_RING_BYTES);
 
 static K_SEM_DEFINE(dsp_data_sem, 0, K_SEM_MAX_LIMIT);
-static K_SEM_DEFINE(dsp_done_sem, 0, 1);
+static K_SEM_DEFINE(dsp_done_sem, 0, 1);   /* DSP thread signals main when finished */
 
+/* Scratch buffer for DSP thread to pop samples into before feed_chunk */
 static int16_t dsp_pop_buf[HALF_BUF_SAMPLES];
-#endif /* !DSP_OFFLINE */
 
 /* ══════════════════════════════════════════════════════════════════
- * SD CARD DATA DECLARATIONS
+ * SD CARD DATA DECLARATIONS  (USE_SD true only)
+ *
+ * [FIX 6] Moved up from the lower #if USE_SD block so that
+ * heart_frame_cb() and lung_frame_cb() (below) can reference
+ * heart_mfcc_ring, lung_mfcc_ring, and sd_ring_drops without
+ * hitting undeclared-identifier errors.
+ *
+ * What lives here: path/size #defines, ring buffer declarations,
+ * sd_ring_drops, and the three *_ring_high_water counters.
+ *
+ * What stays in the lower #if USE_SD block: semaphores, thread stack,
+ * FATFS / fs_mount_t / file handles, compute_checksum(), init_sd_card(),
+ * and sd_writer_thread_fn() — none of those are referenced by the
+ * frame callbacks.
  * ══════════════════════════════════════════════════════════════════ */
 #if USE_SD
 
@@ -328,31 +325,32 @@ static int16_t dsp_pop_buf[HALF_BUF_SAMPLES];
 #define AUDIO_FILE_PATH      "/SD:/analog.pcm"
 #define HEART_MFCC_FILE_PATH "/SD:/heart_mfcc.f32"
 #define LUNG_MFCC_FILE_PATH  "/SD:/lung_mfcc.f32"
-#define HR_RESULT_FILE_PATH  "/SD:/hr.txt"
-#define RR_RESULT_FILE_PATH  "/SD:/rr.txt"
+
+/*
+ * [FIX 7] Sentinel filename for write-verify.
+ * Must be a plain alphanumeric name — do NOT use '~' as the first
+ * character.  ELM FatFs reserves '~' for Windows 8.3 short-name
+ * generation and returns FR_INVALID_NAME (-ENOENT, -2) for any
+ * filename that starts with it.  That is the exact error we are
+ * trying to detect, so using '~' caused verify_sd_writable() to
+ * always fail even on a perfectly healthy, freshly-formatted card.
+ */
 #define SD_INIT_CHECK_PATH   "/SD:/acoustchk"
 
 #define CHECKSUM_SIZE        sizeof(uint32_t)
 
-#define AUDIO_SD_RING_BYTES      (16 * 1024) 
-
-RING_BUF_DECLARE(audio_sd_ring,   AUDIO_SD_RING_BYTES);
-
-/* heart_mfcc_ring and lung_mfcc_ring are only needed in the online
- * DSP path: SAADC ISR → dsp_ring → DSP thread → MFCC ring → SD writer.
- * In offline mode the frame callbacks fs_write coefficients directly
- * to the open MFCC files, so these rings are dead RAM. */
-#if !DSP_OFFLINE
+#define AUDIO_SD_RING_BYTES      (32 * 1024)
 #define HEART_MFCC_RING_BYTES    ( 8 * 1024)
 #define LUNG_MFCC_RING_BYTES     (16 * 1024)
+
+RING_BUF_DECLARE(audio_sd_ring,   AUDIO_SD_RING_BYTES);
 RING_BUF_DECLARE(heart_mfcc_ring, HEART_MFCC_RING_BYTES);
 RING_BUF_DECLARE(lung_mfcc_ring,  LUNG_MFCC_RING_BYTES);
-static uint32_t  heart_ring_high_water = 0;
-static uint32_t  lung_ring_high_water  = 0;
-#endif /* !DSP_OFFLINE */
 
 static atomic_t  sd_ring_drops;
 static uint32_t  audio_ring_high_water = 0;
+static uint32_t  heart_ring_high_water = 0;
+static uint32_t  lung_ring_high_water  = 0;
 
 #endif /* USE_SD — data declarations */
 
@@ -363,10 +361,21 @@ static int16_t heart_window[50];
 static int16_t lung_window[100];
 
 #if USE_SD
+/* Offline-mode direct-to-file pointers.  When non-NULL, the frame
+ * callbacks fs_write coefficients to these files instead of pushing
+ * to the heart/lung MFCC ring buffers.  Set by process_audio_offline()
+ * for the duration of the offline MFCC pass; reset to NULL afterwards.
+ *
+ * Important: these are only safe to read/write from a single thread
+ * (the main thread, during offline processing).  In offline mode the
+ * DSP thread never runs, so there is no concurrency. */
 static struct fs_file_t *offline_heart_fp = NULL;
 static struct fs_file_t *offline_lung_fp  = NULL;
 #endif
 
+/* Heart frame callback.
+ * In online mode: invoked from DSP thread; pushes coeffs to heart_mfcc_ring.
+ * In offline mode: invoked from main thread; writes coeffs to offline_heart_fp. */
 static void heart_frame_cb(int idx, const float *coeffs, void *user)
 {
     (void)user; (void)idx;
@@ -374,26 +383,27 @@ static void heart_frame_cb(int idx, const float *coeffs, void *user)
 
 #if USE_SD
     const uint32_t bytes = heart_pipeline.cfg->n_mfcc * sizeof(float);
+
     if (offline_heart_fp != NULL) {
+        /* Offline mode: direct fs_write.  No ring buffer involved. */
         ssize_t w = fs_write(offline_heart_fp, coeffs, bytes);
         if (w != (ssize_t)bytes) {
             LOG_WRN_ONCE("offline heart fs_write short: %d/%u", (int)w, bytes);
         }
-    }
-#if !DSP_OFFLINE
-    else {
+    } else {
+        /* Online mode: push to ring for SD writer thread to drain. */
         uint32_t put = ring_buf_put(&heart_mfcc_ring,
                                     (const uint8_t *)coeffs, bytes);
         if (put != bytes) {
             atomic_inc(&sd_ring_drops);
         }
     }
-#endif
 #else
     (void)coeffs;
 #endif
 }
 
+/* Lung frame callback. Same dispatch logic as heart_frame_cb. */
 static void lung_frame_cb(int idx, const float *coeffs, void *user)
 {
     (void)user; (void)idx;
@@ -401,28 +411,26 @@ static void lung_frame_cb(int idx, const float *coeffs, void *user)
 
 #if USE_SD
     const uint32_t bytes = lung_pipeline.cfg->n_mfcc * sizeof(float);
+
     if (offline_lung_fp != NULL) {
         ssize_t w = fs_write(offline_lung_fp, coeffs, bytes);
         if (w != (ssize_t)bytes) {
             LOG_WRN_ONCE("offline lung fs_write short: %d/%u", (int)w, bytes);
         }
-    }
-#if !DSP_OFFLINE
-    else {
+    } else {
         uint32_t put = ring_buf_put(&lung_mfcc_ring,
                                     (const uint8_t *)coeffs, bytes);
         if (put != bytes) {
             atomic_inc(&sd_ring_drops);
         }
     }
-#endif
 #else
     (void)coeffs;
 #endif
 }
 
 #define BLE_TX_PRIORITY     5
-#define DSP_THREAD_PRIORITY 7
+#define DSP_THREAD_PRIORITY 7   /* below BLE TX (5) and SD writer (6) */
 
 static K_THREAD_STACK_DEFINE(ble_tx_stack,     BLE_TX_STACK_SIZE);
 static K_THREAD_STACK_DEFINE(dsp_thread_stack, DSP_THREAD_STACK_SIZE);
@@ -432,35 +440,29 @@ static void dsp_thread_fn(void *a, void *b, void *c);
 /* ══════════════════════════════════════════════════════════════════
  * DSP THREAD
  *
- * In offline mode (DSP_OFFLINE=1) this thread is created but
- * immediately sleeps forever — it does no work.  We keep the
- * thread creation so report_ram_usage's k_thread_stack_space_get
- * call stays valid.  Stack is shrunk to 1 KB elsewhere.
- * When DSP_OFFLINE=0 the thread drains dsp_ring as before.
+ * Drains dsp_ring and runs both MFCC pipelines. Signals dsp_done_sem
+ * once recording stops and dsp_ring is fully drained.
  * ══════════════════════════════════════════════════════════════════ */
 static void dsp_thread_fn(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
-#if DSP_OFFLINE
-    while (true) {
-        k_sleep(K_FOREVER);
-    }
-#else
     while (true) {
         k_sem_take(&dsp_data_sem, K_FOREVER);
 
+        /* Drain dsp_ring while recording or while data remains */
         while (analog_recording || ring_buf_size_get(&dsp_ring) > 0) {
             uint32_t avail = ring_buf_size_get(&dsp_ring);
             if (avail < HALF_BUF_BYTES) {
-                if (!analog_recording) break;
+                if (!analog_recording) break;   /* done — ring is empty */
                 k_sleep(K_MSEC(1));
                 continue;
             }
+
             uint32_t got = ring_buf_get(&dsp_ring,
                                         (uint8_t *)dsp_pop_buf,
                                         HALF_BUF_BYTES);
-            if (got != HALF_BUF_BYTES) continue;
+            if (got != HALF_BUF_BYTES) continue;   /* partial read — skip */
 
             dsp_mfcc_feed_chunk(&heart_pipeline, dsp_pop_buf, HALF_BUF_SAMPLES);
             dsp_mfcc_feed_chunk(&lung_pipeline,  dsp_pop_buf, HALF_BUF_SAMPLES);
@@ -468,11 +470,14 @@ static void dsp_thread_fn(void *a, void *b, void *c)
 
         k_sem_give(&dsp_done_sem);
     }
-#endif /* DSP_OFFLINE */
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * SD CARD GLOBALS
+ * SD CARD GLOBALS  (USE_SD true only)
+ *
+ * Semaphores, thread stack, FATFS, file handles, helpers, and the
+ * writer thread body. Ring buffer + atomic declarations have been
+ * moved to the earlier #if USE_SD block above (see [FIX 6]).
  * ══════════════════════════════════════════════════════════════════ */
 #if USE_SD
 
@@ -491,14 +496,8 @@ static struct fs_mount_t mp = {
 };
 static bool             sd_mounted   = false;
 static struct fs_file_t sd_audio_file;
-#if !DSP_OFFLINE
-/* heart/lung file handles only used in the online DSP path where the
- * SD writer streams MFCC frames in real time.  In offline mode the
- * MFCC pass in process_audio_offline() opens its own local file
- * handles, so these are unused and would warn under -Wunused-variable. */
 static struct fs_file_t sd_heart_file;
 static struct fs_file_t sd_lung_file;
-#endif
 static uint32_t         sd_checksum  = 0;
 
 #define SD_WRITE_BUF_SIZE  512
@@ -511,7 +510,26 @@ static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
     return cs;
 }
 
-/* ── [FIX 7a] SD write-verify ─────────────────────────────────── */
+/* ── [FIX 7a] SD write-verify: create + delete a sentinel file ── */
+/*
+ * verify_sd_writable()
+ *
+ * fs_mount() returning 0 does not guarantee the filesystem can actually
+ * create files — it only means the FAT superblock was parsed.  On cards
+ * that were ejected uncleanly, the first fs_open(FS_O_CREATE) can fail
+ * with -ENOENT even though sd_mounted would be true.
+ *
+ * This function creates a tiny sentinel file, confirms the write
+ * succeeded, then deletes it.  Called once at the end of init_sd_card().
+ * If it fails, sd_mounted is forced to false so record_and_stream()
+ * returns ERR:NOSD (clear) instead of ERR:SD_OPEN (confusing).
+ *
+ * IMPORTANT: SD_INIT_CHECK_PATH must not start with '~'.  ELM FatFs
+ * reserves '~' for 8.3 short-name generation and returns -ENOENT for
+ * such names — which would make this function always fail.
+ *
+ * Returns 0 on success, negative errno on failure.
+ */
 static int verify_sd_writable(void)
 {
     struct fs_file_t f;
@@ -572,6 +590,11 @@ static int init_sd_card(void)
     LOG_INF("SD mounted at %s", SD_CARD_MOUNT_POINT);
     sd_mounted = true;
 
+    /* [FIX 7a] Confirm the filesystem can actually create files.
+     * If this fails the card is physically present but not write-ready
+     * (corrupt FAT, write-protected, or wrong format).  Force
+     * sd_mounted = false so the firmware gives ERR:NOSD, not
+     * the cryptic ERR:SD_OPEN. */
     if (verify_sd_writable() != 0) {
         LOG_ERR("SD mounted but not writable — treating as absent");
         fs_unmount(&mp);
@@ -592,44 +615,34 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 
         if (!sd_mounted) {
             LOG_ERR("SD writer: not mounted, discarding data");
-            while (ring_buf_size_get(&audio_sd_ring) > 0
-#if !DSP_OFFLINE
-                || ring_buf_size_get(&heart_mfcc_ring) > 0
-                || ring_buf_size_get(&lung_mfcc_ring)  > 0
-#endif
-            ) {
-                ring_buf_get(&audio_sd_ring, sd_write_buf,
-                             MIN(ring_buf_size_get(&audio_sd_ring), SD_WRITE_BUF_SIZE));
-#if !DSP_OFFLINE
+            while (ring_buf_size_get(&audio_sd_ring)   > 0 ||
+                   ring_buf_size_get(&heart_mfcc_ring) > 0 ||
+                   ring_buf_size_get(&lung_mfcc_ring)  > 0) {
+                ring_buf_get(&audio_sd_ring,   sd_write_buf,
+                             MIN(ring_buf_size_get(&audio_sd_ring),   SD_WRITE_BUF_SIZE));
                 ring_buf_get(&heart_mfcc_ring, sd_write_buf,
                              MIN(ring_buf_size_get(&heart_mfcc_ring), SD_WRITE_BUF_SIZE));
                 ring_buf_get(&lung_mfcc_ring,  sd_write_buf,
                              MIN(ring_buf_size_get(&lung_mfcc_ring),  SD_WRITE_BUF_SIZE));
-#endif
             }
             k_sem_give(&sd_done_sem);
             continue;
         }
 
-        LOG_INF("SD writer: starting write loop");
+        LOG_INF("SD writer: starting write loop (3 files)");
         uint32_t audio_written = 0;
-#if !DSP_OFFLINE
         uint32_t heart_written = 0;
         uint32_t lung_written  = 0;
-#endif
         sd_checksum = 0;
 
         while (analog_recording ||
-               ring_buf_size_get(&audio_sd_ring) > 0
-#if !DSP_OFFLINE
-               || ring_buf_size_get(&heart_mfcc_ring) > 0
-               || ring_buf_size_get(&lung_mfcc_ring)  > 0
-#endif
-        ) {
+               ring_buf_size_get(&audio_sd_ring)   > 0 ||
+               ring_buf_size_get(&heart_mfcc_ring) > 0 ||
+               ring_buf_size_get(&lung_mfcc_ring)  > 0) {
 
             bool did_work = false;
 
-            /* ── Audio ring (always present) ── */
+            /* ── Audio ring ── */
             {
                 uint32_t avail = ring_buf_size_get(&audio_sd_ring);
                 bool done = !analog_recording;
@@ -645,8 +658,7 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 }
             }
 
-#if !DSP_OFFLINE
-            /* ── Heart MFCC ring (online DSP only) ── */
+            /* ── Heart MFCC ring ── */
             {
                 uint32_t avail = ring_buf_size_get(&heart_mfcc_ring);
                 bool done = !analog_recording;
@@ -661,7 +673,7 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 }
             }
 
-            /* ── Lung MFCC ring (online DSP only) ── */
+            /* ── Lung MFCC ring ── */
             {
                 uint32_t avail = ring_buf_size_get(&lung_mfcc_ring);
                 bool done = !analog_recording;
@@ -675,30 +687,22 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                     did_work = true;
                 }
             }
-#endif /* !DSP_OFFLINE */
 
             if (!did_work) {
                 k_sleep(K_MSEC(1));
             }
         }
 
+        /* Append audio checksum, close all three files */
         fs_write(&sd_audio_file, &sd_checksum, CHECKSUM_SIZE);
         fs_close(&sd_audio_file);
-#if !DSP_OFFLINE
         fs_close(&sd_heart_file);
         fs_close(&sd_lung_file);
-#endif
 
-#if !DSP_OFFLINE
         LOG_INF("SD writer done: audio=%u B  heart=%u B  lung=%u B",
                 audio_written, heart_written, lung_written);
         LOG_INF("Ring high-water: audio=%u  heart=%u  lung=%u",
                 audio_ring_high_water, heart_ring_high_water, lung_ring_high_water);
-#else
-        LOG_INF("SD writer done: audio=%u B (offline DSP -> MFCC written later)",
-                audio_written);
-        LOG_INF("Ring high-water: audio=%u", audio_ring_high_water);
-#endif
 
         k_sem_give(&sd_done_sem);
     }
@@ -707,13 +711,25 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 #if DSP_OFFLINE
 /* ══════════════════════════════════════════════════════════════════
  * OFFLINE MFCC PROCESSING (Phase 2)
+ *
+ * Called after the SAADC capture phase has fully completed and the
+ * audio file on SD has been closed.  Re-opens the audio file for
+ * read, opens heart and lung MFCC files for write, then feeds the
+ * audio through both MFCC pipelines on the main thread.  Frame
+ * callbacks write coefficients directly to the open MFCC files
+ * (no ring buffers, no DSP thread).
+ *
+ * Runs at maximum CPU speed -- no real-time constraint.  Typical
+ * duration for 10 s of audio at heart hop=15 + lung hop=5: 15-30 s.
+ *
+ * Returns 0 on success, negative errno on failure.
  * ══════════════════════════════════════════════════════════════════ */
 static int process_audio_offline(void)
 {
     int rc = 0;
-    struct fs_file_t fa;
-    struct fs_file_t fh;
-    struct fs_file_t fl;
+    struct fs_file_t fa;          /* audio file (read)       */
+    struct fs_file_t fh;          /* heart MFCC file (write) */
+    struct fs_file_t fl;          /* lung MFCC file (write)  */
 
     fs_file_t_init(&fa);
     fs_file_t_init(&fh);
@@ -744,18 +760,28 @@ static int process_audio_offline(void)
         return rc;
     }
 
+    /* Reset both pipelines for a fresh pass.  This zeros their biquad
+     * state, sliding windows, decim_phase, hop_counter, and frames_emitted.
+     * After this, frame_emitted will count the actual offline frames. */
     dsp_mfcc_reset(&heart_pipeline);
     dsp_mfcc_reset(&lung_pipeline);
     heart_frame_count = 0;
     lung_frame_count  = 0;
 
+    /* Engage offline-callback dispatch: from now until we clear these,
+     * the frame callbacks fs_write to fh / fl instead of pushing to
+     * the heart_mfcc_ring / lung_mfcc_ring. */
     offline_heart_fp = &fh;
     offline_lung_fp  = &fl;
 
+    /* Read the audio file in HALF_BUF_BYTES chunks (1024 B = 512 int16
+     * samples) -- same granularity the SAADC ISR used originally.  We
+     * deliberately stop after TOTAL_AUDIO_BYTES to skip the XOR checksum
+     * that the SD writer appended at end-of-file. */
     int16_t  read_buf[HALF_BUF_SAMPLES];
     uint32_t bytes_read_total = 0;
     int      chunk_idx        = 0;
-    int64_t  t_start          = k_uptime_get();
+    int64_t  t_start           = k_uptime_get();
 
     while (bytes_read_total < TOTAL_AUDIO_BYTES) {
         uint32_t want = MIN((uint32_t)sizeof(read_buf),
@@ -768,17 +794,26 @@ static int process_audio_offline(void)
         }
         int samples = (int)(got / sizeof(int16_t));
 
+        /* Feed both pipelines.  These calls will synchronously invoke
+         * heart_frame_cb / lung_frame_cb when a frame is ready, which
+         * fs_write directly to fh / fl. */
         dsp_mfcc_feed_chunk(&heart_pipeline, read_buf, samples);
         dsp_mfcc_feed_chunk(&lung_pipeline,  read_buf, samples);
 
         bytes_read_total += (uint32_t)got;
         chunk_idx++;
 
+        /* Yield periodically so the BLE stack and watchdog can run.
+         * BLE supervision timeout is ~400 ms; processing 4 chunks
+         * (~256 ms of audio, ~128 ms of CPU at ~50% load) keeps us
+         * well under that ceiling. */
         if ((chunk_idx & 3) == 0) {
             k_yield();
         }
     }
 
+    /* Disengage offline-callback dispatch BEFORE closing files, so
+     * any stray late callback can't write to a closed handle. */
     offline_heart_fp = NULL;
     offline_lung_fp  = NULL;
 
@@ -800,6 +835,14 @@ static int process_audio_offline(void)
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC EVENT HANDLER
+ *
+ * Kept intentionally minimal — only ISR-safe operations:
+ *   1. DC removal (simple IIR, no FPU division)
+ *   2. ring_buf_put into dsp_ring   -> wakes DSP thread
+ *   3. ring_buf_put into audio_sd_ring (USE_SD)
+ *   4. ring_buf_put into audio_ring  -> wakes BLE TX thread
+ *
+ * NO dsp_mfcc_feed_chunk() here. All RFFT/mel/DCT runs in dsp_thread.
  * ══════════════════════════════════════════════════════════════════ */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
@@ -813,6 +856,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
     case NRFX_SAADC_EVT_DONE: {
         int16_t *filled_buf = p_event->data.done.p_buffer;
 
+        /* ── Step 1: DC removal ── */
 #ifdef ENABLE_DC_REMOVAL
         for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
             dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 8;
@@ -820,6 +864,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
+        /* ── Step 2: Push to DSP ring (ISR-safe) — DSP thread does the math ── */
 #if !DSP_OFFLINE
         uint32_t dsp_written = ring_buf_put(&dsp_ring,
                                             (const uint8_t *)filled_buf,
@@ -831,6 +876,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 #endif
 
 #if USE_SD
+        /* ── Step 3: Push raw audio to SD audio ring (ISR-safe) ── */
         if (analog_recording) {
             uint32_t sd_written = ring_buf_put(&audio_sd_ring,
                                                (const uint8_t *)filled_buf,
@@ -847,6 +893,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
+        /* ── Step 4: Push to BLE audio ring ── */
 #if BLE_AUDIO_LIVE
         uint32_t ble_written = ring_buf_put(&audio_ring,
                                             (const uint8_t *)filled_buf,
@@ -915,6 +962,8 @@ static int saadc_start_streaming(void)
     heart_frame_count = 0;
     lung_frame_count  = 0;
 
+    /* [FIX 2] Set next_dma_buf BEFORE saadc_init() to prevent the race
+     * where EVT_BUF_REQ fires between init and the assignment. */
     next_dma_buf = 1;
 
     if (saadc_init() != 0) return -EIO;
@@ -933,11 +982,7 @@ static void saadc_stop_streaming(void)
     nrfx_saadc_uninit();
     LOG_INF("SAADC stopped (overruns=%u, ble_drops=%u, sd_drops=%u)",
             saadc_dma_overruns,
-#if BLE_AUDIO_LIVE
             (uint32_t)atomic_get(&ring_drops)
-#else
-            0U
-#endif
 #if USE_SD
             , (uint32_t)atomic_get(&sd_ring_drops)
 #else
@@ -962,7 +1007,6 @@ static inline void led_set_green(void)  { led_off(&red_led); led_on(&green_led);
 static inline void led_set_cyan(void)   { led_off(&red_led); led_on(&green_led);  led_on(&blue_led);  }
 static inline void led_set_yellow(void) { led_on(&red_led);  led_on(&green_led);  led_off(&blue_led); }
 static inline void led_set_purple(void) { led_on(&red_led);  led_off(&green_led); led_on(&blue_led);  }
-static inline void led_set_blue(void)   { led_off(&red_led); led_off(&green_led); led_on(&blue_led);  }
 
 static void led_error_flash(void (*color)(void))
 {
@@ -1079,20 +1123,10 @@ static struct bt_nus_cb nus_listener = { .received = received };
 
 /* ══════════════════════════════════════════════════════════════════
  * BLE TX THREAD
- *
- * When BLE_AUDIO_LIVE=0 this thread is created but sleeps forever.
- * All audio (and MFCC, and results) are streamed over BLE later
- * by the main thread from SD files; no live audio path is used.
  * ══════════════════════════════════════════════════════════════════ */
 static void ble_tx_thread_fn(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-
-#if !BLE_AUDIO_LIVE
-    while (true) {
-        k_sleep(K_FOREVER);
-    }
-#else
     uint8_t chunk[251];
     bool    finished_sent = false;
 
@@ -1141,52 +1175,37 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
             tx_seq = (tx_seq + 1) & 0xFFFF;
         }
     }
-#endif /* BLE_AUDIO_LIVE */
 }
 
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
- *
- * Five phases:
- *   Phase 1: SAADC capture → audio.pcm           (~10 s)
- *   Phase 2: audio.pcm → heart/lung .f32          (~23 s)
- *   Phase 3: heart_mfcc.f32 → heart model → hr.txt
- *   Phase 4: lung_mfcc.f32  → lung model  → rr.txt
- *   Phase 5: BLE upload (audio + MFCCs + results)  (~24 s)
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
 
-    /* ── Reset semaphores ── */
-    k_sem_reset(&half_produced_sem);
-
-#if BLE_AUDIO_LIVE
     /* ── Reset BLE audio ring ── */
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
     tx_seq          = 0;
+    k_sem_reset(&half_produced_sem);
     k_sem_reset(&tx_done_sem);
-#endif
 
-#if !DSP_OFFLINE
     /* ── Reset DSP ring ── */
     ring_buf_reset(&dsp_ring);
     k_sem_reset(&dsp_done_sem);
-#endif
 
 #if USE_SD
+    /* ── Reset SD rings ── */
     ring_buf_reset(&audio_sd_ring);
-    atomic_set(&sd_ring_drops, 0);
-    audio_ring_high_water = 0;
-#if !DSP_OFFLINE
     ring_buf_reset(&heart_mfcc_ring);
     ring_buf_reset(&lung_mfcc_ring);
+    atomic_set(&sd_ring_drops, 0);
+    audio_ring_high_water = 0;
     heart_ring_high_water = 0;
     lung_ring_high_water  = 0;
-#endif
     k_sem_reset(&sd_done_sem);
 
     if (!sd_mounted) {
@@ -1196,18 +1215,26 @@ static void record_and_stream(void)
         return;
     }
 
+    /* [FIX 7b] Ensure mount-point directory entry exists.
+     * Harmless on healthy cards (-EEXIST is silently ignored). */
+    
+    /*
+    int mkdir_rc = fs_mkdir(SD_CARD_MOUNT_POINT);
+    if (mkdir_rc < 0 && mkdir_rc != -EEXIST) {
+        LOG_WRN("fs_mkdir(%s) returned %d (non-fatal)",
+                SD_CARD_MOUNT_POINT, mkdir_rc);
+    }
+    */
+
+    /* Open three files, truncating any previous recording.
+     * [FIX 7c] Each fs_open is a separate call with its own error log. */
     fs_unlink(AUDIO_FILE_PATH);
     fs_unlink(HEART_MFCC_FILE_PATH);
     fs_unlink(LUNG_MFCC_FILE_PATH);
-    /* Also clean up stale result files from previous recording */
-    fs_unlink(HR_RESULT_FILE_PATH);
-    fs_unlink(RR_RESULT_FILE_PATH);
 
     fs_file_t_init(&sd_audio_file);
-#if !DSP_OFFLINE
     fs_file_t_init(&sd_heart_file);
     fs_file_t_init(&sd_lung_file);
-#endif
 
     int rc_audio = fs_open(&sd_audio_file, AUDIO_FILE_PATH,
                             FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
@@ -1218,10 +1245,6 @@ static void record_and_stream(void)
         return;
     }
 
-#if !DSP_OFFLINE
-    /* In online DSP mode the SD writer streams MFCC frames into these
-     * files as the DSP thread emits them.  In offline mode they are
-     * opened later by process_audio_offline() after capture finishes. */
     int rc_heart = fs_open(&sd_heart_file, HEART_MFCC_FILE_PATH,
                             FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
     if (rc_heart < 0) {
@@ -1242,45 +1265,64 @@ static void record_and_stream(void)
         led_error_flash(led_set_yellow);
         return;
     }
-#endif /* !DSP_OFFLINE */
-#endif /* USE_SD */
+    /* [FIX 8] sd_data_sem give MOVED — see below */
+#endif
+
+    /* Send audio length to host -- only needed when live-streaming.
+     * When BLE_AUDIO_LIVE=0 the START: header is sent later as part of
+     * the post-recording file streaming loop. */
+#if BLE_AUDIO_LIVE
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "START:%u\n", (uint32_t)TOTAL_AUDIO_BYTES);
+    bt_nus_send(NULL, hdr, strlen(hdr));
+    k_sleep(K_MSEC(10));
+#endif
 
     led_set_cyan();
 
-    /* ── [FIX 8] Set flag before waking drainer threads ── */
+    /* [FIX 8] Set analog_recording = true BEFORE waking either drainer thread.
+     * Previously the SD writer was woken before this flag was set; it saw
+     * empty rings + analog_recording==false, decided the recording was
+     * already over, and exited within 16 ms. The SAADC then dropped 10 s
+     * of audio (sd_drops=4589) because nothing was draining audio_sd_ring.
+     * Same race existed for the DSP thread but it was less visible because
+     * dsp_data_sem is given again from the ISR on every half-buffer. */
     analog_recording = true;
 
 #if USE_SD
-    k_sem_give(&sd_data_sem);
+    k_sem_give(&sd_data_sem);   /* now safe: writer will see recording in progress */
 #endif
 #if !DSP_OFFLINE
+    /* In offline mode the DSP thread never processes anything;
+     * it stays asleep on dsp_data_sem forever.  Only wake it in
+     * online mode. */
     k_sem_give(&dsp_data_sem);
 #endif
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 1: SAADC capture
-     * ════════════════════════════════════════════════════════════ */
-    LOG_INF("Phase 1: SAADC capture — %d s @ %d Hz", DURATION_S, SAMPLING_RATE);
 
     if (saadc_start_streaming() != 0) {
         analog_recording = false;
 #if USE_SD
         fs_close(&sd_audio_file);
-#if !DSP_OFFLINE
         fs_close(&sd_heart_file);
         fs_close(&sd_lung_file);
-#endif
 #endif
         led_error_flash(led_set_yellow);
         bt_nus_send(NULL, "ERR:SAADC", 9);
         return;
     }
 
+    LOG_INF("Recording %d s @ %d Hz (USE_SD=%s)...", DURATION_S, SAMPLING_RATE,
+            USE_SD ? "true" : "false");
+
     for (uint32_t h = 0; h < total_halves; h++) {
         if (k_sem_take(&half_produced_sem, K_MSEC(500)) != 0) {
             LOG_ERR("SAADC timeout at half-buffer %u/%u", h, total_halves);
             analog_recording = false;
             saadc_stop_streaming();
+#if BLE_AUDIO_LIVE
+            k_sem_give(&audio_data_sem);
+            k_sem_take(&tx_done_sem, K_MSEC(10000));
+#endif
             bt_nus_send(NULL, "ERR:TIMEOUT", 11);
             return;
         }
@@ -1289,45 +1331,60 @@ static void record_and_stream(void)
     saadc_stop_streaming();
     analog_recording = false;
 
+#if BLE_AUDIO_LIVE
+    /* Wake BLE TX thread so it can drain audio_ring and send "finished\n". */
+    k_sem_give(&audio_data_sem);
+
+    if (k_sem_take(&tx_done_sem, K_MSEC(10000)) != 0) {
+        LOG_WRN("BLE TX did not finish within 10 s");
+    }
+#endif
+
 #if !DSP_OFFLINE
     if (k_sem_take(&dsp_done_sem, K_MSEC(30000)) != 0) {
-        LOG_WRN("DSP thread did not finish within 30 s");
+        LOG_WRN("DSP thread did not finish within 30 s — MFCC may be incomplete");
     }
 #endif
 
 #if USE_SD
-    LOG_INF("Phase 1 done — waiting for SD writer to flush...");
+    LOG_INF("Waiting for SD writer to flush and close...");
     bool sd_ok = false;
     if (k_sem_take(&sd_done_sem, K_MSEC(15000)) != 0) {
-        LOG_ERR("SD writer timeout — file may be truncated");
+        LOG_ERR("SD writer did not finish within 15 s — file may be truncated");
     } else {
-        LOG_INF("SD audio closed (checksum=0x%08X, drops=%u)",
+        LOG_INF("SD files closed (audio checksum=0x%08X, drops=%u)",
                 sd_checksum, (uint32_t)atomic_get(&sd_ring_drops));
         sd_ok = true;
-    }
-
-    if (!sd_ok) {
-        bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
+#if BLE_AUDIO_LIVE
+        /* Live-audio flow: audio was already streamed during recording
+         * (terminated by "finished\n"), so SD:OK\n goes here, before
+         * the MFCC streams.  When BLE_AUDIO_LIVE=0 we delay this send
+         * until after the audio file has been streamed -- see the file
+         * streaming loop below. */
+        bt_nus_send(NULL, "SD:OK\n", 6);
+#endif
     }
 #endif
 
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 2: Offline MFCC
-     * ════════════════════════════════════════════════════════════ */
 #if DSP_OFFLINE && USE_SD
-    LOG_INF("Phase 2: offline MFCC processing...");
-    led_set_yellow();
-
-    int mfcc_rc = process_audio_offline();
-    if (mfcc_rc < 0) {
-        LOG_ERR("Offline MFCC failed: %d", mfcc_rc);
-        bt_nus_send(NULL, "ERR:DSP", 7);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
+    /* ── Phase 2: Offline MFCC processing ─────────────────────────────
+     * SD writer has closed all three files; audio file contains all
+     * 161792 B of captured PCM (plus a 4-byte XOR checksum at the tail
+     * which we skip).  Re-read the audio file from SD, feed it through
+     * both MFCC pipelines, and write coefficients directly to the
+     * heart/lung files.  No real-time constraint -- runs as fast as
+     * the M4F + SD reads allow. */
+    if (sd_ok) {
+        int rc = process_audio_offline();
+        if (rc < 0) {
+            LOG_ERR("Offline MFCC processing failed: %d", rc);
+            bt_nus_send(NULL, "ERR:DSP", 7);
+            led_error_flash(led_set_yellow);
+            led_set_green();
+            return;
+        }
+    } else {
+        LOG_ERR("Skipping offline MFCC because SD writer didn't finish");
     }
 #endif
 
@@ -1347,136 +1404,42 @@ static void record_and_stream(void)
     }
 
 #if USE_SD
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 3: Heart model inference
+    /* ── Stream SD files back over BLE ────────────────────────────────
      *
-     * arena = tensor_arena (104 KB, statically declared above).
-     * The arena is freshly available because MFCC is done and
-     * no other consumer touches it.
-     * ════════════════════════════════════════════════════════════ */
-    heart_result_t heart_result;
-    heart_result.rc = -ENOTSUP;
-    heart_result.value = 0.f;
-    heart_result.confidence = 0.f;
-    heart_result.class_idx = -1;
-
-#if ENABLE_HEART_MODEL
-    LOG_INF("Phase 3: heart inference (%d frames × %d coeffs)...",
-            hf, heart_pipeline.cfg->n_mfcc);
-    led_set_blue();
-
-    run_heart_inference(tensor_arena,
-                        TENSOR_ARENA_BYTES,
-                        HEART_MFCC_FILE_PATH,
-                        hf,
-                        heart_pipeline.cfg->n_mfcc,
-                        &heart_result);
-
-    if (heart_result.rc < 0) {
-        LOG_ERR("Heart inference failed: %d", heart_result.rc);
-        bt_nus_send(NULL, "ERR:HEART_INF", 13);
-        /* Non-fatal: continue to lung inference */
-    } else {
-        LOG_INF("Heart result: HR=%.0f BPM (confidence=%.3f, class=%d)",
-                (double)heart_result.value,
-                (double)heart_result.confidence,
-                heart_result.class_idx);
-    }
-#else
-    LOG_INF("Phase 3: heart model disabled (ENABLE_HEART_MODEL=0) — skipping");
-#endif
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 4: Lung model inference
+     * Order: [audio (if !BLE_AUDIO_LIVE)] -> heart MFCC -> lung MFCC
      *
-     * Same arena — heart interpreter has gone out of scope in
-     * tflm_inference.cc, so the arena bytes are logically free.
-     * ════════════════════════════════════════════════════════════ */
-    lung_result_t lung_result;
-    lung_result.rc = -ENOTSUP;
-    lung_result.value = 0.f;
-    lung_result.confidence = 0.f;
-    lung_result.class_idx = -1;
-
-#if ENABLE_LUNG_MODEL
-    LOG_INF("Phase 4: lung inference (%d frames × %d coeffs)...",
-            lf, lung_pipeline.cfg->n_mfcc);
-    led_set_purple();
-
-    run_lung_inference(tensor_arena,
-                       TENSOR_ARENA_BYTES,
-                       LUNG_MFCC_FILE_PATH,
-                       lf,
-                       lung_pipeline.cfg->n_mfcc,
-                       &lung_result);
-
-    if (lung_result.rc < 0) {
-        LOG_ERR("Lung inference failed: %d", lung_result.rc);
-        bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-        /* Non-fatal: continue to BLE upload */
-    } else {
-        LOG_INF("Lung result: RR=%.0f BPM (confidence=%.3f, class=%d)",
-                (double)lung_result.value,
-                (double)lung_result.confidence,
-                lung_result.class_idx);
-    }
-#else
-    LOG_INF("Phase 4: lung model disabled (ENABLE_LUNG_MODEL=0) — skipping");
-#endif
-#endif /* USE_SD */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 5: BLE upload
+     * The audio entry uses the same START:/finished\n protocol as the
+     * old live-streaming path so the receiver's state machine doesn't
+     * need to change -- the only difference is that all audio bytes
+     * arrive AFTER the recording window instead of during it.
      *
-     * Stream in order:
-     *   1. audio.pcm      (START:/finished\n)
-     *   2. SD:OK\n
-     *   3. heart_mfcc.f32 (MFCC_HEART_START:/MFCC_HEART_END\n)
-     *   4. lung_mfcc.f32  (MFCC_LUNG_START:/MFCC_LUNG_END\n)
-     *   5. hr.txt         (RESULT_HEART_START:/RESULT_HEART_END\n)
-     *   6. rr.txt         (RESULT_LUNG_START:/RESULT_LUNG_END\n)
-     * ════════════════════════════════════════════════════════════ */
-    LOG_INF("Phase 5: BLE upload...");
-    led_set_green();
-
-#if USE_SD
+     * Each entry knows its on-disk byte count up front:
+     *   - audio: TOTAL_AUDIO_BYTES (= 160000 for 10 s @ 8 kHz / int16)
+     *           NOTE: the file on SD also has a 4-byte XOR checksum
+     *           appended (see sd_writer_thread_fn).  We deliberately
+     *           do NOT send the checksum byte -- the receiver expects
+     *           exactly TOTAL_AUDIO_BYTES of PCM.
+     *   - heart: hf * n_mfcc * sizeof(float)
+     *   - lung:  lf * n_mfcc * sizeof(float)
+     */
     struct file_stream_entry {
-        const char *start_fmt;
-        const char *end_msg;
-        const char *path;
-        uint32_t    file_bytes;
-        bool        is_audio;      /* triggers SD:OK\n after end_msg */
+        const char *start_fmt;     /* printf-format for START header   */
+        const char *end_msg;       /* trailer message (or NULL)        */
+        const char *path;          /* SD file path                     */
+        uint32_t    file_bytes;    /* exact byte count to send         */
     };
 
-    /* Result file sizes: small text, but we need actual byte count.
-     * Read them from the filesystem rather than hard-coding. */
-    uint32_t hr_file_bytes = 0;
-    uint32_t rr_file_bytes = 0;
-
-    if (heart_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(HR_RESULT_FILE_PATH, &dirent) == 0) {
-            hr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-    if (lung_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(RR_RESULT_FILE_PATH, &dirent) == 0) {
-            rr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-
-    /* Build stream list (max 6 entries) */
-    struct file_stream_entry stream_list[6];
+    struct file_stream_entry stream_list[3];
     int stream_count = 0;
+    (void)sd_ok;  /* may be unused when BLE_AUDIO_LIVE=1 */
 
 #if !BLE_AUDIO_LIVE
+    /* Audio file -- only when live-streaming is disabled */
     stream_list[stream_count++] = (struct file_stream_entry){
         .start_fmt  = "START:%u\n",
         .end_msg    = "finished\n",
         .path       = AUDIO_FILE_PATH,
         .file_bytes = (uint32_t)TOTAL_AUDIO_BYTES,
-        .is_audio   = true,
     };
 #endif
 
@@ -1485,48 +1448,17 @@ static void record_and_stream(void)
         .end_msg    = "MFCC_HEART_END\n",
         .path       = HEART_MFCC_FILE_PATH,
         .file_bytes = (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
     };
-
     stream_list[stream_count++] = (struct file_stream_entry){
         .start_fmt  = "MFCC_LUNG_START:%u\n",
         .end_msg    = "MFCC_LUNG_END\n",
         .path       = LUNG_MFCC_FILE_PATH,
         .file_bytes = (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
     };
 
-    /* Append result files only if inference succeeded */
-#if ENABLE_HEART_MODEL
-    if (heart_result.rc == 0 && hr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_HEART_START:%u\n",
-            .end_msg    = "RESULT_HEART_END\n",
-            .path       = HR_RESULT_FILE_PATH,
-            .file_bytes = hr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-#if ENABLE_LUNG_MODEL
-    if (lung_result.rc == 0 && rr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_LUNG_START:%u\n",
-            .end_msg    = "RESULT_LUNG_END\n",
-            .path       = RR_RESULT_FILE_PATH,
-            .file_bytes = rr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-
-    /* ── Stream each file ── */
     for (int fi = 0; fi < stream_count; fi++) {
         struct file_stream_entry *e = &stream_list[fi];
 
-        /* Send START header */
         char ctrl[64];
         int ctrl_len = snprintf(ctrl, sizeof(ctrl), e->start_fmt, e->file_bytes);
         int err;
@@ -1536,7 +1468,6 @@ static void record_and_stream(void)
         } while (err == -ENOMEM || err == -EAGAIN);
         k_sleep(K_MSEC(20));
 
-        /* Open file and stream */
         struct fs_file_t f;
         fs_file_t_init(&f);
         if (fs_open(&f, e->path, FS_O_READ) < 0) {
@@ -1546,10 +1477,12 @@ static void record_and_stream(void)
         }
 
         uint8_t  pkt[251];
-        uint16_t seq     = 0;
+        uint16_t seq = 0;
         uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
         uint32_t bytes_sent = 0;
 
+        /* Read exactly e->file_bytes; do not send any trailing data
+         * (e.g. the XOR checksum at the tail of the audio file). */
         while (bytes_sent < e->file_bytes) {
             uint32_t want = MIN((uint32_t)payload, e->file_bytes - bytes_sent);
             ssize_t  nr   = fs_read(&f, &pkt[CHUNK_HEADER_BYTES], want);
@@ -1567,7 +1500,6 @@ static void record_and_stream(void)
 
         fs_close(&f);
 
-        /* Send END trailer */
         do {
             err = bt_nus_send(NULL, e->end_msg, strlen(e->end_msg));
             if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
@@ -1576,21 +1508,23 @@ static void record_and_stream(void)
         LOG_INF("BLE send done: %s (%u bytes)", e->path, bytes_sent);
         k_sleep(K_MSEC(20));
 
-        /* After audio trailer, send SD:OK\n so receiver state machine
-         * advances correctly (matches v6.8 receiver expectations) */
 #if !BLE_AUDIO_LIVE
-        if (e->is_audio) {
+        /* If this was the audio entry (always index 0 when live audio
+         * is disabled), now is the right time to send SD:OK\n -- after
+         * the audio "finished\n" trailer and before the MFCC streams.
+         * Matches the receiver's expected sequence: audio, finished,
+         * SD:OK, heart, lung. */
+        if (fi == 0 && sd_ok &&
+            strcmp(e->path, AUDIO_FILE_PATH) == 0) {
             bt_nus_send(NULL, "SD:OK\n", 6);
             k_sleep(K_MSEC(10));
         }
 #endif
     }
-#endif /* USE_SD */
+#endif
 
-    LOG_INF("record_and_stream() complete. "
-            "HR=%.0f RR=%.0f",
-            (double)heart_result.value,
-            (double)lung_result.value);
+    led_set_green();
+    LOG_INF("record_and_stream() complete.");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1633,12 +1567,14 @@ int main(void)
                           sd_adv, ARRAY_SIZE(sd_adv));
     if (err) { LOG_ERR("bt_le_adv_start: %d", err); return err; }
 
+    /* BLE TX thread */
     k_thread_create(&ble_tx_thread_data, ble_tx_stack,
                     K_THREAD_STACK_SIZEOF(ble_tx_stack),
                     ble_tx_thread_fn, NULL, NULL, NULL,
                     BLE_TX_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&ble_tx_thread_data, "ble_tx");
 
+    /* DSP thread — drains dsp_ring, runs MFCC pipelines off ISR */
     k_thread_create(&dsp_thread_data, dsp_thread_stack,
                     K_THREAD_STACK_SIZEOF(dsp_thread_stack),
                     dsp_thread_fn, NULL, NULL, NULL,
@@ -1646,12 +1582,14 @@ int main(void)
     k_thread_name_set(&dsp_thread_data, "dsp");
 
 #if USE_SD
+    /* SD writer thread — starts blocked on sd_data_sem */
     k_thread_create(&sd_writer_thread_data, sd_writer_stack,
                     K_THREAD_STACK_SIZEOF(sd_writer_stack),
                     sd_writer_thread_fn, NULL, NULL, NULL,
                     SD_WRITER_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&sd_writer_thread_data, "sd_writer");
 
+    /* SD card init — non-fatal if card absent */
     if (init_sd_card() != 0) {
         LOG_ERR("SD card init failed — REC will return ERR:NOSD");
         led_error_flash(led_set_yellow);
@@ -1659,7 +1597,8 @@ int main(void)
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.0 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v6.8 ready (USE_SD=%s) — waiting for BLE connection",
+            USE_SD ? "true" : "false");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -1675,72 +1614,46 @@ int main(void)
 
 /*
  * ════════════════════════════════════════════════════════════════════
- * CMakeLists.txt additions needed for v7.0
+ * REQUIRED prj.conf (USE_SD true — already set in your prj.conf)
  * ════════════════════════════════════════════════════════════════════
  *
- * # Add tflm_inference.cc (C++ file — Zephyr handles mixed C/C++)
- * target_sources(app PRIVATE
- *     src/main.c
- *     src/tflm_inference.cc
- *     src/heart_model.c      # generated by xxd -i
- *     src/lung_model.c       # generated by xxd -i
- * )
- *
- * # TFLite Micro module (adjust path to your tree)
- * add_subdirectory(${ZEPHYR_BASE}/../modules/lib/tflite-micro tflite-micro)
- * target_link_libraries(app PRIVATE tensorflow-microlite)
+ * CONFIG_SPI=y
+ * CONFIG_DISK_ACCESS=y
+ * CONFIG_DISK_DRIVER_SDMMC=y
+ * CONFIG_FAT_FILESYSTEM_ELM=y
+ * CONFIG_FILE_SYSTEM=y
+ * CONFIG_FILE_SYSTEM_MAX_TYPES=2
+ * CONFIG_HEAP_MEM_POOL_SIZE=8192
+ * CONFIG_MAIN_STACK_SIZE=4096
  *
  * ════════════════════════════════════════════════════════════════════
- * prj.conf additions for v7.0
+ * OVERLAY NOTE
  * ════════════════════════════════════════════════════════════════════
  *
- * CONFIG_CPP=y
- * CONFIG_STD_CPP17=y
- * CONFIG_LIB_CPLUSPLUS=y
- * CONFIG_REQUIRES_FLOAT_PRINTF=y
- *
- * # Increase heap if TFLite Micro needs it
- * CONFIG_HEAP_MEM_POOL_SIZE=16384
- *
- * # Increase main stack — inference runs on main thread
- * CONFIG_MAIN_STACK_SIZE=8192
+ * spi-max-frequency = <4000000> is safer for broad SD compatibility.
+ * 10000000 (10 MHz) works with most cards but some cheaper cards
+ * misbehave during write bursts above 4–8 MHz.  If SD write errors
+ * appear during recording, drop to 4000000 first before debugging
+ * firmware.
  *
  * ════════════════════════════════════════════════════════════════════
- * MEMORY BUDGET (approximate, v7.0)
+ * MEMORY BUDGET (approximate, v6.8)
  * ════════════════════════════════════════════════════════════════════
  *
  *   Zephyr kernel + BLE stack          ~90 KB
  *   DSP scratch (dsp_mfcc.c statics)    ~7 KB
- *   audio_ring  (.bss, unused at inf.)  16 KB
- *   dsp_ring    (.bss, unused at inf.)  32 KB
+ *   audio_ring  (BLE TX)                16 KB
+ *   dsp_ring    (ISR->DSP thread)       32 KB
  *   audio_sd_ring                       32 KB
- *   heart_mfcc_ring (.bss, unused)       8 KB
- *   lung_mfcc_ring  (.bss, unused)      16 KB
+ *   heart_mfcc_ring                      8 KB
+ *   lung_mfcc_ring                      16 KB
  *   ping_pong[2][512]                    2 KB
  *   dsp_pop_buf[512]                     1 KB
- *   tensor_arena                        64 KB  ← new
  *   BLE TX thread stack                  2 KB
  *   DSP thread stack                     4 KB
  *   SD writer thread stack               2 KB
  *   sd_write_buf                       512  B
  *   fat_fs (FATFS work area)            ~4 KB
- *   ─────────────────────────────────────────
- *   Total .bss estimate               ~280 KB  (nRF52840 has 256 KB)
- *
- *   ⚠ WARNING: 280 KB > 256 KB.  You MUST reduce ring buffer sizes.
- *   Recommended cuts (all are compile-time #defines above):
- *
- *   With BLE_AUDIO_LIVE=0:  remove or shrink audio_ring 16→0 KB
- *     → Change: AUDIO_RING_BYTES to (1 * 1024)  [1 KB placeholder]
- *   With DSP_OFFLINE=1:     remove or shrink dsp_ring   32→0 KB
- *     → Change: DSP_RING_BYTES to (1 * 1024)   [1 KB placeholder]
- *   With offline callbacks: remove heart/lung_mfcc_ring 24→0 KB
- *     → Change: HEART_MFCC_RING_BYTES to (1 * 1024)
- *               LUNG_MFCC_RING_BYTES  to (1 * 1024)
- *
- *   After cuts: saves ~70 KB → total ~210 KB + 64 KB arena = 274 KB
- *   That still fits (nRF52840 has 256 KB SRAM — but Zephyr reports
- *   only the 256 KB region; check your specific SoC variant).
- *   If tight, reduce tensor_arena to 48 KB and validate with logs.
+ *   Remaining headroom                 ~38 KB
  * ════════════════════════════════════════════════════════════════════
  */

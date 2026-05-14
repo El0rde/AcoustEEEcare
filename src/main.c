@@ -238,35 +238,146 @@ static int init_sd_card(void)
     static const char *disk_pdrv = "SD";
     uint64_t memory_size_mb;
     uint32_t block_count, block_size;
+    int      ret;
 
-    LOG_INF("Initialising SD card...");
+    LOG_INF("=== SD INIT START ===");
+    LOG_INF("disk_pdrv = \"%s\"", disk_pdrv);
 
-    if (disk_access_init(disk_pdrv) != 0) {
-        LOG_ERR("disk_access_init failed");
+    /* ── Step 1: disk_access_init with retry ── */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        LOG_INF("[SD] disk_access_init attempt %d/5...", attempt + 1);
+        ret = disk_access_init(disk_pdrv);
+        LOG_INF("[SD] disk_access_init returned: %d", ret);
+        if (ret == 0) {
+            LOG_INF("[SD] disk_access_init OK on attempt %d", attempt + 1);
+            break;
+        }
+        LOG_WRN("[SD] attempt %d failed (ret=%d), waiting 500 ms...", attempt + 1, ret);
+        k_sleep(K_MSEC(500));
+    }
+
+    if (ret != 0) {
+        LOG_ERR("[SD] disk_access_init FAILED after all retries (last ret=%d)", ret);
+        LOG_ERR("[SD] Possible causes: card absent, SPI wiring fault, "
+                "CS pin wrong, card not 3.3 V tolerant");
         return -1;
     }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
-        LOG_ERR("Cannot get sector count");
+
+    /* ── Step 2: DISK_IOCTL_GET_SECTOR_COUNT ── */
+    LOG_INF("[SD] querying sector count...");
+    ret = disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count);
+    LOG_INF("[SD] DISK_IOCTL_GET_SECTOR_COUNT ret=%d, block_count=%u", ret, block_count);
+    if (ret != 0) {
+        LOG_ERR("[SD] Cannot get sector count (ret=%d)", ret);
         return -1;
     }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
-        LOG_ERR("Cannot get sector size");
+
+    /* ── Step 3: DISK_IOCTL_GET_SECTOR_SIZE ── */
+    LOG_INF("[SD] querying sector size...");
+    ret = disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size);
+    LOG_INF("[SD] DISK_IOCTL_GET_SECTOR_SIZE ret=%d, block_size=%u", ret, block_size);
+    if (ret != 0) {
+        LOG_ERR("[SD] Cannot get sector size (ret=%d)", ret);
+        return -1;
+    }
+
+    /* Sanity-check the values before using them */
+    if (block_size == 0 || block_size > 4096) {
+        LOG_ERR("[SD] Suspicious block_size=%u — card may not have initialised "
+                "correctly", block_size);
+        return -1;
+    }
+    if (block_count == 0) {
+        LOG_ERR("[SD] block_count=0 — card reported empty, init likely failed silently");
         return -1;
     }
 
     memory_size_mb = (uint64_t)block_count * block_size / (1024 * 1024);
-    LOG_INF("SD card: %u MB", (uint32_t)memory_size_mb);
+    LOG_INF("[SD] Card geometry: %u sectors x %u B = %u MB",
+            block_count, block_size, (uint32_t)memory_size_mb);
 
-    /*
-     * mp is fully initialised at declaration (type, mnt_point, fs_data).
-     * Just call fs_mount() — no patching needed here.
-     */
-    if (fs_mount(&mp) != 0) {
-        LOG_ERR("fs_mount failed");
+    /* ── Step 4: fs_mount ── */
+    LOG_INF("[SD] fs_mount: type=%d mnt_point=\"%s\" fs_data=%p",
+            mp.type, mp.mnt_point, mp.fs_data);
+    LOG_INF("[SD] fat_fs address: %p (size=%u B)", (void *)&fat_fs, (uint32_t)sizeof(fat_fs));
+
+    ret = fs_mount(&mp);
+    LOG_INF("[SD] fs_mount returned: %d", ret);
+
+    if (ret != 0) {
+        LOG_ERR("[SD] fs_mount FAILED (ret=%d)", ret);
+        LOG_ERR("[SD] Possible causes: card not FAT32 formatted, "
+                "corrupted FAT, card needs full format (not quick)");
+
+        /*
+         * Attempt DISK_IOCTL_CTRL_SYNC to see if the underlying driver
+         * is at least responsive after a failed mount.
+         */
+        int sync_ret = disk_access_ioctl(disk_pdrv, DISK_IOCTL_CTRL_SYNC, NULL);
+        LOG_INF("[SD] post-failure DISK_IOCTL_CTRL_SYNC ret=%d "
+                "(0=driver alive, non-0=driver also dead)", sync_ret);
         return -1;
     }
 
-    LOG_INF("SD mounted at %s", SD_CARD_MOUNT_POINT);
+    LOG_INF("[SD] fs_mount OK");
+
+    /* ── Step 5: fs_statvfs — check free space ── */
+    struct fs_statvfs sbuf;
+    ret = fs_statvfs(SD_CARD_MOUNT_POINT, &sbuf);
+    if (ret != 0) {
+        LOG_WRN("[SD] fs_statvfs failed (ret=%d) — mount OK but FS may be "
+                "damaged", ret);
+    } else {
+        LOG_INF("[SD] statvfs: f_bsize=%lu f_frsize=%lu f_blocks=%lu f_bfree=%lu",
+                sbuf.f_bsize, sbuf.f_frsize, sbuf.f_blocks, sbuf.f_bfree);
+        uint32_t free_mb = (uint32_t)((uint64_t)sbuf.f_bfree * sbuf.f_frsize
+                                      / (1024 * 1024));
+        LOG_INF("[SD] Free space: ~%u MB", free_mb);
+        if (sbuf.f_bfree == 0) {
+            LOG_WRN("[SD] Card appears FULL — writes will fail");
+        }
+    }
+
+    /* ── Step 6: probe write/read roundtrip ── */
+    LOG_INF("[SD] probe: writing test file " SD_CARD_MOUNT_POINT "/test.tmp ...");
+    struct fs_file_t probe_file;
+    fs_file_t_init(&probe_file);
+    ret = fs_open(&probe_file, SD_CARD_MOUNT_POINT "/test.tmp",
+                  FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+    LOG_INF("[SD] probe fs_open ret=%d", ret);
+
+    if (ret == 0) {
+        static const uint8_t probe_data[] = { 0xAC, 0x0E, 0x5E, 0xEC };
+        ssize_t wr = fs_write(&probe_file, probe_data, sizeof(probe_data));
+        LOG_INF("[SD] probe fs_write ret=%d (expected %u)", (int)wr,
+                (uint32_t)sizeof(probe_data));
+        fs_close(&probe_file);
+
+        /* Re-open and read back */
+        ret = fs_open(&probe_file, SD_CARD_MOUNT_POINT "/test.tmp", FS_O_READ);
+        LOG_INF("[SD] probe re-open for read ret=%d", ret);
+        if (ret == 0) {
+            uint8_t readback[4] = {0};
+            ssize_t rd = fs_read(&probe_file, readback, sizeof(readback));
+            LOG_INF("[SD] probe fs_read ret=%d data=[%02X %02X %02X %02X]",
+                    (int)rd, readback[0], readback[1], readback[2], readback[3]);
+            fs_close(&probe_file);
+
+            if (rd == sizeof(probe_data) &&
+                memcmp(readback, probe_data, sizeof(probe_data)) == 0) {
+                LOG_INF("[SD] probe PASSED — card is readable and writable");
+            } else {
+                LOG_ERR("[SD] probe FAILED — readback mismatch, card may be "
+                        "write-protected or have a bad sector at root");
+            }
+        }
+        fs_unlink(SD_CARD_MOUNT_POINT "/test.tmp");
+    } else {
+        LOG_ERR("[SD] probe fs_open failed (ret=%d) — card mounted but not "
+                "writable; check write-protect tab", ret);
+    }
+
+    LOG_INF("=== SD INIT COMPLETE ===");
     sd_mounted = true;
     return 0;
 }

@@ -1,22 +1,26 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * v5.3: Removed &adc { status = "okay" } node.
- * When CONFIG_ADC=n, the Zephyr ADC driver is not compiled and the
- * devicetree node has no driver to bind to.  Enabling it caused a
- * spurious Zephyr DTS warning and is unnecessary — nrfx_saadc accesses
- * the SAADC peripheral directly without the Zephyr ADC subsystem.
+ * v5.6: Use existing board &spi2 — xiao_ble_common.dtsi already enables
+ *   it on D8/D9/D10 with correct pinctrl. We only need to:
+ *   1. Override compatible to nordic,nrf-spim (SPIM master, not shared SPI/TWI)
+ *   2. Add cs-gpios for D1/P0.03
+ *   3. Add the sdhc child node
+ *
+ *   Do NOT define &spi3 — xiao_ble-pinctrl.dtsi has no spi3_default,
+ *   so &spi3_default is an undefined reference on this board.
  */
 
-&xiao_spi {
+&spi2 {
+    compatible = "nordic,nrf-spim";   /* override: SPIM master, not nrf-spi */
     status = "okay";
-    cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
+    cs-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;   /* D1 / A1 / P0.03 */
 
     sdhc0: sdhc@0 {
         compatible = "zephyr,sdhc-spi-slot";
         reg = <0>;
         status = "okay";
-        spi-max-frequency = <4000000>;
+        spi-max-frequency = <400000>;
         mmc {
             compatible = "zephyr,sdmmc-disk";
             disk-name = "SD";

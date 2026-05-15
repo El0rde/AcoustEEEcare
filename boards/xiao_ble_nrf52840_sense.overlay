@@ -1,26 +1,24 @@
 /*
- * SPDX-License-Identifier: Apache-2.0
+ * AcoustEEEcare — SD Card Isolated Test
+ * xiao_ble_nrf52840_sense.overlay
  *
- * v5.6: Use existing board &spi2 — xiao_ble_common.dtsi already enables
- *   it on D8/D9/D10 with correct pinctrl. We only need to:
- *   1. Override compatible to nordic,nrf-spim (SPIM master, not shared SPI/TWI)
- *   2. Add cs-gpios for D1/P0.03
- *   3. Add the sdhc child node
- *
- *   Do NOT define &spi3 — xiao_ble-pinctrl.dtsi has no spi3_default,
- *   so &spi3_default is an undefined reference on this board.
+ * Uses the canonical &xiao_spi / &xiao_d abstractions from the board's
+ * seeed_xiao_connector.dtsi — same as the official expansion board shield.
+ * CS is D1 (xiao_d pin 1) to match your physical wiring.
  */
 
-&spi2 {
-    compatible = "nordic,nrf-spim";   /* override: SPIM master, not nrf-spi */
+&xiao_spi {
     status = "okay";
-    cs-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;   /* D1 / A1 / P0.03 */
+
+    cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;   /* D1 — your physical CS wire */
 
     sdhc0: sdhc@0 {
         compatible = "zephyr,sdhc-spi-slot";
         reg = <0>;
         status = "okay";
-        spi-max-frequency = <400000>;
+        spi-max-frequency = <24000000>;  /* fix: was 400000 */
+        power-delay-ms = <500>;          /* add: SD rail stabilization */
+
         mmc {
             compatible = "zephyr,sdmmc-disk";
             disk-name = "SD";

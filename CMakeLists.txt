@@ -13,7 +13,7 @@ zephyr_include_directories(
  
 target_sources(app PRIVATE
     src/main.c
-    src/dsp_mfcc.c
+    # src/dsp_mfcc.c
 )
  
 # CMSIS-DSP is bundled with Zephyr's SDK — we just need to declare

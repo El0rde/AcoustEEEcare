@@ -1,31 +1,33 @@
 /*
  * tflm_inference.cc — TFLite Micro heart + lung inference
  * =========================================================
- * v2.0 — corrected for the actual heart model architecture.
+ * v2.1 — updated for best_mcu_int8 heart model (665 × 25).
  *
  * Compiled as C++ (required by TFLite Micro).
  * Linked into the Zephyr image alongside main.c (plain C).
  *
- * HEART MODEL (trial_144_int8.tflite, inspected 2026-05-12)
+ * HEART MODEL (best_mcu_int8.tflite — trial 59, MAE 3.30 BPM)
  * ─────────────────────────────────────────────────────────
- *   Input:  [1, 1331, 20, 1]  int8   scale=0.06558  zp=23
- *           (full 1331-frame MFCC matrix, 20 coeffs/frame, NHWC)
- *   Output: [1, 1]             int8   scale=0.47416 zp=-128
- *           (single BPM scalar, regression)
+ *   Input:  [1, 665, 25, 1]  int8
+ *           (665-frame MFCC matrix, 25 coeffs/frame, NHWC)
+ *   Output: [1, 1]            int8   (single BPM scalar, regression)
  *
  *   Architecture: 5x Conv2D + 2x MaxPool2D + Mean (GAP) + 3x FullyConnected
  *   Ops needed:   CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED
  *
- *   IMPORTANT: model expects 20 MFCC coefficients per frame.  The
- *   firmware MFCC config must be set to n_mfcc=20 (regenerate
- *   heart_mfcc_tables.c via tools/gen_mfcc_tables.py with num_mfcc=20).
- *   At runtime we validate n_mfcc==20 and fail clearly otherwise.
+ *   Reported peak_pair_bytes = 83,712  (~82 KB of activation memory).
+ *   With TFLM overhead, a 100 KB arena is the right starting point.
+ *
+ *   IMPORTANT: model expects 25 MFCC coefficients per frame and exactly
+ *   665 frames.  The firmware MFCC config must be set to n_mfcc=25 and
+ *   produce 665 frames per 10 s capture.  At runtime we validate both
+ *   and fail clearly otherwise.
  *
  * LUNG MODEL
  * ──────────
  *   Not yet integrated.  When the .tflite is ready:
  *   1. Add lung_model.h (xxd -i lung_model.tflite > lung_model.h)
- *   2. Update LUNG_* macros below with the actual input shape
+ *   2. Update LUNG_EXPECTED_* macros below with the actual input shape
  *   3. Define ENABLE_LUNG_MODEL=1 in main.c
  *
  * DESIGN NOTES
@@ -36,26 +38,23 @@
  *
  * • Model data is compiled in as C arrays from heart_model.h / lung_model.h.
  *   Generate with:
- *       xxd -i heart_model.tflite > heart_model.h
+ *       xxd -i best_mcu_int8.tflite > heart_model.h
  *   Then edit the array name to g_heart_model_data and the length to
- *   g_heart_model_data_len.
+ *   g_heart_model_data_len.  Make the array `alignas(8) const uint8_t`.
  *
  * • MFCC data is read from SD card and stream-quantized directly into
  *   the model's input tensor.  No intermediate large RAM buffer.
- *   This is safe across all TFLM versions (no "arena tail" tricks).
  *
- * • Output dequantization is hard-coded against the model's reported
- *   scale/zp; reads input->params.scale / zero_point at runtime so
- *   if you retrain with different quantization, it still works.
+ * • CMSIS-NN kernels are enabled via CONFIG_TENSORFLOW_LITE_MICRO_CMSIS_NN_KERNELS
+ *   in prj.conf — that switch is built into TFLite Micro itself, so no
+ *   include changes are required here.  Inference will simply be ~5-15×
+ *   faster on the int8 Conv ops when the option is on.
  */
 
 /* ── Standard headers ──
  * Use C-style headers (string.h, stdio.h, math.h) rather than their
  * C++ <cstring>/<cstdio>/<cmath> wrappers, because Zephyr's minimal
- * C++ library (used when CONFIG_REQUIRES_FULL_LIBCPP is not enabled)
- * does not provide the <c*> headers.  C headers from picolibc are
- * always available.  Functions are called without std:: prefix,
- * which works in both modes. */
+ * C++ library does not provide the <c*> headers. */
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -75,10 +74,7 @@
 /* ── Our own header (C-linkage declarations) ── */
 #include "tflm_inference.h"
 
-/* ── Compiled-in model data ──
- * Generate with: xxd -i heart_model.tflite > heart_model.h
- * Rename the resulting array to g_heart_model_data.
- * The header gives us:  alignas(8) const uint8_t g_heart_model_data[...]; */
+/* ── Compiled-in model data ── */
 #include "heart_model.h"
 
 #if defined(ENABLE_LUNG_MODEL) && ENABLE_LUNG_MODEL
@@ -89,23 +85,31 @@ LOG_MODULE_REGISTER(tflm_inference, LOG_LEVEL_INF);
 
 /* ══════════════════════════════════════════════════════════════════
  * Heart model expected input shape -- validated at runtime
+ * (UPDATED for best_mcu_int8 model: 665 frames × 25 MFCC)
  * ══════════════════════════════════════════════════════════════════ */
-#define HEART_EXPECTED_FRAMES   1331
-#define HEART_EXPECTED_N_MFCC   20
+#define HEART_EXPECTED_FRAMES   665
+#define HEART_EXPECTED_N_MFCC   25
 
-/* SD read chunk size, in BYTES of float data.  Tuned so quantizing
- * one chunk's worth fits easily in stack scratch (1 KB float in,
- * 256 B int8 out).  256 floats = 64 frames of 20-mfcc data. */
+/* SD read chunk size, in FLOATS.  Tuned so quantizing one chunk's
+ * worth fits easily in stack scratch (1 KB float in, 256 B int8 out). */
 #define MFCC_READ_CHUNK_FLOATS  256
+
+/* ══════════════════════════════════════════════════════════════════
+ * FORWARD DECLARATIONS (so we can keep public API at the bottom).
+ * ══════════════════════════════════════════════════════════════════ */
+static int   load_and_quantize_mfcc(const char *path, TfLiteTensor *input,
+                                    int n_frames, int n_mfcc, const char *tag);
+static float dequantize_output_scalar(TfLiteTensor *output);
+static int   write_result_file(const char *path, const char *text);
 
 /* ══════════════════════════════════════════════════════════════════
  * Helper: load + quantize MFCC float data from SD directly into the
  * model's int8 input tensor.
  *
- * Layout invariants we rely on (validated above):
+ * Layout invariants:
  *   - Input tensor shape is [1, n_frames, n_mfcc, 1] NHWC int8.
- *   - With C=1, the memory layout is identical to row-major
- *     [frame][mfcc], so we can write contiguously without any
+ *   - With C=1, memory layout is identical to row-major
+ *     [frame][mfcc], so we write contiguously without any
  *     transpose/stride work.
  *   - On-disk float MFCC data is also row-major [frame][mfcc].
  *
@@ -147,15 +151,10 @@ static int load_and_quantize_mfcc(const char   *path,
         return rc;
     }
 
-    /* Stream-read in float chunks, quantize each into the int8 buffer. */
-    float    chunk[MFCC_READ_CHUNK_FLOATS];
-    size_t   elements_done   = 0;
-    int      mfcc_drops_warned = 0;
+    /* ── 4-byte aligned stack scratch buffer ── */
+    float    chunk[MFCC_READ_CHUNK_FLOATS] __aligned(4);
+    size_t   elements_done = 0;
 
-    /* If the source file's frame width differs from the model's
-     * expected n_mfcc, we drop or zero-pad coefficients per frame.
-     * The firmware should be configured so this mismatch does NOT
-     * happen, but we handle it gracefully and warn loudly. */
     while (elements_done < expected_elements) {
         size_t want_elements = expected_elements - elements_done;
         if (want_elements > MFCC_READ_CHUNK_FLOATS) {
@@ -168,9 +167,11 @@ static int load_and_quantize_mfcc(const char   *path,
             LOG_ERR("%s: short read at element %u (got=%d, want=%u)",
                     tag, (unsigned)elements_done, (int)got_bytes,
                     (unsigned)want_bytes);
-            /* Zero-pad the remainder so the model still gets a
-             * full input.  Result may be inaccurate but won't crash. */
-            memset(dst + elements_done, (int)(0 / scale + zp),  /* quantized 0 */
+            /* Quantized-zero fill the rest so the input tensor is at
+             * least valid (model output will be wrong, but no crash). */
+            int8_t qzero = (int8_t)((-zp) > 127 ? 127 :
+                                    ((-zp) < -128 ? -128 : -zp));
+            memset(dst + elements_done, qzero,
                    expected_elements - elements_done);
             fs_close(&f);
             return -EIO;
@@ -195,7 +196,6 @@ static int load_and_quantize_mfcc(const char   *path,
     fs_close(&f);
     LOG_INF("%s: loaded + quantized %u elements", tag, (unsigned)elements_done);
 
-    (void)mfcc_drops_warned;
     return 0;
 }
 
@@ -219,7 +219,7 @@ static float dequantize_output_scalar(TfLiteTensor *output)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * Write a small text result file to SD (e.g. "/SD:/hr.txt" => "HR:72\n")
+ * Write a small text result file to SD.
  * ══════════════════════════════════════════════════════════════════ */
 static int write_result_file(const char *path, const char *text)
 {
@@ -247,9 +247,6 @@ static int write_result_file(const char *path, const char *text)
 /* ══════════════════════════════════════════════════════════════════
  * Generic inference runner — heart and lung share this body.
  *
- * Resolver, interpreter, and tensor lifetime are all stack-local;
- * the arena lives in the caller's BSS (passed by pointer).
- *
  *   model_data       compiled-in .tflite flatbuffer (in flash)
  *   model_name       "heart" or "lung" for logs
  *   arena/arena_bytes  shared tensor arena
@@ -271,21 +268,16 @@ static int run_inference(const uint8_t *model_data,
                          int            exp_mfcc,
                          float         *out_value)
 {
-    /* ── 1. Validate that firmware MFCC shape matches model ──
-     * If the firmware was configured with a different n_mfcc than
-     * the model was trained on, we cannot just "feed and hope".
-     * Bail with a clear error so the user knows to regenerate the
-     * MFCC tables to match. */
+    /* ── 1. Validate firmware MFCC shape matches model ── */
     if (n_mfcc != exp_mfcc) {
         LOG_ERR("%s: n_mfcc mismatch -- firmware=%d, model=%d. "
-                "Regenerate %s MFCC tables with num_mfcc=%d "
-                "(tools/gen_mfcc_tables.py).",
+                "Regenerate %s MFCC tables with num_mfcc=%d.",
                 model_name, n_mfcc, exp_mfcc, model_name, exp_mfcc);
         return -EINVAL;
     }
     if (n_frames != exp_frames) {
         LOG_ERR("%s: n_frames mismatch -- firmware=%d, model=%d. "
-                "MFCC config probably has wrong hop/frame settings.",
+                "MFCC config has wrong hop/frame settings.",
                 model_name, n_frames, exp_frames);
         return -EINVAL;
     }
@@ -299,11 +291,8 @@ static int run_inference(const uint8_t *model_data,
         return -EINVAL;
     }
 
-    /* ── 3. Build resolver INLINE -- do NOT factor into a helper that
-     * returns by value, because some TFLM versions hold internal
-     * pointers into the resolver instance that get invalidated on
-     * move/copy. Build it in place, keep it alive for the full
-     * lifetime of the interpreter. ── */
+    /* ── 3. Build resolver INLINE; some TFLM versions hold internal
+     * pointers into the resolver that get invalidated on move/copy. ── */
     tflite::MicroMutableOpResolver<8> resolver;
     if (resolver.AddConv2D()         != kTfLiteOk ||
         resolver.AddMaxPool2D()      != kTfLiteOk ||
@@ -320,7 +309,7 @@ static int run_inference(const uint8_t *model_data,
 
     if (interpreter.AllocateTensors() != kTfLiteOk) {
         LOG_ERR("%s: AllocateTensors failed -- arena too small? "
-                "(arena=%u B). Try increasing TENSOR_ARENA_BYTES.",
+                "(arena=%u B). Increase TENSOR_ARENA_BYTES.",
                 model_name, (unsigned)arena_bytes);
         return -ENOMEM;
     }
@@ -333,6 +322,24 @@ static int run_inference(const uint8_t *model_data,
     TfLiteTensor *input = interpreter.input(0);
     if (input == nullptr) {
         LOG_ERR("%s: null input tensor", model_name);
+        return -EINVAL;
+    }
+
+    /* Verify tensor dims line up with what the firmware will provide.
+     * Expected: [1, n_frames, n_mfcc, 1]. */
+    if (input->dims->size != 4 ||
+        input->dims->data[0] != 1 ||
+        input->dims->data[1] != exp_frames ||
+        input->dims->data[2] != exp_mfcc ||
+        input->dims->data[3] != 1) {
+        LOG_ERR("%s: input dims [%d,%d,%d,%d] do not match expected "
+                "[1,%d,%d,1]",
+                model_name,
+                input->dims->size > 0 ? input->dims->data[0] : -1,
+                input->dims->size > 1 ? input->dims->data[1] : -1,
+                input->dims->size > 2 ? input->dims->data[2] : -1,
+                input->dims->size > 3 ? input->dims->data[3] : -1,
+                exp_frames, exp_mfcc);
         return -EINVAL;
     }
 
@@ -392,7 +399,6 @@ void run_heart_inference(uint8_t       *arena,
                                &result->value);
 
     if (result->rc == 0) {
-        /* Write /SD:/hr.txt -- HR in BPM, rounded to integer. */
         char txt[32];
         snprintf(txt, sizeof(txt), "HR:%.0f\n", (double)result->value);
         int wrc = write_result_file("/SD:/hr.txt", txt);
@@ -422,8 +428,8 @@ void run_lung_inference(uint8_t      *arena,
     result->confidence = 1.0f;
 
 #if defined(ENABLE_LUNG_MODEL) && ENABLE_LUNG_MODEL
-    /* TODO: update LUNG_EXPECTED_FRAMES / LUNG_EXPECTED_N_MFCC
-     * once the lung .tflite is inspected and integrated. */
+    /* TODO: update LUNG_EXPECTED_FRAMES / LUNG_EXPECTED_N_MFCC once
+     * the lung .tflite is inspected and integrated. */
     result->rc = run_inference(g_lung_model_data,
                                "lung",
                                arena, arena_bytes,

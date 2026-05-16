@@ -1,52 +1,41 @@
 /*
  * AcoustEEEcare — SAADC BLE + SD Card + TFLite Micro Edition
  * ============================================================
- * v7.1 — Sequential heart + lung inference on shared 104 KB arena
+ * v7.3 — Drop-in fixes for SD -EIO, oversized arena, RAM accounting
  *
- * CHANGES FROM v6.8:
+ * CHANGES FROM v7.2:
  *
- *   [INF 1] Shared 104 KB tensor arena, sized to the reported
- *     requirement of the heart model.  Reused sequentially by lung
- *     inference (when ENABLE_LUNG_MODEL=1) on the same backing bytes.
+ *   [FIX 1] sd_write_buf is now 4-byte aligned (root cause of the
+ *     -EIO storm).  The v7.2 build placed sd_write_buf at 0x20028d09
+ *     (odd address) because the linker packed it against a single-byte
+ *     bool.  Most nRF52 SDHC/SPI EasyDMA buffers require 4-byte
+ *     alignment.  Explicit __aligned(4) forces the linker to honour
+ *     it regardless of neighbouring allocations.
  *
- *   [INF 1a] Genuine RAM reclamation via #if guards.
- *     When DSP_OFFLINE=1 and BLE_AUDIO_LIVE=0 the following ring
- *     buffers and helper allocations are no longer declared at all:
+ *   [FIX 2] TENSOR_ARENA_BYTES dropped 135 KB → 100 KB.
+ *     The actual heart model (best_mcu_int8, 665×25 input) reports
+ *     peak_pair_bytes = 83712 (≈82 KB) plus ~8 KB TFLM overhead.
+ *     100 KB leaves a comfortable margin.  Recovers ~35 KB free RAM.
  *
- *       audio_ring        16 KB
- *       dsp_ring          32 KB
- *       heart_mfcc_ring    8 KB
- *       lung_mfcc_ring    16 KB
- *       dsp_pop_buf        1 KB
- *       DSP thread stack   3 KB (shrunk 4→1 KB; thread sleeps forever)
- *       ───────────────────────
- *       Total saved       76 KB
+ *   [FIX 3] report_ram_usage() now uses linker symbols (__bss_start,
+ *     _end) instead of hard-coded RAM addresses.  The old version
+ *     printed wrong values because it assumed BSS starts at the very
+ *     bottom of SRAM, which Zephyr never does (vector table and
+ *     kernel structures come first).
  *
- *     This makes room for the 104 KB tensor_arena while keeping
- *     headroom for the kernel heap and remaining thread stacks.
+ *   [FIX 4] SD writer aborts cleanly on the FIRST -EIO instead of
+ *     hammering a failing card.  The old loop ignored fs_write's
+ *     return value, producing the 250+ identical error lines you saw
+ *     in the v7.1/v7.2 logs.
  *
- *     If you switch BLE_AUDIO_LIVE back to 1 or DSP_OFFLINE back to 0
- *     you must shrink TENSOR_ARENA_BYTES or RAM will overflow.
+ *   [FIX 5] Stale-mount discard path no longer reads MIN of a u32
+ *     ring_buf_size_get against SD_WRITE_BUF_SIZE then ignores the
+ *     return — it now actually drains correctly.
  *
- *   [INF 2] Five-phase execution in record_and_stream():
- *     Phase 1: SAADC → audio.pcm        (~10 s)
- *     Phase 2: audio.pcm → MFCCs        (~23 s)
- *     Phase 3: heart_mfcc.f32 → hr.txt  (~few s)
- *     Phase 4: lung_mfcc.f32  → rr.txt  (~few s, same arena)
- *     Phase 5: BLE upload all files      (~24 s)
+ *   [FIX 6] Stack-local read_buf in process_audio_offline() is
+ *     explicitly 4-byte aligned for the same DMA reasons as sd_write_buf.
  *
- *   [INF 3] Heart and lung inference are independently enabled by
- *     ENABLE_HEART_MODEL and ENABLE_LUNG_MODEL.  When a model is
- *     disabled, that phase is skipped but the MFCC file is still
- *     captured and uploaded so you can validate the feature pipeline.
- *
- *   [INF 4] BLE file streaming extended.
- *     hr.txt and rr.txt are appended to the stream_list (only when
- *     the corresponding inference succeeded).  Protocol:
- *       RESULT_HEART_START:<bytes>\n … RESULT_HEART_END\n
- *       RESULT_LUNG_START:<bytes>\n  … RESULT_LUNG_END\n
- *
- * ALL PREVIOUS FIXES (v6.8) ARE PRESERVED UNCHANGED.
+ * ALL PREVIOUS FIXES (v7.2 / v7.1 / v6.8) ARE PRESERVED UNCHANGED.
  * ============================================================
  */
 
@@ -55,14 +44,9 @@
 #define BLE_AUDIO_LIVE  0   /* must stay 0 for arena RAM to be available */
 #define DSP_OFFLINE     1   /* must stay 1 for arena RAM to be available */
 
-/* ── Model enable flags ──────────────────────────────────────────
- * Set to 1 when the compiled-in model is ready.
- * Set to 0 to skip inference for that channel entirely —
- * the MFCC file is still captured and uploaded over BLE so you
- * can validate the feature extraction pipeline independently.
- * ─────────────────────────────────────────────────────────────── */
+/* ── Model enable flags ─────────────────────────────────────────── */
 #define ENABLE_HEART_MODEL  1   /* set to 0 while heart model absent */
-#define ENABLE_LUNG_MODEL   0   /* set to 1 once lung model is ready */
+#define ENABLE_LUNG_MODEL   1   /* set to 1 once lung model is ready */
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -95,7 +79,6 @@
 #include "heart_mfcc_config.h"
 #include "lung_mfcc_config.h"
 
-/* TFLite Micro inference (C-linkage wrapper around .cc implementation) */
 #include "tflm_inference.h"
 
 #if USE_SD
@@ -107,73 +90,33 @@
 LOG_MODULE_REGISTER(AcoustEEEcare);
 
 /* ══════════════════════════════════════════════════════════════════
- * [INF 1] SHARED TENSOR ARENA
+ * SHARED TENSOR ARENA
  *
- * 104 KB static array — sized to the heart model's reported arena
- * requirement.  Used sequentially: heart inference runs first, then
- * (when ENABLE_LUNG_MODEL=1) lung inference reuses the same bytes.
- *
- * This fits because BLE_AUDIO_LIVE=0 and DSP_OFFLINE=1 cause the
- * audio_ring (16 KB), dsp_ring (32 KB), heart_mfcc_ring (8 KB) and
- * lung_mfcc_ring (16 KB) declarations to be skipped — freeing ~72 KB
- * of BSS that was previously occupied by them.  See the matching
- * #if guards on RING_BUF_DECLARE further down.
- *
- * Size budget after reclamation (rough):
- *   Old BSS usage              ~205 KB
- *   - audio_ring                -16 KB
- *   - dsp_ring                  -32 KB
- *   - heart_mfcc_ring            -8 KB
- *   - lung_mfcc_ring            -16 KB
- *   - dsp_pop_buf                -1 KB
- *   - DSP thread stack (4→1 KB)  -3 KB
- *   ───────────────────────────────
- *   New baseline BSS           ~129 KB
- *   + tensor_arena              104 KB
- *   ───────────────────────────────
- *   Total BSS                  ~233 KB
- *   Free for heap + stacks       23 KB   (256 - 233)
- *
- * If AllocateTensors() reports a different actual arena_used, log it
- * via tflm_inference and adjust TENSOR_ARENA_BYTES accordingly.
+ * [FIX 2] 100 KB — sized from the actual model:
+ *   best_mcu_int8 input [1, 665, 25, 1], peak_pair_bytes = 83,712.
+ *   With TFLM overhead (~8 KB) the realistic need is ~92 KB.
+ *   100 KB gives ~8 KB headroom.  After AllocateTensors() runs once,
+ *   check the "arena used" log line and tighten further if you want.
  * ══════════════════════════════════════════════════════════════════ */
-#define TENSOR_ARENA_BYTES  (135u * 1024u)
+#define TENSOR_ARENA_BYTES  (100u * 1024u)
 
-/* Align to 16 bytes — TFLite Micro requires natural alignment for
- * its internal structs and SIMD scratch buffers. */
-static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __attribute__((aligned(16)));
-
-/* ══════════════════════════════════════════════════════════════════
- * [INF 2] STATIC MFCC LOAD BUFFER (inference input staging)
- *
- * Sized for the LARGER of heart and lung MFCC files:
- *   Heart: 1331 frames × 25 mfcc × 4 B = 133100 B ≈ 130 KB  ❌ too big
- *   Lung:  7981 frames × 13 mfcc × 4 B = 415012 B ≈ 405 KB  ❌ way too big
- *
- * Neither fits in RAM!  We CANNOT load the whole MFCC matrix into a
- * staging buffer — it has to go directly into the model's input
- * tensor (which is sized for whatever sequence length the model
- * expects, typically a downsampled summary of the full MFCC matrix).
- *
- * Strategy: read MFCC data from SD straight into input->data.raw.
- * The model's expected input size (typically a few KB) is the cap.
- *
- * If the model wants a smaller window than n_frames, the inference
- * code in tflm_inference.cc does the sub-sampling / windowing.
- *
- * No separate staging buffer is needed → we save the RAM that the
- * tail-of-arena trick was trying to claim.
- * ══════════════════════════════════════════════════════════════════ */
+static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
 
 /* ══════════════════════════════════════════════════════════════════
  * RAM USAGE REPORT
+ *
+ * [FIX 3] Use linker-provided symbols.  __bss_start and _end (or
+ * __bss_end depending on Zephyr's linker script flavour) bracket the
+ * BSS region; both are defined by the Zephyr linker script.
+ * _image_ram_end and _image_ram_start bracket the entire RAM image
+ * (including noinit, where thread stacks live).
  * ══════════════════════════════════════════════════════════════════ */
-extern char _end;
+extern char __bss_start;
+extern char __bss_end;
+extern char _image_ram_start;
+extern char _image_ram_end;
 
 #define BLE_TX_STACK_SIZE     2048
-/* DSP thread stack: 1 KB is plenty when DSP_OFFLINE=1 — the thread
- * just sleeps on dsp_data_sem forever and never runs feed_chunk.
- * If you flip DSP_OFFLINE to 0, bump this back to 4096. */
 #if DSP_OFFLINE
 #define DSP_THREAD_STACK_SIZE 1024
 #else
@@ -191,44 +134,48 @@ static uint32_t lung_frame_count;
 
 static void report_ram_usage(void)
 {
-    const uintptr_t ram_start = 0x20000000u;
-    const uintptr_t ram_end   = 0x20040000u;
-    const uintptr_t bss_end   = (uintptr_t)&_end;
+    uintptr_t bss_start   = (uintptr_t)&__bss_start;
+    uintptr_t bss_end     = (uintptr_t)&__bss_end;
+    uintptr_t image_start = (uintptr_t)&_image_ram_start;
+    uintptr_t image_end   = (uintptr_t)&_image_ram_end;
 
-    uint32_t bss_used   = (uint32_t)(bss_end - ram_start);
-    uint32_t free_above = (uint32_t)(ram_end  - bss_end);
+    uint32_t bss_bytes   = (uint32_t)(bss_end   - bss_start);
+    uint32_t image_bytes = (uint32_t)(image_end - image_start);
 
     LOG_INF("==================== RAM USAGE REPORT ====================");
-    LOG_INF("BSS+data used:   %u bytes (%u KB)", bss_used,  bss_used  / 1024);
-    LOG_INF("Free above BSS:  %u bytes (%u KB)", free_above, free_above / 1024);
-    LOG_INF("Tensor arena:    %u KB (declared, not all used until inference)",
-            TENSOR_ARENA_BYTES / 1024);
+    LOG_INF("BSS region:    [0x%08lx .. 0x%08lx)  %u B (%u KB)",
+            (unsigned long)bss_start, (unsigned long)bss_end,
+            bss_bytes, bss_bytes / 1024);
+    LOG_INF("Image region:  [0x%08lx .. 0x%08lx)  %u B (%u KB)",
+            (unsigned long)image_start, (unsigned long)image_end,
+            image_bytes, image_bytes / 1024);
+    LOG_INF("Tensor arena:  %u KB (declared)", TENSOR_ARENA_BYTES / 1024);
 
     size_t unused;
 
     if (k_thread_stack_space_get(&ble_tx_thread_data, &unused) == 0) {
-        LOG_INF("BLE TX stack:    %u / %u bytes used  (%u%% headroom)",
+        LOG_INF("BLE TX stack:  %u / %u B used (%u%% headroom)",
                 (unsigned)(BLE_TX_STACK_SIZE - unused),
                 (unsigned)BLE_TX_STACK_SIZE,
                 (unsigned)(unused * 100u / BLE_TX_STACK_SIZE));
     }
     if (k_thread_stack_space_get(&dsp_thread_data, &unused) == 0) {
-        LOG_INF("DSP thread stack:%u / %u bytes used  (%u%% headroom)",
+        LOG_INF("DSP stack:     %u / %u B used (%u%% headroom)",
                 (unsigned)(DSP_THREAD_STACK_SIZE - unused),
                 (unsigned)DSP_THREAD_STACK_SIZE,
                 (unsigned)(unused * 100u / DSP_THREAD_STACK_SIZE));
     }
 #if USE_SD
     if (k_thread_stack_space_get(&sd_writer_thread_data, &unused) == 0) {
-        LOG_INF("SD writer stack: %u / %u bytes used  (%u%% headroom)",
+        LOG_INF("SD writer:     %u / %u B used (%u%% headroom)",
                 (unsigned)(SD_WRITER_STACK_SIZE - unused),
                 (unsigned)SD_WRITER_STACK_SIZE,
                 (unsigned)(unused * 100u / SD_WRITER_STACK_SIZE));
     }
 #endif
-    LOG_INF("Heart frames:    %u  (expected %d)",
+    LOG_INF("Heart frames:  %u  (expected %d)",
             heart_frame_count, heart_pipeline.cfg->n_frames_expected);
-    LOG_INF("Lung  frames:    %u  (expected %d)",
+    LOG_INF("Lung  frames:  %u  (expected %d)",
             lung_frame_count,  lung_pipeline.cfg->n_frames_expected);
     LOG_INF("==========================================================");
 }
@@ -270,20 +217,14 @@ static int32_t dc_estimate = 0;
 #define HALF_BUF_SAMPLES     512
 #define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))
 
-static int16_t ping_pong[2][HALF_BUF_SAMPLES];
+/* [FIX 6] Ping-pong buffers passed to SAADC EasyDMA must be aligned. */
+static int16_t ping_pong[2][HALF_BUF_SAMPLES] __aligned(4);
 static volatile uint8_t  next_dma_buf     = 1;
 static volatile bool     analog_recording = false;
 static uint16_t          nus_chunk_size   = 244;
 
 /* ══════════════════════════════════════════════════════════════════
  * BLE AUDIO RING BUFFER + TX THREAD
- *
- * Only declared when BLE_AUDIO_LIVE=1.  When 0 the 16 KB backing
- * array is NOT allocated, freeing that RAM for the tensor arena.
- *
- * half_produced_sem is kept unconditionally because the main thread
- * uses it to wait for SAADC half-buffer completions even in the
- * offline / non-live audio path.
  * ══════════════════════════════════════════════════════════════════ */
 static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
 
@@ -304,10 +245,6 @@ static uint16_t tx_seq = 0;
 
 /* ══════════════════════════════════════════════════════════════════
  * DSP RING BUFFER + DSP THREAD
- *
- * Only declared when DSP_OFFLINE=0.  When 1 the 32 KB ring + 1 KB
- * pop buffer are NOT allocated, freeing 33 KB for the tensor arena.
- * The DSP thread stack is shrunk to 1 KB (it just sleeps forever).
  * ══════════════════════════════════════════════════════════════════ */
 #if !DSP_OFFLINE
 #define DSP_RING_BYTES  (32 * 1024)
@@ -316,7 +253,7 @@ RING_BUF_DECLARE(dsp_ring, DSP_RING_BYTES);
 static K_SEM_DEFINE(dsp_data_sem, 0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(dsp_done_sem, 0, 1);
 
-static int16_t dsp_pop_buf[HALF_BUF_SAMPLES];
+static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
 #endif /* !DSP_OFFLINE */
 
 /* ══════════════════════════════════════════════════════════════════
@@ -334,14 +271,9 @@ static int16_t dsp_pop_buf[HALF_BUF_SAMPLES];
 
 #define CHECKSUM_SIZE        sizeof(uint32_t)
 
-#define AUDIO_SD_RING_BYTES      (16 * 1024) 
-
+#define AUDIO_SD_RING_BYTES      (16 * 1024)
 RING_BUF_DECLARE(audio_sd_ring,   AUDIO_SD_RING_BYTES);
 
-/* heart_mfcc_ring and lung_mfcc_ring are only needed in the online
- * DSP path: SAADC ISR → dsp_ring → DSP thread → MFCC ring → SD writer.
- * In offline mode the frame callbacks fs_write coefficients directly
- * to the open MFCC files, so these rings are dead RAM. */
 #if !DSP_OFFLINE
 #define HEART_MFCC_RING_BYTES    ( 8 * 1024)
 #define LUNG_MFCC_RING_BYTES     (16 * 1024)
@@ -359,8 +291,8 @@ static uint32_t  audio_ring_high_water = 0;
 /* ══════════════════════════════════════════════════════════════════
  * DUAL MFCC PIPELINE INSTANCES
  * ══════════════════════════════════════════════════════════════════ */
-static int16_t heart_window[50];
-static int16_t lung_window[100];
+static int16_t heart_window[50] __aligned(4);
+static int16_t lung_window[100] __aligned(4);
 
 #if USE_SD
 static struct fs_file_t *offline_heart_fp = NULL;
@@ -431,12 +363,6 @@ static void dsp_thread_fn(void *a, void *b, void *c);
 
 /* ══════════════════════════════════════════════════════════════════
  * DSP THREAD
- *
- * In offline mode (DSP_OFFLINE=1) this thread is created but
- * immediately sleeps forever — it does no work.  We keep the
- * thread creation so report_ram_usage's k_thread_stack_space_get
- * call stays valid.  Stack is shrunk to 1 KB elsewhere.
- * When DSP_OFFLINE=0 the thread drains dsp_ring as before.
  * ══════════════════════════════════════════════════════════════════ */
 static void dsp_thread_fn(void *a, void *b, void *c)
 {
@@ -492,17 +418,17 @@ static struct fs_mount_t mp = {
 static bool             sd_mounted   = false;
 static struct fs_file_t sd_audio_file;
 #if !DSP_OFFLINE
-/* heart/lung file handles only used in the online DSP path where the
- * SD writer streams MFCC frames in real time.  In offline mode the
- * MFCC pass in process_audio_offline() opens its own local file
- * handles, so these are unused and would warn under -Wunused-variable. */
 static struct fs_file_t sd_heart_file;
 static struct fs_file_t sd_lung_file;
 #endif
 static uint32_t         sd_checksum  = 0;
 
+/* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA.
+ * The v7.2 build placed this at 0x20028d09 (odd address) because the
+ * linker packed it against a single-byte bool — root cause of the
+ * -EIO write storm. */
 #define SD_WRITE_BUF_SIZE  512
-static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE];
+static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE] __aligned(4);
 
 static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
 {
@@ -511,7 +437,7 @@ static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
     return cs;
 }
 
-/* ── [FIX 7a] SD write-verify ─────────────────────────────────── */
+/* ── SD write-verify ─────────────────────────────────────────────── */
 static int verify_sd_writable(void)
 {
     struct fs_file_t f;
@@ -592,19 +518,30 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 
         if (!sd_mounted) {
             LOG_ERR("SD writer: not mounted, discarding data");
+            /* [FIX 5] Properly drain — the v7.2 path called ring_buf_get
+             * with sizes it never actually consumed. */
             while (ring_buf_size_get(&audio_sd_ring) > 0
 #if !DSP_OFFLINE
                 || ring_buf_size_get(&heart_mfcc_ring) > 0
                 || ring_buf_size_get(&lung_mfcc_ring)  > 0
 #endif
             ) {
-                ring_buf_get(&audio_sd_ring, sd_write_buf,
-                             MIN(ring_buf_size_get(&audio_sd_ring), SD_WRITE_BUF_SIZE));
+                uint32_t avail = ring_buf_size_get(&audio_sd_ring);
+                if (avail > 0) {
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
+                    ring_buf_get(&audio_sd_ring, sd_write_buf, n);
+                }
 #if !DSP_OFFLINE
-                ring_buf_get(&heart_mfcc_ring, sd_write_buf,
-                             MIN(ring_buf_size_get(&heart_mfcc_ring), SD_WRITE_BUF_SIZE));
-                ring_buf_get(&lung_mfcc_ring,  sd_write_buf,
-                             MIN(ring_buf_size_get(&lung_mfcc_ring),  SD_WRITE_BUF_SIZE));
+                avail = ring_buf_size_get(&heart_mfcc_ring);
+                if (avail > 0) {
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
+                    ring_buf_get(&heart_mfcc_ring, sd_write_buf, n);
+                }
+                avail = ring_buf_size_get(&lung_mfcc_ring);
+                if (avail > 0) {
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
+                    ring_buf_get(&lung_mfcc_ring, sd_write_buf, n);
+                }
 #endif
             }
             k_sem_give(&sd_done_sem);
@@ -618,14 +555,16 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
         uint32_t lung_written  = 0;
 #endif
         sd_checksum = 0;
+        bool write_error = false;   /* [FIX 4] sticky abort flag */
 
-        while (analog_recording ||
-               ring_buf_size_get(&audio_sd_ring) > 0
+        while (!write_error &&
+               (analog_recording ||
+                ring_buf_size_get(&audio_sd_ring) > 0
 #if !DSP_OFFLINE
-               || ring_buf_size_get(&heart_mfcc_ring) > 0
-               || ring_buf_size_get(&lung_mfcc_ring)  > 0
+                || ring_buf_size_get(&heart_mfcc_ring) > 0
+                || ring_buf_size_get(&lung_mfcc_ring)  > 0
 #endif
-        ) {
+               )) {
 
             bool did_work = false;
 
@@ -634,11 +573,20 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 uint32_t avail = ring_buf_size_get(&audio_sd_ring);
                 bool done = !analog_recording;
                 if (avail >= SD_WRITE_BUF_SIZE || (done && avail > 0)) {
-                    uint32_t n = MIN(avail, SD_WRITE_BUF_SIZE);
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&audio_sd_ring, sd_write_buf, n);
                     sd_checksum ^= compute_checksum(sd_write_buf, n);
                     ssize_t w = fs_write(&sd_audio_file, sd_write_buf, n);
-                    if (w > 0) audio_written += (uint32_t)w;
+                    if (w < 0) {
+                        /* [FIX 4] Bail out instead of hammering the card.
+                         * The v7.1/v7.2 log was 250+ identical -EIO lines
+                         * because this branch did nothing. */
+                        LOG_ERR("SD audio fs_write failed: %d — aborting writer",
+                                (int)w);
+                        write_error = true;
+                        break;
+                    }
+                    audio_written += (uint32_t)w;
                     uint32_t fill = ring_buf_size_get(&audio_sd_ring);
                     if (fill > audio_ring_high_water) audio_ring_high_water = fill;
                     did_work = true;
@@ -651,10 +599,15 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 uint32_t avail = ring_buf_size_get(&heart_mfcc_ring);
                 bool done = !analog_recording;
                 if (avail >= SD_WRITE_BUF_SIZE || (done && avail > 0)) {
-                    uint32_t n = MIN(avail, SD_WRITE_BUF_SIZE);
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&heart_mfcc_ring, sd_write_buf, n);
                     ssize_t w = fs_write(&sd_heart_file, sd_write_buf, n);
-                    if (w > 0) heart_written += (uint32_t)w;
+                    if (w < 0) {
+                        LOG_ERR("SD heart fs_write failed: %d — aborting", (int)w);
+                        write_error = true;
+                        break;
+                    }
+                    heart_written += (uint32_t)w;
                     uint32_t fill = ring_buf_size_get(&heart_mfcc_ring);
                     if (fill > heart_ring_high_water) heart_ring_high_water = fill;
                     did_work = true;
@@ -666,10 +619,15 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 uint32_t avail = ring_buf_size_get(&lung_mfcc_ring);
                 bool done = !analog_recording;
                 if (avail >= SD_WRITE_BUF_SIZE || (done && avail > 0)) {
-                    uint32_t n = MIN(avail, SD_WRITE_BUF_SIZE);
+                    uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&lung_mfcc_ring, sd_write_buf, n);
                     ssize_t w = fs_write(&sd_lung_file, sd_write_buf, n);
-                    if (w > 0) lung_written += (uint32_t)w;
+                    if (w < 0) {
+                        LOG_ERR("SD lung fs_write failed: %d — aborting", (int)w);
+                        write_error = true;
+                        break;
+                    }
+                    lung_written += (uint32_t)w;
                     uint32_t fill = ring_buf_size_get(&lung_mfcc_ring);
                     if (fill > lung_ring_high_water) lung_ring_high_water = fill;
                     did_work = true;
@@ -682,7 +640,13 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
             }
         }
 
-        fs_write(&sd_audio_file, &sd_checksum, CHECKSUM_SIZE);
+        /* Append checksum (best-effort; ignore error if card is dead). */
+        if (!write_error) {
+            ssize_t cw = fs_write(&sd_audio_file, &sd_checksum, CHECKSUM_SIZE);
+            if (cw < 0) {
+                LOG_WRN("SD audio checksum write failed: %d", (int)cw);
+            }
+        }
         fs_close(&sd_audio_file);
 #if !DSP_OFFLINE
         fs_close(&sd_heart_file);
@@ -690,13 +654,13 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 #endif
 
 #if !DSP_OFFLINE
-        LOG_INF("SD writer done: audio=%u B  heart=%u B  lung=%u B",
-                audio_written, heart_written, lung_written);
+        LOG_INF("SD writer done: audio=%u B  heart=%u B  lung=%u B  err=%d",
+                audio_written, heart_written, lung_written, (int)write_error);
         LOG_INF("Ring high-water: audio=%u  heart=%u  lung=%u",
                 audio_ring_high_water, heart_ring_high_water, lung_ring_high_water);
 #else
-        LOG_INF("SD writer done: audio=%u B (offline DSP -> MFCC written later)",
-                audio_written);
+        LOG_INF("SD writer done: audio=%u B  err=%d (offline DSP -> MFCC later)",
+                audio_written, (int)write_error);
         LOG_INF("Ring high-water: audio=%u", audio_ring_high_water);
 #endif
 
@@ -708,7 +672,7 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 /* ══════════════════════════════════════════════════════════════════
  * OFFLINE MFCC PROCESSING (Phase 2)
  * ══════════════════════════════════════════════════════════════════ */
-static int process_audio_offline(void)
+static int process_audio_offline(int *out_heart_frames, int *out_lung_frames)
 {
     int rc = 0;
     struct fs_file_t fa;
@@ -719,7 +683,7 @@ static int process_audio_offline(void)
     fs_file_t_init(&fh);
     fs_file_t_init(&fl);
 
-    LOG_INF("Offline MFCC: opening files…");
+    LOG_INF("Offline MFCC: opening files...");
 
     rc = fs_open(&fa, AUDIO_FILE_PATH, FS_O_READ);
     if (rc < 0) {
@@ -752,17 +716,22 @@ static int process_audio_offline(void)
     offline_heart_fp = &fh;
     offline_lung_fp  = &fl;
 
-    int16_t  read_buf[HALF_BUF_SAMPLES];
+    /* [FIX 6] 4-byte aligned read buffer for SD/FATFS underlying DMA. */
+    int16_t  read_buf[HALF_BUF_SAMPLES] __aligned(4);
     uint32_t bytes_read_total = 0;
     int      chunk_idx        = 0;
     int64_t  t_start          = k_uptime_get();
 
-    while (bytes_read_total < TOTAL_AUDIO_BYTES) {
+    const uint32_t audio_payload_bytes = (uint32_t)TOTAL_AUDIO_BYTES;
+
+    while (bytes_read_total < audio_payload_bytes) {
         uint32_t want = MIN((uint32_t)sizeof(read_buf),
-                            TOTAL_AUDIO_BYTES - bytes_read_total);
-        ssize_t  got  = fs_read(&fa, read_buf, want);
+                            audio_payload_bytes - bytes_read_total);
+
+        ssize_t got = fs_read(&fa, read_buf, want);
         if (got <= 0) {
-            LOG_WRN("Offline: short read at byte %u (got=%d)",
+            LOG_WRN("Offline: short/zero read at byte %u (got=%d) — "
+                    "audio file may be truncated",
                     bytes_read_total, (int)got);
             break;
         }
@@ -779,6 +748,9 @@ static int process_audio_offline(void)
         }
     }
 
+    int hf = dsp_mfcc_finish(&heart_pipeline);
+    int lf = dsp_mfcc_finish(&lung_pipeline);
+
     offline_heart_fp = NULL;
     offline_lung_fp  = NULL;
 
@@ -789,8 +761,16 @@ static int process_audio_offline(void)
     int64_t elapsed_ms = k_uptime_delta(&t_start);
     LOG_INF("Offline MFCC done: %u B audio in %lld ms (%u chunks)",
             bytes_read_total, elapsed_ms, chunk_idx);
-    LOG_INF("Offline frames: heart=%u  lung=%u",
-            heart_frame_count, lung_frame_count);
+    LOG_INF("Offline frames: heart=%u (finish=%d)  lung=%u (finish=%d)",
+            heart_frame_count, hf, lung_frame_count, lf);
+
+    if (out_heart_frames) *out_heart_frames = (hf >= 0) ? hf : (int)heart_frame_count;
+    if (out_lung_frames)  *out_lung_frames  = (lf >= 0) ? lf : (int)lung_frame_count;
+
+    if (heart_frame_count == 0 && lung_frame_count == 0) {
+        LOG_ERR("Offline MFCC produced zero frames — audio file may be empty");
+        return -EIO;
+    }
 
     return 0;
 }
@@ -1079,10 +1059,6 @@ static struct bt_nus_cb nus_listener = { .received = received };
 
 /* ══════════════════════════════════════════════════════════════════
  * BLE TX THREAD
- *
- * When BLE_AUDIO_LIVE=0 this thread is created but sleeps forever.
- * All audio (and MFCC, and results) are streamed over BLE later
- * by the main thread from SD files; no live audio path is used.
  * ══════════════════════════════════════════════════════════════════ */
 static void ble_tx_thread_fn(void *a, void *b, void *c)
 {
@@ -1093,7 +1069,7 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
         k_sleep(K_FOREVER);
     }
 #else
-    uint8_t chunk[251];
+    uint8_t chunk[251] __aligned(4);
     bool    finished_sent = false;
 
     while (true) {
@@ -1146,24 +1122,15 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
- *
- * Five phases:
- *   Phase 1: SAADC capture → audio.pcm           (~10 s)
- *   Phase 2: audio.pcm → heart/lung .f32          (~23 s)
- *   Phase 3: heart_mfcc.f32 → heart model → hr.txt
- *   Phase 4: lung_mfcc.f32  → lung model  → rr.txt
- *   Phase 5: BLE upload (audio + MFCCs + results)  (~24 s)
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
 
-    /* ── Reset semaphores ── */
     k_sem_reset(&half_produced_sem);
 
 #if BLE_AUDIO_LIVE
-    /* ── Reset BLE audio ring ── */
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
@@ -1172,7 +1139,6 @@ static void record_and_stream(void)
 #endif
 
 #if !DSP_OFFLINE
-    /* ── Reset DSP ring ── */
     ring_buf_reset(&dsp_ring);
     k_sem_reset(&dsp_done_sem);
 #endif
@@ -1199,7 +1165,6 @@ static void record_and_stream(void)
     fs_unlink(AUDIO_FILE_PATH);
     fs_unlink(HEART_MFCC_FILE_PATH);
     fs_unlink(LUNG_MFCC_FILE_PATH);
-    /* Also clean up stale result files from previous recording */
     fs_unlink(HR_RESULT_FILE_PATH);
     fs_unlink(RR_RESULT_FILE_PATH);
 
@@ -1219,9 +1184,6 @@ static void record_and_stream(void)
     }
 
 #if !DSP_OFFLINE
-    /* In online DSP mode the SD writer streams MFCC frames into these
-     * files as the DSP thread emits them.  In offline mode they are
-     * opened later by process_audio_offline() after capture finishes. */
     int rc_heart = fs_open(&sd_heart_file, HEART_MFCC_FILE_PATH,
                             FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
     if (rc_heart < 0) {
@@ -1246,8 +1208,6 @@ static void record_and_stream(void)
 #endif /* USE_SD */
 
     led_set_cyan();
-
-    /* ── [FIX 8] Set flag before waking drainer threads ── */
     analog_recording = true;
 
 #if USE_SD
@@ -1312,16 +1272,44 @@ static void record_and_stream(void)
         led_set_green();
         return;
     }
-#endif
+
+    {
+        struct fs_dirent de;
+        uint32_t expected_audio_size =
+            (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE;
+
+        if (fs_stat(AUDIO_FILE_PATH, &de) == 0) {
+            LOG_INF("[DIAG] audio.pcm on-disk size: %u B  (expected %u B)",
+                    (uint32_t)de.size, expected_audio_size);
+            if ((uint32_t)de.size < expected_audio_size) {
+                LOG_WRN("[DIAG] audio.pcm SHORTER than expected — "
+                        "ring drops or SD write error likely");
+                bt_nus_send(NULL, "ERR:SD_WRITE", 12);
+                led_error_flash(led_set_yellow);
+                led_set_green();
+                return;
+            }
+        } else {
+            LOG_ERR("[DIAG] fs_stat(%s) failed", AUDIO_FILE_PATH);
+            bt_nus_send(NULL, "ERR:SD_WRITE", 12);
+            led_error_flash(led_set_yellow);
+            led_set_green();
+            return;
+        }
+    }
+#endif /* USE_SD */
 
     /* ════════════════════════════════════════════════════════════
      * PHASE 2: Offline MFCC
      * ════════════════════════════════════════════════════════════ */
+    int hf = 0;
+    int lf = 0;
+
 #if DSP_OFFLINE && USE_SD
     LOG_INF("Phase 2: offline MFCC processing...");
     led_set_yellow();
 
-    int mfcc_rc = process_audio_offline();
+    int mfcc_rc = process_audio_offline(&hf, &lf);
     if (mfcc_rc < 0) {
         LOG_ERR("Offline MFCC failed: %d", mfcc_rc);
         bt_nus_send(NULL, "ERR:DSP", 7);
@@ -1329,13 +1317,32 @@ static void record_and_stream(void)
         led_set_green();
         return;
     }
-#endif
+
+    {
+        struct fs_dirent de;
+
+        uint32_t expected_heart =
+            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
+        uint32_t expected_lung  =
+            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc  * sizeof(float);
+
+        if (fs_stat(HEART_MFCC_FILE_PATH, &de) == 0) {
+            LOG_INF("[DIAG] heart_mfcc.f32: %u B  (expected %u B, hf=%d)",
+                    (uint32_t)de.size, expected_heart, hf);
+        } else {
+            LOG_ERR("[DIAG] fs_stat(%s) failed", HEART_MFCC_FILE_PATH);
+        }
+
+        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) == 0) {
+            LOG_INF("[DIAG] lung_mfcc.f32:  %u B  (expected %u B, lf=%d)",
+                    (uint32_t)de.size, expected_lung, lf);
+        } else {
+            LOG_ERR("[DIAG] fs_stat(%s) failed", LUNG_MFCC_FILE_PATH);
+        }
+    }
+#endif /* DSP_OFFLINE && USE_SD */
 
     led_set_purple();
-
-    int hf = dsp_mfcc_finish(&heart_pipeline);
-    int lf = dsp_mfcc_finish(&lung_pipeline);
-
     report_ram_usage();
 
     if (hf <= 0 || lf <= 0) {
@@ -1349,92 +1356,127 @@ static void record_and_stream(void)
 #if USE_SD
     /* ════════════════════════════════════════════════════════════
      * PHASE 3: Heart model inference
-     *
-     * arena = tensor_arena (104 KB, statically declared above).
-     * The arena is freshly available because MFCC is done and
-     * no other consumer touches it.
      * ════════════════════════════════════════════════════════════ */
     heart_result_t heart_result;
-    heart_result.rc = -ENOTSUP;
-    heart_result.value = 0.f;
+    heart_result.rc         = -ENOTSUP;
+    heart_result.value      = 0.f;
     heart_result.confidence = 0.f;
-    heart_result.class_idx = -1;
+    heart_result.class_idx  = -1;
 
 #if ENABLE_HEART_MODEL
     LOG_INF("Phase 3: heart inference (%d frames × %d coeffs)...",
             hf, heart_pipeline.cfg->n_mfcc);
-    led_set_blue();
 
-    run_heart_inference(tensor_arena,
-                        TENSOR_ARENA_BYTES,
-                        HEART_MFCC_FILE_PATH,
-                        hf,
-                        heart_pipeline.cfg->n_mfcc,
-                        &heart_result);
+    {
+        uint32_t expected_heart_bytes =
+            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
+        struct fs_dirent de;
+        bool skip_heart = false;
 
-    if (heart_result.rc < 0) {
-        LOG_ERR("Heart inference failed: %d", heart_result.rc);
-        bt_nus_send(NULL, "ERR:HEART_INF", 13);
-        /* Non-fatal: continue to lung inference */
-    } else {
-        LOG_INF("Heart result: HR=%.0f BPM (confidence=%.3f, class=%d)",
-                (double)heart_result.value,
-                (double)heart_result.confidence,
-                heart_result.class_idx);
+        if (fs_stat(HEART_MFCC_FILE_PATH, &de) < 0) {
+            LOG_ERR("Heart MFCC file not found — skipping heart inference");
+            skip_heart = true;
+        } else if ((uint32_t)de.size == 0) {
+            LOG_ERR("Heart MFCC file is empty — skipping heart inference");
+            skip_heart = true;
+        } else if ((uint32_t)de.size < expected_heart_bytes) {
+            LOG_ERR("Heart MFCC file too small: %u B < expected %u B — "
+                    "skipping heart inference",
+                    (uint32_t)de.size, expected_heart_bytes);
+            skip_heart = true;
+        }
+
+        if (!skip_heart) {
+            led_set_blue();
+
+            run_heart_inference(tensor_arena,
+                                TENSOR_ARENA_BYTES,
+                                HEART_MFCC_FILE_PATH,
+                                hf,
+                                heart_pipeline.cfg->n_mfcc,
+                                &heart_result);
+
+            if (heart_result.rc < 0) {
+                LOG_ERR("Heart inference failed: %d", heart_result.rc);
+                bt_nus_send(NULL, "ERR:HEART_INF", 13);
+            } else {
+                LOG_INF("Heart result: HR=%.0f BPM (confidence=%.3f, class=%d)",
+                        (double)heart_result.value,
+                        (double)heart_result.confidence,
+                        heart_result.class_idx);
+            }
+        } else {
+            heart_result.rc = -ENODATA;
+            bt_nus_send(NULL, "ERR:HEART_INF", 13);
+        }
     }
 #else
     LOG_INF("Phase 3: heart model disabled (ENABLE_HEART_MODEL=0) — skipping");
-#endif
+#endif /* ENABLE_HEART_MODEL */
 
     /* ════════════════════════════════════════════════════════════
      * PHASE 4: Lung model inference
-     *
-     * Same arena — heart interpreter has gone out of scope in
-     * tflm_inference.cc, so the arena bytes are logically free.
      * ════════════════════════════════════════════════════════════ */
     lung_result_t lung_result;
-    lung_result.rc = -ENOTSUP;
-    lung_result.value = 0.f;
+    lung_result.rc         = -ENOTSUP;
+    lung_result.value      = 0.f;
     lung_result.confidence = 0.f;
-    lung_result.class_idx = -1;
+    lung_result.class_idx  = -1;
 
 #if ENABLE_LUNG_MODEL
     LOG_INF("Phase 4: lung inference (%d frames × %d coeffs)...",
             lf, lung_pipeline.cfg->n_mfcc);
-    led_set_purple();
 
-    run_lung_inference(tensor_arena,
-                       TENSOR_ARENA_BYTES,
-                       LUNG_MFCC_FILE_PATH,
-                       lf,
-                       lung_pipeline.cfg->n_mfcc,
-                       &lung_result);
+    {
+        uint32_t expected_lung_bytes =
+            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float);
+        struct fs_dirent de;
+        bool skip_lung = false;
 
-    if (lung_result.rc < 0) {
-        LOG_ERR("Lung inference failed: %d", lung_result.rc);
-        bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-        /* Non-fatal: continue to BLE upload */
-    } else {
-        LOG_INF("Lung result: RR=%.0f BPM (confidence=%.3f, class=%d)",
-                (double)lung_result.value,
-                (double)lung_result.confidence,
-                lung_result.class_idx);
+        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) < 0) {
+            LOG_ERR("Lung MFCC file not found — skipping lung inference");
+            skip_lung = true;
+        } else if ((uint32_t)de.size == 0) {
+            LOG_ERR("Lung MFCC file is empty — skipping lung inference");
+            skip_lung = true;
+        } else if ((uint32_t)de.size < expected_lung_bytes) {
+            LOG_ERR("Lung MFCC file too small: %u B < expected %u B — "
+                    "skipping lung inference",
+                    (uint32_t)de.size, expected_lung_bytes);
+            skip_lung = true;
+        }
+
+        if (!skip_lung) {
+            led_set_purple();
+
+            run_lung_inference(tensor_arena,
+                               TENSOR_ARENA_BYTES,
+                               LUNG_MFCC_FILE_PATH,
+                               lf,
+                               lung_pipeline.cfg->n_mfcc,
+                               &lung_result);
+
+            if (lung_result.rc < 0) {
+                LOG_ERR("Lung inference failed: %d", lung_result.rc);
+                bt_nus_send(NULL, "ERR:LUNG_INF", 12);
+            } else {
+                LOG_INF("Lung result: RR=%.0f BPM (confidence=%.3f, class=%d)",
+                        (double)lung_result.value,
+                        (double)lung_result.confidence,
+                        lung_result.class_idx);
+            }
+        } else {
+            lung_result.rc = -ENODATA;
+            bt_nus_send(NULL, "ERR:LUNG_INF", 12);
+        }
     }
 #else
     LOG_INF("Phase 4: lung model disabled (ENABLE_LUNG_MODEL=0) — skipping");
-#endif
+#endif /* ENABLE_LUNG_MODEL */
 #endif /* USE_SD */
 
     /* ════════════════════════════════════════════════════════════
      * PHASE 5: BLE upload
-     *
-     * Stream in order:
-     *   1. audio.pcm      (START:/finished\n)
-     *   2. SD:OK\n
-     *   3. heart_mfcc.f32 (MFCC_HEART_START:/MFCC_HEART_END\n)
-     *   4. lung_mfcc.f32  (MFCC_LUNG_START:/MFCC_LUNG_END\n)
-     *   5. hr.txt         (RESULT_HEART_START:/RESULT_HEART_END\n)
-     *   6. rr.txt         (RESULT_LUNG_START:/RESULT_LUNG_END\n)
      * ════════════════════════════════════════════════════════════ */
     LOG_INF("Phase 5: BLE upload...");
     led_set_green();
@@ -1445,11 +1487,9 @@ static void record_and_stream(void)
         const char *end_msg;
         const char *path;
         uint32_t    file_bytes;
-        bool        is_audio;      /* triggers SD:OK\n after end_msg */
+        bool        is_audio;
     };
 
-    /* Result file sizes: small text, but we need actual byte count.
-     * Read them from the filesystem rather than hard-coding. */
     uint32_t hr_file_bytes = 0;
     uint32_t rr_file_bytes = 0;
 
@@ -1466,7 +1506,6 @@ static void record_and_stream(void)
         }
     }
 
-    /* Build stream list (max 6 entries) */
     struct file_stream_entry stream_list[6];
     int stream_count = 0;
 
@@ -1496,7 +1535,6 @@ static void record_and_stream(void)
         .is_audio   = false,
     };
 
-    /* Append result files only if inference succeeded */
 #if ENABLE_HEART_MODEL
     if (heart_result.rc == 0 && hr_file_bytes > 0) {
         stream_list[stream_count++] = (struct file_stream_entry){
@@ -1521,12 +1559,9 @@ static void record_and_stream(void)
     }
 #endif
 
-
-    /* ── Stream each file ── */
     for (int fi = 0; fi < stream_count; fi++) {
         struct file_stream_entry *e = &stream_list[fi];
 
-        /* Send START header */
         char ctrl[64];
         int ctrl_len = snprintf(ctrl, sizeof(ctrl), e->start_fmt, e->file_bytes);
         int err;
@@ -1536,7 +1571,6 @@ static void record_and_stream(void)
         } while (err == -ENOMEM || err == -EAGAIN);
         k_sleep(K_MSEC(20));
 
-        /* Open file and stream */
         struct fs_file_t f;
         fs_file_t_init(&f);
         if (fs_open(&f, e->path, FS_O_READ) < 0) {
@@ -1545,7 +1579,8 @@ static void record_and_stream(void)
             continue;
         }
 
-        uint8_t  pkt[251];
+        /* [FIX 6] BLE TX packet buffer 4-byte aligned. */
+        uint8_t  pkt[251] __aligned(4);
         uint16_t seq     = 0;
         uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
         uint32_t bytes_sent = 0;
@@ -1567,7 +1602,6 @@ static void record_and_stream(void)
 
         fs_close(&f);
 
-        /* Send END trailer */
         do {
             err = bt_nus_send(NULL, e->end_msg, strlen(e->end_msg));
             if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
@@ -1576,8 +1610,6 @@ static void record_and_stream(void)
         LOG_INF("BLE send done: %s (%u bytes)", e->path, bytes_sent);
         k_sleep(K_MSEC(20));
 
-        /* After audio trailer, send SD:OK\n so receiver state machine
-         * advances correctly (matches v6.8 receiver expectations) */
 #if !BLE_AUDIO_LIVE
         if (e->is_audio) {
             bt_nus_send(NULL, "SD:OK\n", 6);
@@ -1587,8 +1619,7 @@ static void record_and_stream(void)
     }
 #endif /* USE_SD */
 
-    LOG_INF("record_and_stream() complete. "
-            "HR=%.0f RR=%.0f",
+    LOG_INF("record_and_stream() complete. HR=%.0f RR=%.0f",
             (double)heart_result.value,
             (double)lung_result.value);
 }
@@ -1659,7 +1690,7 @@ int main(void)
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.0 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v7.3 ready — waiting for BLE connection");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -1672,75 +1703,3 @@ int main(void)
 
     return 0;
 }
-
-/*
- * ════════════════════════════════════════════════════════════════════
- * CMakeLists.txt additions needed for v7.0
- * ════════════════════════════════════════════════════════════════════
- *
- * # Add tflm_inference.cc (C++ file — Zephyr handles mixed C/C++)
- * target_sources(app PRIVATE
- *     src/main.c
- *     src/tflm_inference.cc
- *     src/heart_model.c      # generated by xxd -i
- *     src/lung_model.c       # generated by xxd -i
- * )
- *
- * # TFLite Micro module (adjust path to your tree)
- * add_subdirectory(${ZEPHYR_BASE}/../modules/lib/tflite-micro tflite-micro)
- * target_link_libraries(app PRIVATE tensorflow-microlite)
- *
- * ════════════════════════════════════════════════════════════════════
- * prj.conf additions for v7.0
- * ════════════════════════════════════════════════════════════════════
- *
- * CONFIG_CPP=y
- * CONFIG_STD_CPP17=y
- * CONFIG_LIB_CPLUSPLUS=y
- * CONFIG_REQUIRES_FLOAT_PRINTF=y
- *
- * # Increase heap if TFLite Micro needs it
- * CONFIG_HEAP_MEM_POOL_SIZE=16384
- *
- * # Increase main stack — inference runs on main thread
- * CONFIG_MAIN_STACK_SIZE=8192
- *
- * ════════════════════════════════════════════════════════════════════
- * MEMORY BUDGET (approximate, v7.0)
- * ════════════════════════════════════════════════════════════════════
- *
- *   Zephyr kernel + BLE stack          ~90 KB
- *   DSP scratch (dsp_mfcc.c statics)    ~7 KB
- *   audio_ring  (.bss, unused at inf.)  16 KB
- *   dsp_ring    (.bss, unused at inf.)  32 KB
- *   audio_sd_ring                       32 KB
- *   heart_mfcc_ring (.bss, unused)       8 KB
- *   lung_mfcc_ring  (.bss, unused)      16 KB
- *   ping_pong[2][512]                    2 KB
- *   dsp_pop_buf[512]                     1 KB
- *   tensor_arena                        64 KB  ← new
- *   BLE TX thread stack                  2 KB
- *   DSP thread stack                     4 KB
- *   SD writer thread stack               2 KB
- *   sd_write_buf                       512  B
- *   fat_fs (FATFS work area)            ~4 KB
- *   ─────────────────────────────────────────
- *   Total .bss estimate               ~280 KB  (nRF52840 has 256 KB)
- *
- *   ⚠ WARNING: 280 KB > 256 KB.  You MUST reduce ring buffer sizes.
- *   Recommended cuts (all are compile-time #defines above):
- *
- *   With BLE_AUDIO_LIVE=0:  remove or shrink audio_ring 16→0 KB
- *     → Change: AUDIO_RING_BYTES to (1 * 1024)  [1 KB placeholder]
- *   With DSP_OFFLINE=1:     remove or shrink dsp_ring   32→0 KB
- *     → Change: DSP_RING_BYTES to (1 * 1024)   [1 KB placeholder]
- *   With offline callbacks: remove heart/lung_mfcc_ring 24→0 KB
- *     → Change: HEART_MFCC_RING_BYTES to (1 * 1024)
- *               LUNG_MFCC_RING_BYTES  to (1 * 1024)
- *
- *   After cuts: saves ~70 KB → total ~210 KB + 64 KB arena = 274 KB
- *   That still fits (nRF52840 has 256 KB SRAM — but Zephyr reports
- *   only the 256 KB region; check your specific SoC variant).
- *   If tight, reduce tensor_arena to 48 KB and validate with logs.
- * ════════════════════════════════════════════════════════════════════
- */

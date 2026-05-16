@@ -31,8 +31,8 @@ LOG_MODULE_REGISTER(dsp_mfcc);
 #define BP_SCRATCH_MAX   512
 #define MAX_FFT_SIZE     512
 #define MAX_N_FFT_BINS   257
-#define MAX_N_MEL        25
-#define MAX_N_MFCC       25
+#define MAX_N_MEL        30
+#define MAX_N_MFCC       30
 
 static float32_t bp_scratch[BP_SCRATCH_MAX];
 static float32_t fft_in    [MAX_FFT_SIZE];

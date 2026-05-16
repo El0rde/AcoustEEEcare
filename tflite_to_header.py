@@ -7,7 +7,7 @@ as a uint8_t array.  Cross-platform replacement for `xxd -i`.
 
 Usage:
     python tflite_to_header.py trial_144_int8.tflite heart_model.h g_heart_model_data
-    python tflite_to_header.py lung_model.tflite     lung_model.h  g_lung_model_data
+    python tflite_to_header.py best_mcu_lung_int8.tflite     lung_model.h  g_lung_model_data
 
 Arguments:
     1. Path to input .tflite file

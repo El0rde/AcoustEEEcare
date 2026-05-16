@@ -1,22 +1,46 @@
 /*
- * SPDX-License-Identifier: Apache-2.0
+ * AcoustEEEcare — app.overlay
+ * v7.4 — CS pin corrected to xiao_d pin 1 (was pin 2 in v7.3)
  *
- * v5.3: Removed &adc { status = "okay" } node.
- * When CONFIG_ADC=n, the Zephyr ADC driver is not compiled and the
- * devicetree node has no driver to bind to.  Enabling it caused a
- * spurious Zephyr DTS warning and is unnecessary — nrfx_saadc accesses
- * the SAADC peripheral directly without the Zephyr ADC subsystem.
+ * CHANGES FROM v7.3:
+ *
+ *   [FIX 9] cs-gpios: xiao_d pin 1  (confirmed by isolated test hardware)
+ *             v7.3 had pin 2, which was the source of CS assertion
+ *             failures that the isolated test exposed.
+ *
+ *   [FIX 10] spi-max-frequency raised 4 MHz → 24 MHz.
+ *             The isolated test overlay used 24 MHz successfully.
+ *             nRF52840 SPI max is 32 MHz; 24 MHz gives headroom while
+ *             still being well within SD spec class 10 / UHS-I limits.
+ *             If you see CRC errors, drop back to 8 MHz first.
+ *
+ *   [FIX 11] power-delay-ms = <500> added.
+ *             Matches the isolated test's SD rail stabilisation delay
+ *             and the 250 ms + 1500 ms retry back-off in init_sd_card().
+ *             Ensures the card's internal regulator has settled before
+ *             the first disk_access_init() attempt.
+ *
+ * When CONFIG_ADC=n (as in prj.conf) there is no &adc node — omitting
+ * it is correct; nrfx_saadc accesses the SAADC peripheral directly.
  */
 
 &xiao_spi {
     status = "okay";
-    cs-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
+
+    /* [FIX 9] CS on xiao_d pin 1 — matches physical hardware wiring. */
+    cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
 
     sdhc0: sdhc@0 {
         compatible = "zephyr,sdhc-spi-slot";
         reg = <0>;
         status = "okay";
-        spi-max-frequency = <4000000>;
+
+        /* [FIX 10] 24 MHz — proven by isolated test; drop to 8 MHz on CRC errors. */
+        spi-max-frequency = <24000000>;
+
+        /* [FIX 11] 500 ms rail stabilisation — matches init_sd_card() retry timing. */
+        power-delay-ms = <500>;
+
         mmc {
             compatible = "zephyr,sdmmc-disk";
             disk-name = "SD";

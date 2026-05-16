@@ -1,41 +1,42 @@
 /*
  * AcoustEEEcare — SAADC BLE + SD Card + TFLite Micro Edition
  * ============================================================
- * v7.3 — Drop-in fixes for SD -EIO, oversized arena, RAM accounting
+ * v7.4 — SD init hardened with 6-step sequence from isolated test
  *
- * CHANGES FROM v7.2:
+ * CHANGES FROM v7.3:
  *
- *   [FIX 1] sd_write_buf is now 4-byte aligned (root cause of the
- *     -EIO storm).  The v7.2 build placed sd_write_buf at 0x20028d09
- *     (odd address) because the linker packed it against a single-byte
- *     bool.  Most nRF52 SDHC/SPI EasyDMA buffers require 4-byte
- *     alignment.  Explicit __aligned(4) forces the linker to honour
- *     it regardless of neighbouring allocations.
+ *   [FIX 7] init_sd_card() replaced with the 6-step hardened sequence
+ *     proven in the SD Card Isolated Test (v6.6):
  *
- *   [FIX 2] TENSOR_ARENA_BYTES dropped 135 KB → 100 KB.
- *     The actual heart model (best_mcu_int8, 665×25 input) reports
- *     peak_pair_bytes = 83712 (≈82 KB) plus ~8 KB TFLM overhead.
- *     100 KB leaves a comfortable margin.  Recovers ~35 KB free RAM.
+ *     Step 1: disk_access_init with INIT_RETRIES (5) attempts + 1750 ms
+ *             back-off (250 ms rail-stabilise + 1500 ms retry gap).
+ *             The v7.3 version had a single shot with no retry path.
  *
- *   [FIX 3] report_ram_usage() now uses linker symbols (__bss_start,
- *     _end) instead of hard-coded RAM addresses.  The old version
- *     printed wrong values because it assumed BSS starts at the very
- *     bottom of SRAM, which Zephyr never does (vector table and
- *     kernel structures come first).
+ *     Step 2: DISK_IOCTL_GET_SECTOR_COUNT — validates the card responds.
  *
- *   [FIX 4] SD writer aborts cleanly on the FIRST -EIO instead of
- *     hammering a failing card.  The old loop ignored fs_write's
- *     return value, producing the 250+ identical error lines you saw
- *     in the v7.1/v7.2 logs.
+ *     Step 3: DISK_IOCTL_GET_SECTOR_SIZE — guards against non-512-byte
+ *             cards that FATFS cannot handle without extra config.
  *
- *   [FIX 5] Stale-mount discard path no longer reads MIN of a u32
- *     ring_buf_size_get against SD_WRITE_BUF_SIZE then ignores the
- *     return — it now actually drains correctly.
+ *     Step 4: fs_mount() with a CTRL_SYNC diagnostic on failure
+ *             (distinguishes SPI wiring fault from wrong FS format).
  *
- *   [FIX 6] Stack-local read_buf in process_audio_offline() is
- *     explicitly 4-byte aligned for the same DMA reasons as sd_write_buf.
+ *     Step 5: fs_statvfs() free-space check — warns (non-fatal) if the
+ *             card is full before we even start recording.
  *
- * ALL PREVIOUS FIXES (v7.2 / v7.1 / v6.8) ARE PRESERVED UNCHANGED.
+ *     Step 6: probe write → seek → read → memcmp → unlink roundtrip,
+ *             replacing the old single-byte sentinel verify_sd_writable().
+ *             The probe uses the full AcoustEEEcare sentinel string so
+ *             the on-card file is self-documenting.
+ *
+ *   [FIX 8] verify_sd_writable() removed — fully superseded by Step 6.
+ *
+ *   [FIX 9] app.overlay CS pin corrected: xiao_d pin 1 (was pin 2).
+ *           Pin 2 was the v7.3 overlay default; the isolated test
+ *           confirmed pin 1 matches the physical hardware wiring.
+ *           (overlay change only — no main.c impact, noted here for
+ *           traceability)
+ *
+ * ALL PREVIOUS FIXES (v7.3 / v7.2 / v7.1 / v6.8) ARE PRESERVED UNCHANGED.
  * ============================================================
  */
 
@@ -267,9 +268,20 @@ static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
 #define LUNG_MFCC_FILE_PATH  "/SD:/lung_mfcc.f32"
 #define HR_RESULT_FILE_PATH  "/SD:/hr.txt"
 #define RR_RESULT_FILE_PATH  "/SD:/rr.txt"
+
+/* [FIX 7] Probe file path used by the 6-step init sequence. */
 #define SD_INIT_CHECK_PATH   "/SD:/acoustchk"
 
 #define CHECKSUM_SIZE        sizeof(uint32_t)
+
+/* [FIX 7] SD init constants from the isolated test. */
+#define SD_DISK_NAME         "SD"
+#define SD_INIT_RETRIES      5
+#define SD_INIT_RETRY_MS     1500
+#define SD_RAIL_STABILISE_MS 250
+
+/* Probe sentinel — self-documenting if the file is left on the card. */
+static const char sd_probe_payload[] = "AcoustEEEcare-SD-probe-v7.4\n";
 
 #define AUDIO_SD_RING_BYTES      (16 * 1024)
 RING_BUF_DECLARE(audio_sd_ring,   AUDIO_SD_RING_BYTES);
@@ -423,10 +435,7 @@ static struct fs_file_t sd_lung_file;
 #endif
 static uint32_t         sd_checksum  = 0;
 
-/* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA.
- * The v7.2 build placed this at 0x20028d09 (odd address) because the
- * linker packed it against a single-byte bool — root cause of the
- * -EIO write storm. */
+/* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA. */
 #define SD_WRITE_BUF_SIZE  512
 static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE] __aligned(4);
 
@@ -437,74 +446,153 @@ static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
     return cs;
 }
 
-/* ── SD write-verify ─────────────────────────────────────────────── */
-static int verify_sd_writable(void)
+/* ══════════════════════════════════════════════════════════════════
+ * init_sd_card — 6-step hardened sequence (from isolated test v6.6)
+ *
+ * [FIX 7] Replaces the v7.3 single-shot init + verify_sd_writable().
+ *
+ *   Step 1  disk_access_init with retries + rail-stabilise delay
+ *   Step 2  DISK_IOCTL_GET_SECTOR_COUNT — card responds sanity check
+ *   Step 3  DISK_IOCTL_GET_SECTOR_SIZE  — must be 512 for FATFS
+ *   Step 4  fs_mount() + CTRL_SYNC diagnostic on failure
+ *   Step 5  fs_statvfs() free-space check (non-fatal warn if full)
+ *   Step 6  probe write → seek → read → memcmp → unlink
+ *           (supersedes old verify_sd_writable() single-byte sentinel)
+ * ══════════════════════════════════════════════════════════════════ */
+static int init_sd_card(void)
 {
-    struct fs_file_t f;
-    fs_file_t_init(&f);
+    int ret;
 
-    int rc = fs_open(&f, SD_INIT_CHECK_PATH,
-                     FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
-    if (rc < 0) {
-        LOG_ERR("SD write-verify: fs_open(%s) failed: %d",
-                SD_INIT_CHECK_PATH, rc);
-        return rc;
+    LOG_INF("Initialising SD card (6-step sequence)...");
+
+    /* ── Step 1: disk_access_init with retries ───────────────────── */
+    LOG_INF("[1/6] Initialising disk '%s' ...", SD_DISK_NAME);
+    ret = -EIO;
+    for (int attempt = 0; attempt < SD_INIT_RETRIES; attempt++) {
+        ret = disk_access_init(SD_DISK_NAME);
+        if (ret == 0) {
+            break;
+        }
+        LOG_WRN("  attempt %d/%d failed (%d), retrying ...",
+                attempt + 1, SD_INIT_RETRIES, ret);
+        LOG_INF("  Waiting %d ms for SD power rail to stabilise...",
+                SD_RAIL_STABILISE_MS);
+        k_msleep(SD_RAIL_STABILISE_MS);
+        k_msleep(SD_INIT_RETRY_MS);
+    }
+    if (ret != 0) {
+        LOG_ERR("[1/6] FAIL: disk_access_init returned %d after %d attempts",
+                ret, SD_INIT_RETRIES);
+        return ret;
+    }
+    LOG_INF("[1/6] disk_access_init OK");
+
+    /* ── Step 2: sector count ────────────────────────────────────── */
+    uint32_t sector_count = 0;
+    ret = disk_access_ioctl(SD_DISK_NAME,
+                            DISK_IOCTL_GET_SECTOR_COUNT, &sector_count);
+    if (ret != 0 || sector_count == 0) {
+        LOG_ERR("[2/6] FAIL: sector count ioctl ret=%d count=%u",
+                ret, sector_count);
+        return (ret != 0) ? ret : -EIO;
+    }
+    LOG_INF("[2/6] sector_count=%u  (~%u MiB)",
+            sector_count,
+            (uint32_t)((uint64_t)sector_count * 512u / (1024u * 1024u)));
+
+    /* ── Step 3: sector size ─────────────────────────────────────── */
+    uint32_t sector_size = 0;
+    ret = disk_access_ioctl(SD_DISK_NAME,
+                            DISK_IOCTL_GET_SECTOR_SIZE, &sector_size);
+    if (ret != 0 || sector_size != 512u) {
+        LOG_ERR("[3/6] FAIL: sector size ret=%d size=%u (expected 512)",
+                ret, sector_size);
+        return (ret != 0) ? ret : -EIO;
+    }
+    LOG_INF("[3/6] sector_size=%u", sector_size);
+
+    /* ── Step 4: mount FAT filesystem ────────────────────────────── */
+    ret = fs_mount(&mp);
+    if (ret != 0) {
+        LOG_ERR("[4/6] FAIL: fs_mount returned %d", ret);
+        /* CTRL_SYNC distinguishes SPI wiring fault from wrong FS format. */
+        int sync_ret = disk_access_ioctl(SD_DISK_NAME,
+                                         DISK_IOCTL_CTRL_SYNC, NULL);
+        LOG_INF("  CTRL_SYNC probe: %s",
+                (sync_ret == 0)
+                    ? "SPI OK — check card format "
+                      "(exFAT needs CONFIG_FS_FATFS_EXFAT=y)"
+                    : "SPI also failing — check wiring/power");
+        return ret;
+    }
+    LOG_INF("[4/6] FAT mount OK  (%s)", SD_CARD_MOUNT_POINT);
+    sd_mounted = true;
+
+    /* ── Step 5: free space ──────────────────────────────────────── */
+    struct fs_statvfs sbuf;
+    ret = fs_statvfs(SD_CARD_MOUNT_POINT, &sbuf);
+    if (ret != 0) {
+        /* Non-fatal — card may still be usable. */
+        LOG_WRN("[5/6] fs_statvfs failed (%d) — continuing anyway", ret);
+    } else {
+        uint64_t free_bytes = (uint64_t)sbuf.f_bfree * sbuf.f_frsize;
+        LOG_INF("[5/6] free=%llu MiB",
+                (unsigned long long)(free_bytes / (1024u * 1024u)));
+        if (sbuf.f_bfree == 0) {
+            LOG_WRN("  WARNING: SD card is full — writes will fail");
+        }
     }
 
-    const uint8_t sentinel = 0xA5;
-    ssize_t w = fs_write(&f, &sentinel, 1);
-    fs_close(&f);
-    fs_unlink(SD_INIT_CHECK_PATH);
+    /* ── Step 6: probe write → seek → read → memcmp → unlink ────── */
+    LOG_INF("[6/6] Probe write/read roundtrip on %s ...", SD_INIT_CHECK_PATH);
 
-    if (w != 1) {
-        LOG_ERR("SD write-verify: fs_write returned %d", (int)w);
+    const size_t probe_len = sizeof(sd_probe_payload) - 1u; /* exclude NUL */
+    char probe_rd[sizeof(sd_probe_payload)];
+
+    struct fs_file_t probe;
+    fs_file_t_init(&probe);
+
+    ret = fs_open(&probe, SD_INIT_CHECK_PATH, FS_O_CREATE | FS_O_RDWR);
+    if (ret != 0) {
+        LOG_ERR("[6/6] FAIL: fs_open probe returned %d", ret);
+        fs_unmount(&mp);
+        sd_mounted = false;
+        return ret;
+    }
+
+    ssize_t w = fs_write(&probe, sd_probe_payload, probe_len);
+    if (w < 0 || (size_t)w != probe_len) {
+        LOG_ERR("[6/6] FAIL: fs_write probe returned %d (expected %u)",
+                (int)w, (unsigned)probe_len);
+        fs_close(&probe);
+        fs_unlink(SD_INIT_CHECK_PATH);
+        fs_unmount(&mp);
+        sd_mounted = false;
         return (w < 0) ? (int)w : -EIO;
     }
 
-    LOG_INF("SD write-verify: OK");
-    return 0;
-}
+    fs_seek(&probe, 0, FS_SEEK_SET);
 
-/* ── SD card init ─────────────────────────────────────────────── */
-static int init_sd_card(void)
-{
-    static const char *disk_pdrv = "SD";
-    uint64_t memory_size_mb;
-    uint32_t block_count, block_size;
+    ssize_t r = fs_read(&probe, probe_rd, probe_len);
+    fs_close(&probe);
+    fs_unlink(SD_INIT_CHECK_PATH);
 
-    LOG_INF("Initialising SD card...");
-
-    if (disk_access_init(disk_pdrv) != 0) {
-        LOG_ERR("disk_access_init failed");
-        return -1;
-    }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
-        LOG_ERR("Cannot get sector count");
-        return -1;
-    }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
-        LOG_ERR("Cannot get sector size");
-        return -1;
-    }
-
-    memory_size_mb = (uint64_t)block_count * block_size / (1024 * 1024);
-    LOG_INF("SD card: %u MB", (uint32_t)memory_size_mb);
-
-    if (fs_mount(&mp) != 0) {
-        LOG_ERR("fs_mount failed");
-        return -1;
-    }
-
-    LOG_INF("SD mounted at %s", SD_CARD_MOUNT_POINT);
-    sd_mounted = true;
-
-    if (verify_sd_writable() != 0) {
-        LOG_ERR("SD mounted but not writable — treating as absent");
+    if (r < 0 || (size_t)r != probe_len) {
+        LOG_ERR("[6/6] FAIL: fs_read probe returned %d (expected %u)",
+                (int)r, (unsigned)probe_len);
         fs_unmount(&mp);
         sd_mounted = false;
-        return -1;
+        return (r < 0) ? (int)r : -EIO;
     }
 
+    if (memcmp(sd_probe_payload, probe_rd, probe_len) != 0) {
+        LOG_ERR("[6/6] FAIL: probe read-back mismatch — data corruption");
+        fs_unmount(&mp);
+        sd_mounted = false;
+        return -EIO;
+    }
+
+    LOG_INF("[6/6] probe write+read+verify OK  → SD is writable");
     return 0;
 }
 
@@ -518,8 +606,7 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 
         if (!sd_mounted) {
             LOG_ERR("SD writer: not mounted, discarding data");
-            /* [FIX 5] Properly drain — the v7.2 path called ring_buf_get
-             * with sizes it never actually consumed. */
+            /* [FIX 5] Properly drain the rings. */
             while (ring_buf_size_get(&audio_sd_ring) > 0
 #if !DSP_OFFLINE
                 || ring_buf_size_get(&heart_mfcc_ring) > 0
@@ -576,17 +663,15 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                     uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&audio_sd_ring, sd_write_buf, n);
                     sd_checksum ^= compute_checksum(sd_write_buf, n);
-                    ssize_t w = fs_write(&sd_audio_file, sd_write_buf, n);
-                    if (w < 0) {
-                        /* [FIX 4] Bail out instead of hammering the card.
-                         * The v7.1/v7.2 log was 250+ identical -EIO lines
-                         * because this branch did nothing. */
+                    ssize_t wr = fs_write(&sd_audio_file, sd_write_buf, n);
+                    if (wr < 0) {
+                        /* [FIX 4] Bail out instead of hammering the card. */
                         LOG_ERR("SD audio fs_write failed: %d — aborting writer",
-                                (int)w);
+                                (int)wr);
                         write_error = true;
                         break;
                     }
-                    audio_written += (uint32_t)w;
+                    audio_written += (uint32_t)wr;
                     uint32_t fill = ring_buf_size_get(&audio_sd_ring);
                     if (fill > audio_ring_high_water) audio_ring_high_water = fill;
                     did_work = true;
@@ -601,13 +686,13 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 if (avail >= SD_WRITE_BUF_SIZE || (done && avail > 0)) {
                     uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&heart_mfcc_ring, sd_write_buf, n);
-                    ssize_t w = fs_write(&sd_heart_file, sd_write_buf, n);
-                    if (w < 0) {
-                        LOG_ERR("SD heart fs_write failed: %d — aborting", (int)w);
+                    ssize_t wr = fs_write(&sd_heart_file, sd_write_buf, n);
+                    if (wr < 0) {
+                        LOG_ERR("SD heart fs_write failed: %d — aborting", (int)wr);
                         write_error = true;
                         break;
                     }
-                    heart_written += (uint32_t)w;
+                    heart_written += (uint32_t)wr;
                     uint32_t fill = ring_buf_size_get(&heart_mfcc_ring);
                     if (fill > heart_ring_high_water) heart_ring_high_water = fill;
                     did_work = true;
@@ -621,13 +706,13 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                 if (avail >= SD_WRITE_BUF_SIZE || (done && avail > 0)) {
                     uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&lung_mfcc_ring, sd_write_buf, n);
-                    ssize_t w = fs_write(&sd_lung_file, sd_write_buf, n);
-                    if (w < 0) {
-                        LOG_ERR("SD lung fs_write failed: %d — aborting", (int)w);
+                    ssize_t wr = fs_write(&sd_lung_file, sd_write_buf, n);
+                    if (wr < 0) {
+                        LOG_ERR("SD lung fs_write failed: %d — aborting", (int)wr);
                         write_error = true;
                         break;
                     }
-                    lung_written += (uint32_t)w;
+                    lung_written += (uint32_t)wr;
                     uint32_t fill = ring_buf_size_get(&lung_mfcc_ring);
                     if (fill > lung_ring_high_water) lung_ring_high_water = fill;
                     did_work = true;
@@ -1685,12 +1770,17 @@ int main(void)
 
     if (init_sd_card() != 0) {
         LOG_ERR("SD card init failed — REC will return ERR:NOSD");
+        LOG_ERR("  CS      — overlay: xiao_d pin 1; verify physical wire");
+        LOG_ERR("  Format  — must be FAT32; exFAT needs CONFIG_FS_FATFS_EXFAT=y");
+        LOG_ERR("  Power   — SD module needs stable 3.3 V");
+        LOG_ERR("  SPI     — D8/D9/D10 wired to SCK/MISO/MOSI?");
         led_error_flash(led_set_yellow);
+        /* sd_mounted stays false — ERR:NOSD sent on first REC */
     }
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.3 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v7.4 ready — waiting for BLE connection");
 
     while (true) {
         k_sleep(K_MSEC(100));

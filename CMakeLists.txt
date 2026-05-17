@@ -16,6 +16,15 @@ target_sources(app PRIVATE
     src/dsp_mfcc.c
 )
  
+# Global model-enable toggles. These are seen by ALL translation units
+# (main.c, tflm_inference.cc, etc.) so we don't end up with the model
+# enabled in main.c but disabled inside tflm_inference.cc.
+# Set to 1 to enable, 0 to disable.
+target_compile_definitions(app PRIVATE
+    ENABLE_HEART_MODEL=1
+    ENABLE_LUNG_MODEL=1
+)
+
 # CMSIS-DSP is bundled with Zephyr's SDK — we just need to declare
 # the dependency so Kconfig enables arm_math.h and the right sources.
 # This is handled via prj.conf: CONFIG_CMSIS_DSP=y

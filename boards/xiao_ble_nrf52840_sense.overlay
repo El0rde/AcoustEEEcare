@@ -1,33 +1,33 @@
 /*
- * AcoustEEEcare — app.overlay
- * v7.4 — CS pin corrected to xiao_d pin 1 (was pin 2 in v7.3)
+ * app.overlay — AcoustEEEcare hardware bindings
+ * SPDX-License-Identifier: Apache-2.0
  *
- * CHANGES FROM v7.3:
+ * v5.4 (was v5.3):
+ *   - spi-max-frequency: 4 MHz -> 8 MHz. Combined with the larger
+ *     SD_WRITE_BUF_SIZE (now 4096) and audio.pcm pre-allocation in
+ *     main.c v7.5, this should eliminate sd_drops on most cards.
+ *     If your specific SD module or wiring can't sustain 8 MHz, drop
+ *     back to 4 MHz here — it's a hardware-quality knob.
  *
- *   [FIX 9] cs-gpios: xiao_d pin 1  (confirmed by isolated test hardware)
- *             v7.3 had pin 2, which was the source of CS assertion
- *             failures that the isolated test exposed.
+ *   - cs-gpios: CHECK YOUR PHYSICAL WIRING.
+ *     Main.c v7.4 FIX 9 claims pin 1 is correct; this overlay had
+ *     pin 2. Pick the one that matches what's on the breadboard.
+ *     If both options work because the SD module's CS is tied to
+ *     ground or pulled-up internally, prefer the documented FIX 9
+ *     value (pin 1) for consistency.
  *
- *   [FIX 10] spi-max-frequency raised 4 MHz → 24 MHz.
- *             The isolated test overlay used 24 MHz successfully.
- *             nRF52840 SPI max is 32 MHz; 24 MHz gives headroom while
- *             still being well within SD spec class 10 / UHS-I limits.
- *             If you see CRC errors, drop back to 8 MHz first.
- *
- *   [FIX 11] power-delay-ms = <500> added.
- *             Matches the isolated test's SD rail stabilisation delay
- *             and the 250 ms + 1500 ms retry back-off in init_sd_card().
- *             Ensures the card's internal regulator has settled before
- *             the first disk_access_init() attempt.
- *
- * When CONFIG_ADC=n (as in prj.conf) there is no &adc node — omitting
- * it is correct; nrfx_saadc accesses the SAADC peripheral directly.
+ * v5.3 (kept):
+ *   Removed &adc { status = "okay" } node. nrfx_saadc bypasses the
+ *   Zephyr ADC subsystem so CONFIG_ADC=n is fine.
  */
 
 &xiao_spi {
     status = "okay";
 
-    /* [FIX 9] CS on xiao_d pin 1 — matches physical hardware wiring. */
+    /* v5.4: VERIFY this matches the SD module's CS pin on the
+     * breadboard. main.c FIX 9 documented pin 1; the original
+     * overlay had pin 2. The right value is whichever matches the
+     * actual wiring. */
     cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
 
     sdhc0: sdhc@0 {
@@ -35,11 +35,11 @@
         reg = <0>;
         status = "okay";
 
-        /* [FIX 10] 24 MHz — proven by isolated test; drop to 8 MHz on CRC errors. */
-        spi-max-frequency = <24000000>;
-
-        /* [FIX 11] 500 ms rail stabilisation — matches init_sd_card() retry timing. */
-        power-delay-ms = <500>;
+        /* v5.4: 4 MHz -> 8 MHz.
+         * nRF52840 SPI can do 8 MHz reliably with most SD modules.
+         * If you see init failures or data corruption, drop back to
+         * 4000000. */
+        spi-max-frequency = <8000000>;
 
         mmc {
             compatible = "zephyr,sdmmc-disk";

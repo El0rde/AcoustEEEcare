@@ -1,54 +1,32 @@
 /*
  * tflm_inference.cc — TFLite Micro heart + lung inference
  * =========================================================
- * v2.1 — updated for best_mcu_int8 heart model (665 × 25).
+ * v2.2 — lung shape validation + arena-used export.
  *
- * Compiled as C++ (required by TFLite Micro).
- * Linked into the Zephyr image alongside main.c (plain C).
+ * Changes from v2.1:
+ *   - LUNG_EXPECTED_FRAMES / LUNG_EXPECTED_N_MFCC defined so the
+ *     existing shape validation in run_inference() actually
+ *     compares against the model's expected shape (was passing
+ *     n_frames/n_mfcc as their own expected values — no-op).
+ *   - g_tflm_arena_used_bytes (defined in main.c) is updated after
+ *     each successful AllocateTensors() so report_ram_usage() shows
+ *     the real arena high-water.
  *
  * HEART MODEL (best_mcu_int8.tflite — trial 59, MAE 3.30 BPM)
  * ─────────────────────────────────────────────────────────
  *   Input:  [1, 665, 25, 1]  int8
- *           (665-frame MFCC matrix, 25 coeffs/frame, NHWC)
- *   Output: [1, 1]            int8   (single BPM scalar, regression)
+ *   Output: [1, 1]            int8  (regression: BPM scalar)
  *
- *   Architecture: 5x Conv2D + 2x MaxPool2D + Mean (GAP) + 3x FullyConnected
- *   Ops needed:   CONV_2D, MAX_POOL_2D, MEAN, FULLY_CONNECTED
+ * LUNG MODEL (best_mcu_lung_int8.tflite, ~28.8 KB)
+ * ─────────────────────────────────────────────────
+ *   Input:  [1, 324, 26, 1]  int8
+ *           (324 = 1 + (40000 - 1200) / 120 from lung_winning_config)
+ *   Output: regression scalar (RR in BPM)
  *
- *   Reported peak_pair_bytes = 83,712  (~82 KB of activation memory).
- *   With TFLM overhead, a 100 KB arena is the right starting point.
- *
- *   IMPORTANT: model expects 25 MFCC coefficients per frame and exactly
- *   665 frames.  The firmware MFCC config must be set to n_mfcc=25 and
- *   produce 665 frames per 10 s capture.  At runtime we validate both
- *   and fail clearly otherwise.
- *
- * LUNG MODEL
- * ──────────
- *   Not yet integrated.  When the .tflite is ready:
- *   1. Add lung_model.h (xxd -i lung_model.tflite > lung_model.h)
- *   2. Update LUNG_EXPECTED_* macros below with the actual input shape
- *   3. Define ENABLE_LUNG_MODEL=1 in main.c
- *
- * DESIGN NOTES
- * ────────────
- * • ONE shared arena, used sequentially.  Heart interpreter is built,
- *   run, destroyed (out of scope), then lung interpreter is built on
- *   the same bytes.
- *
- * • Model data is compiled in as C arrays from heart_model.h / lung_model.h.
- *   Generate with:
- *       xxd -i best_mcu_int8.tflite > heart_model.h
- *   Then edit the array name to g_heart_model_data and the length to
- *   g_heart_model_data_len.  Make the array `alignas(8) const uint8_t`.
- *
- * • MFCC data is read from SD card and stream-quantized directly into
- *   the model's input tensor.  No intermediate large RAM buffer.
- *
- * • CMSIS-NN kernels are enabled via CONFIG_TENSORFLOW_LITE_MICRO_CMSIS_NN_KERNELS
- *   in prj.conf — that switch is built into TFLite Micro itself, so no
- *   include changes are required here.  Inference will simply be ~5-15×
- *   faster on the int8 Conv ops when the option is on.
+ *   NOTE: if AllocateTensors() rejects the input shape, run
+ *   `flatc -t schema.fbs -- best_mcu_lung_int8.tflite | jq` and
+ *   update LUNG_EXPECTED_FRAMES below to whatever the model has in
+ *   its subgraphs[0].tensors[0].shape.
  */
 
 /* ── Standard headers ──
@@ -85,14 +63,30 @@ LOG_MODULE_REGISTER(tflm_inference, LOG_LEVEL_INF);
 
 /* ══════════════════════════════════════════════════════════════════
  * Heart model expected input shape -- validated at runtime
- * (UPDATED for best_mcu_int8 model: 665 frames × 25 MFCC)
+ * (best_mcu_int8 model: 665 frames × 25 MFCC)
  * ══════════════════════════════════════════════════════════════════ */
 #define HEART_EXPECTED_FRAMES   665
 #define HEART_EXPECTED_N_MFCC   25
 
-/* SD read chunk size, in FLOATS.  Tuned so quantizing one chunk's
- * worth fits easily in stack scratch (1 KB float in, 256 B int8 out). */
+/* ══════════════════════════════════════════════════════════════════
+ * Lung model expected input shape -- v2.2
+ * Derived from lung_winning_config (frame=300 ms / hop=10% / fft=2048):
+ *   n_frames = 1 + (40000 - 1200) / 120 = 324
+ *   n_mfcc   = 26
+ * If the model itself disagrees, AllocateTensors will fail with a
+ * clear dims mismatch message and you can adjust either the config
+ * or these macros to match the trained model.
+ * ══════════════════════════════════════════════════════════════════ */
+#define LUNG_EXPECTED_FRAMES    324
+#define LUNG_EXPECTED_N_MFCC    26
+
+/* SD read chunk size, in FLOATS. */
 #define MFCC_READ_CHUNK_FLOATS  256
+
+/* v2.2: arena high-water exported so main.c can report it.
+ * Defined in main.c, declared here as volatile (writer is C++, reader
+ * is C, so the volatile is paranoia against LTO reordering). */
+extern "C" volatile uint32_t g_tflm_arena_used_bytes;
 
 /* ══════════════════════════════════════════════════════════════════
  * FORWARD DECLARATIONS (so we can keep public API at the bottom).
@@ -315,6 +309,7 @@ static int run_inference(const uint8_t *model_data,
     }
 
     const size_t arena_used = interpreter.arena_used_bytes();
+    g_tflm_arena_used_bytes = (uint32_t)arena_used;   /* v2.2: export */
     LOG_INF("%s: AllocateTensors OK -- arena used = %u / %u bytes",
             model_name, (unsigned)arena_used, (unsigned)arena_bytes);
 
@@ -428,15 +423,14 @@ void run_lung_inference(uint8_t      *arena,
     result->confidence = 1.0f;
 
 #if defined(ENABLE_LUNG_MODEL) && ENABLE_LUNG_MODEL
-    /* TODO: update LUNG_EXPECTED_FRAMES / LUNG_EXPECTED_N_MFCC once
-     * the lung .tflite is inspected and integrated. */
+    /* v2.2: pass real expected dims so the shape validation in
+     * run_inference() actually catches mismatches. */
     result->rc = run_inference(g_lung_model_data,
                                "lung",
                                arena, arena_bytes,
                                mfcc_path,
                                n_frames, n_mfcc,
-                               /*exp_frames*/ n_frames,
-                               /*exp_mfcc*/   n_mfcc,
+                               LUNG_EXPECTED_FRAMES, LUNG_EXPECTED_N_MFCC,
                                &result->value);
 
     if (result->rc == 0) {

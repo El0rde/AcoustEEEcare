@@ -1,7 +1,7 @@
 /*
  * tflm_inference.h — TFLite Micro heart + lung inference
  * =========================================================
- * v2.0 — corrected for the actual heart model architecture.
+ * v2.2 — synced with tflm_inference.cc v2.2 (lung integrated).
  *
  * Sequential inference on a shared tensor arena:
  *
@@ -18,23 +18,20 @@
  *   5. Dequantize the scalar output.
  *   6. Write a small text result file to SD.
  *
- * Heart model (trial_144_int8.tflite):
- *   Input  shape  [1, 1331, 20, 1]   int8 (scale ≈ 0.0656, zp = 23)
- *   Output shape  [1, 1]              int8 (scale ≈ 0.4742, zp = -128)
+ * Heart model (best_mcu_int8.tflite):
+ *   Input  shape  [1, 665, 25, 1]   int8
+ *   Output shape  [1, 1]             int8
  *   Regression: output[0] is HR in BPM after dequantization.
+ *   MFCC config must match heart_winning_config (665 frames × 25 mfcc).
  *
- *   IMPORTANT: this requires the firmware heart MFCC config to be
- *   regenerated with num_mfcc=20 (not 25).  Run:
- *       python tools/gen_mfcc_tables.py --num-mfcc 20 ...
- *   to produce heart_mfcc_tables.c, and update heart_mfcc_config.h
- *   so n_mfcc=20 and the mel_fb / dct shapes match.
- *
- * Lung model: not integrated.  When ready, define ENABLE_LUNG_MODEL=1
- * in main.c and follow the TODO in tflm_inference.cc.
+ * Lung model (best_mcu_lung_int8.tflite):
+ *   Input  shape  [1, 324, 26, 1]   int8   (derived from
+ *                 lung_winning_config: frame=300 ms, hop=10%)
+ *   Output: regression scalar (RR in BPM).
  *
  * Output files written to SD:
  *   /SD:/hr.txt    e.g. "HR:72\n"
- *   /SD:/rr.txt    e.g. "RR:15\n"   (when lung model is integrated)
+ *   /SD:/rr.txt    e.g. "RR:15\n"
  */
 
 #pragma once
@@ -55,7 +52,7 @@ typedef struct {
 } heart_result_t;
 
 typedef struct {
-    float    value;        /* RR in BPM (when lung model is integrated) */
+    float    value;        /* RR in BPM (regression output)             */
     float    confidence;   /* 1.0 for regression                        */
     int      class_idx;    /* -1 for regression                         */
     int      rc;
@@ -67,10 +64,10 @@ typedef struct {
  * Run heart inference.
  *
  * @param arena        Shared tensor arena buffer.
- * @param arena_bytes  Size of the arena in bytes.  Heart model needs ~104 KB.
+ * @param arena_bytes  Size of the arena in bytes.  Heart needs ~92 KB; 100 KB recommended.
  * @param mfcc_path    SD path to heart_mfcc.f32 (e.g. "/SD:/heart_mfcc.f32").
- * @param n_frames     Frames written by the offline MFCC pass.  Must == 1331.
- * @param n_mfcc       Coefficients per frame.  Must == 20.
+ * @param n_frames     Frames written by the offline MFCC pass.  Must == 665.
+ * @param n_mfcc       Coefficients per frame.  Must == 25.
  * @param result       Output struct.  result->rc < 0 on failure.
  *
  * On success: writes "/SD:/hr.txt" with "HR:<value>\n".
@@ -85,9 +82,11 @@ void run_heart_inference(uint8_t       *arena,
                          heart_result_t *result);
 
 /**
- * Run lung inference.  Stub until the lung model is integrated.
+ * Run lung inference.
  *
  * Same contract as run_heart_inference().
+ *   n_frames must == 324, n_mfcc must == 26 (per lung_winning_config).
+ *
  * On success: writes "/SD:/rr.txt" with "RR:<value>\n".
  * When ENABLE_LUNG_MODEL is 0 or undefined, returns -ENOTSUP without
  * doing anything.

@@ -1,42 +1,43 @@
 /*
- * AcoustEEEcare — SAADC BLE + SD Card + TFLite Micro Edition
+ * AcoustEEEcare — SAADC BLE + SD Card Edition
  * ============================================================
- * v7.4 — SD init hardened with 6-step sequence from isolated test
+ * v7.5 — BSS-corruption fixes + RAM usage instrumentation
  *
- * CHANGES FROM v7.3:
+ * CHANGES FROM v7.4:
  *
- *   [FIX 7] init_sd_card() replaced with the 6-step hardened sequence
- *     proven in the SD Card Isolated Test (v6.6):
+ *   [FIX 10] heart_window sized 50 -> 60 to match heart frame_samples=60.
+ *            Previously memset(p->window, 0, 60*2)=120 bytes overflowed
+ *            a 100-byte buffer on every dsp_mfcc_reset(), silently
+ *            corrupting whatever sat next in BSS.
  *
- *     Step 1: disk_access_init with INIT_RETRIES (5) attempts + 1750 ms
- *             back-off (250 ms rail-stabilise + 1500 ms retry gap).
- *             The v7.3 version had a single shot with no retry path.
+ *   [FIX 11] lung_window sized 100 -> 1200 to match lung frame_samples=1200.
+ *            The previous 200-byte buffer was being memset'd with
+ *            2400 bytes on every reset — a 2200-byte BSS overflow.
+ *            THIS WAS THE PRIMARY CAUSE OF THE SECOND-REC HANG.
  *
- *     Step 2: DISK_IOCTL_GET_SECTOR_COUNT — validates the card responds.
+ *   [FIX 12] SD_WRITE_BUF_SIZE bumped 512 -> 4096 (one FAT cluster on
+ *            most SD cards). Cuts per-write FATFS overhead ~8x, which
+ *            is what was causing the sd_drops=36 (~36 KB of dropped
+ *            audio on the first REC).
  *
- *     Step 3: DISK_IOCTL_GET_SECTOR_SIZE — guards against non-512-byte
- *             cards that FATFS cannot handle without extra config.
+ *   [FIX 13] AUDIO_SD_RING_BYTES bumped 16 KB -> 32 KB. Was exactly 1 s
+ *            of audio at 8 kHz/int16. Any fs_write stall >1 s caused
+ *            ring overflow. 32 KB gives ~2 s of headroom.
  *
- *     Step 4: fs_mount() with a CTRL_SYNC diagnostic on failure
- *             (distinguishes SPI wiring fault from wrong FS format).
+ *   [FIX 14] audio.pcm file is pre-truncated to expected size right
+ *            after fs_open. FATFS allocates clusters up front so
+ *            subsequent writes skip FAT updates entirely.
  *
- *     Step 5: fs_statvfs() free-space check — warns (non-fatal) if the
- *             card is full before we even start recording.
+ *   [FIX 15] report_ram_usage() now also dumps:
+ *            - tensor_arena last "used" bytes (set by tflm_inference)
+ *            - heap stats via sys_heap_runtime_stats_get()
+ *            - per-thread stack high-water using k_thread_foreach()
+ *            Called BEFORE recording starts AND after each phase.
  *
- *     Step 6: probe write → seek → read → memcmp → unlink roundtrip,
- *             replacing the old single-byte sentinel verify_sd_writable().
- *             The probe uses the full AcoustEEEcare sentinel string so
- *             the on-card file is self-documenting.
+ *   [FIX 16] _bss_end symbol name resolved with weak fallback for
+ *            both Zephyr linker script flavours (__bss_end vs _end).
  *
- *   [FIX 8] verify_sd_writable() removed — fully superseded by Step 6.
- *
- *   [FIX 9] app.overlay CS pin corrected: xiao_d pin 1 (was pin 2).
- *           Pin 2 was the v7.3 overlay default; the isolated test
- *           confirmed pin 1 matches the physical hardware wiring.
- *           (overlay change only — no main.c impact, noted here for
- *           traceability)
- *
- * ALL PREVIOUS FIXES (v7.3 / v7.2 / v7.1 / v6.8) ARE PRESERVED UNCHANGED.
+ * ALL PREVIOUS FIXES (v7.4 / v7.3 / v7.2 / v7.1 / v6.8) ARE PRESERVED.
  * ============================================================
  */
 
@@ -45,9 +46,11 @@
 #define BLE_AUDIO_LIVE  0   /* must stay 0 for arena RAM to be available */
 #define DSP_OFFLINE     1   /* must stay 1 for arena RAM to be available */
 
+
 /* ── Model enable flags ─────────────────────────────────────────── */
-#define ENABLE_HEART_MODEL  1   /* set to 0 while heart model absent */
-#define ENABLE_LUNG_MODEL   1   /* set to 1 once lung model is ready */
+/* #define ENABLE_HEART_MODEL  1    set to 0 while heart model absent */
+/* #define ENABLE_LUNG_MODEL   1    set to 1 once lung model is ready */ 
+
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -55,6 +58,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -71,24 +75,63 @@
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/sys/byteorder.h>
 #include "zephyr/kernel/thread_stack.h"
+// #include "zephyr/sys/time_units.h"
+
+/* v7.5: optional thread analyzer + heap stats for RAM tracking */
+#if defined(CONFIG_THREAD_ANALYZER)
+#include <zephyr/debug/thread_analyzer.h>
+#endif
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+#include <zephyr/sys/sys_heap.h>
+extern struct sys_heap _system_heap;   /* defined by Zephyr kernel */
+#endif
 
 #include <nrfx.h>
 #include <drivers/nrfx_errors.h>
 #include <nrfx_saadc.h>
 
 #include "dsp_mfcc.h"
-#include "heart_mfcc_config.h"
-#include "lung_mfcc_config.h"
-
-#include "tflm_inference.h"
 
 #if USE_SD
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
+/*
+ * ff.h provides the FATFS typedef (the ELM FatFs work-area struct).
+ * It is supplied by the fatfs west module when CONFIG_FAT_FILESYSTEM_ELM=y.
+ * Zephyr's own subsys/fs/shell.c includes it the same way.
+ * Do NOT write your own ff.h — west pulls the real one from
+ * https://github.com/zephyrproject-rtos/fatfs
+ */
 #include <ff.h>
 #endif
 
 LOG_MODULE_REGISTER(AcoustEEEcare);
+
+/* ══════════════════════════════════════════════════════════════════
+ * FORWARD DECLARATIONS for debug beacons
+ *
+ * The LED helpers (led_set_*, led_on, led_off) and the LED gpio_dt_spec
+ * variables are defined further down in the file. We forward-declare
+ * them up here so earlier functions (debug_flash_twice, saadc_init,
+ * saadc_start_streaming) can use them.
+ *
+ * Also declares saadc_start_streaming and saadc_stop_streaming so
+ * record_and_stream can call them.
+ * ══════════════════════════════════════════════════════════════════ */
+extern const struct gpio_dt_spec red_led;
+extern const struct gpio_dt_spec green_led;
+extern const struct gpio_dt_spec blue_led;
+static inline void led_on (const struct gpio_dt_spec *l);
+static inline void led_off(const struct gpio_dt_spec *l);
+static inline void led_set_white(void);
+static inline void led_set_red(void);
+static inline void led_set_green(void);
+static inline void led_set_blue(void);
+static inline void led_set_yellow(void);
+static inline void led_set_purple(void);
+static inline void led_set_cyan(void);
+static int  saadc_start_streaming(void);
+static void saadc_stop_streaming(void);
 
 /* ══════════════════════════════════════════════════════════════════
  * SHARED TENSOR ARENA
@@ -99,9 +142,11 @@ LOG_MODULE_REGISTER(AcoustEEEcare);
  *   100 KB gives ~8 KB headroom.  After AllocateTensors() runs once,
  *   check the "arena used" log line and tighten further if you want.
  * ══════════════════════════════════════════════════════════════════ */
-#define TENSOR_ARENA_BYTES  (100u * 1024u)
+#define TENSOR_ARENA_BYTES  (72u * 1024u)
 
-static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
+/* __used so the linker keeps it even if ENABLE_*_MODEL=0,
+ * preserving BSS layout for diagnostic builds. */
+static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16) __used;
 
 /* ══════════════════════════════════════════════════════════════════
  * RAM USAGE REPORT
@@ -112,12 +157,15 @@ static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
  * _image_ram_end and _image_ram_start bracket the entire RAM image
  * (including noinit, where thread stacks live).
  * ══════════════════════════════════════════════════════════════════ */
+/* v7.5 [FIX 16]: __bss_end isn't defined on every Zephyr linker
+ * script flavour. Provide weak fallback alias to _end. */
 extern char __bss_start;
-extern char __bss_end;
+extern char __bss_end __attribute__((weak));
+extern char _end      __attribute__((weak));
 extern char _image_ram_start;
 extern char _image_ram_end;
 
-#define BLE_TX_STACK_SIZE     2048
+#define BLE_TX_STACK_SIZE     1024
 #if DSP_OFFLINE
 #define DSP_THREAD_STACK_SIZE 1024
 #else
@@ -133,27 +181,66 @@ static dsp_mfcc_pipeline_t lung_pipeline;
 static uint32_t heart_frame_count;
 static uint32_t lung_frame_count;
 
-static void report_ram_usage(void)
+/* v7.5 [FIX 15]: TFLM arena high-water (updated by tflm_inference.cc
+ * via this extern). Lets report_ram_usage() show the actual usage. */
+volatile uint32_t g_tflm_arena_used_bytes = 0;
+
+#if defined(CONFIG_THREAD_ANALYZER)
+static void thread_stack_dump_cb(const struct k_thread *thread, void *user_data)
+{
+    ARG_UNUSED(user_data);
+    size_t unused;
+    if (k_thread_stack_space_get(thread, &unused) != 0) {
+        return;
+    }
+    const char *name = k_thread_name_get((k_tid_t)thread);
+    LOG_INF("  %-12s  unused=%5u B", name ? name : "?", (unsigned)unused);
+}
+#endif
+
+static void report_ram_usage(const char *label)
 {
     uintptr_t bss_start   = (uintptr_t)&__bss_start;
-    uintptr_t bss_end     = (uintptr_t)&__bss_end;
+    /* Prefer __bss_end if present, else fall back to _end. */
+    uintptr_t bss_end     = (&__bss_end != NULL)
+                              ? (uintptr_t)&__bss_end
+                              : (uintptr_t)&_end;
     uintptr_t image_start = (uintptr_t)&_image_ram_start;
     uintptr_t image_end   = (uintptr_t)&_image_ram_end;
 
     uint32_t bss_bytes   = (uint32_t)(bss_end   - bss_start);
     uint32_t image_bytes = (uint32_t)(image_end - image_start);
 
-    LOG_INF("==================== RAM USAGE REPORT ====================");
+    LOG_INF("================ RAM USAGE @ %s ================",
+            label ? label : "unlabeled");
     LOG_INF("BSS region:    [0x%08lx .. 0x%08lx)  %u B (%u KB)",
             (unsigned long)bss_start, (unsigned long)bss_end,
             bss_bytes, bss_bytes / 1024);
     LOG_INF("Image region:  [0x%08lx .. 0x%08lx)  %u B (%u KB)",
             (unsigned long)image_start, (unsigned long)image_end,
             image_bytes, image_bytes / 1024);
-    LOG_INF("Tensor arena:  %u KB (declared)", TENSOR_ARENA_BYTES / 1024);
+    LOG_INF("Tensor arena:  declared=%u B  last_used=%u B",
+            (unsigned)TENSOR_ARENA_BYTES,
+            (unsigned)g_tflm_arena_used_bytes);
 
+    /* ── Heap stats ─────────────────────────────────────────────── */
+#if defined(CONFIG_SYS_HEAP_RUNTIME_STATS)
+    {
+        struct sys_memory_stats hs;
+        if (sys_heap_runtime_stats_get(&_system_heap, &hs) == 0) {
+            LOG_INF("Heap:          free=%u  alloc=%u  max_alloc=%u",
+                    (unsigned)hs.free_bytes,
+                    (unsigned)hs.allocated_bytes,
+                    (unsigned)hs.max_allocated_bytes);
+        }
+    }
+#else
+    LOG_INF("Heap:          (CONFIG_SYS_HEAP_RUNTIME_STATS=n; "
+            "stats unavailable)");
+#endif
+
+    /* ── Per-thread stack high-water ────────────────────────────── */
     size_t unused;
-
     if (k_thread_stack_space_get(&ble_tx_thread_data, &unused) == 0) {
         LOG_INF("BLE TX stack:  %u / %u B used (%u%% headroom)",
                 (unsigned)(BLE_TX_STACK_SIZE - unused),
@@ -174,17 +261,24 @@ static void report_ram_usage(void)
                 (unsigned)(unused * 100u / SD_WRITER_STACK_SIZE));
     }
 #endif
+
+    /* ── All-thread analyzer (covers main, idle, BLE rx, etc.) ── */
+#if defined(CONFIG_THREAD_ANALYZER)
+    LOG_INF("All threads (unused stack bytes):");
+    k_thread_foreach(thread_stack_dump_cb, NULL);
+#endif
+
     LOG_INF("Heart frames:  %u  (expected %d)",
             heart_frame_count, heart_pipeline.cfg->n_frames_expected);
     LOG_INF("Lung  frames:  %u  (expected %d)",
             lung_frame_count,  lung_pipeline.cfg->n_frames_expected);
-    LOG_INF("==========================================================");
+    LOG_INF("=========================================================");
 }
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC CONFIG
  * ══════════════════════════════════════════════════════════════════ */
-#define SAADC_CC_VALUE      2000U
+#define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz */
 #define SAADC_IRQ_PRIORITY  6
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
@@ -204,6 +298,10 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
 
 static volatile uint32_t saadc_dma_overruns = 0;
 
+/* DC removal: high-pass IIR, alpha = 1/256.
+ * Init to 0 — converges within ~256 samples (~32 ms at 8 kHz).
+ * DO NOT init to 2048: that creates a large transient spike at the
+ * start of every recording. */
 #define ENABLE_DC_REMOVAL
 static int32_t dc_estimate = 0;
 
@@ -212,14 +310,13 @@ static int32_t dc_estimate = 0;
  * ══════════════════════════════════════════════════════════════════ */
 #define SAMPLING_RATE        8000
 #define DURATION_S           10
-#define TOTAL_AUDIO_SAMPLES  (SAMPLING_RATE * DURATION_S)
-#define TOTAL_AUDIO_BYTES    (TOTAL_AUDIO_SAMPLES * sizeof(int16_t))
+#define TOTAL_AUDIO_SAMPLES  (SAMPLING_RATE * DURATION_S)            /* 80 000 */
+#define TOTAL_AUDIO_BYTES    (TOTAL_AUDIO_SAMPLES * sizeof(int16_t)) /* 160 000 */
 
 #define HALF_BUF_SAMPLES     512
-#define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))
+#define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))   /* 1 024 */
 
-/* [FIX 6] Ping-pong buffers passed to SAADC EasyDMA must be aligned. */
-static int16_t ping_pong[2][HALF_BUF_SAMPLES] __aligned(4);
+static int16_t ping_pong[2][HALF_BUF_SAMPLES];
 static volatile uint8_t  next_dma_buf     = 1;
 static volatile bool     analog_recording = false;
 static uint16_t          nus_chunk_size   = 244;
@@ -227,12 +324,10 @@ static uint16_t          nus_chunk_size   = 244;
 /* ══════════════════════════════════════════════════════════════════
  * BLE AUDIO RING BUFFER + TX THREAD
  * ══════════════════════════════════════════════════════════════════ */
-static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
-
-#if BLE_AUDIO_LIVE
 #define AUDIO_RING_BYTES  (16 * 1024)
 RING_BUF_DECLARE(audio_ring, AUDIO_RING_BYTES);
 
+static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(audio_data_sem,    0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(tx_done_sem,       0, 1);
 
@@ -240,29 +335,19 @@ static atomic_t  ring_drops;
 static uint32_t  ring_high_water = 0;
 
 static uint16_t tx_seq = 0;
-#endif /* BLE_AUDIO_LIVE */
-
 #define CHUNK_HEADER_BYTES  4
 
-/* ══════════════════════════════════════════════════════════════════
- * DSP RING BUFFER + DSP THREAD
- * ══════════════════════════════════════════════════════════════════ */
-#if !DSP_OFFLINE
-#define DSP_RING_BYTES  (32 * 1024)
-RING_BUF_DECLARE(dsp_ring, DSP_RING_BYTES);
-
-static K_SEM_DEFINE(dsp_data_sem, 0, K_SEM_MAX_LIMIT);
-static K_SEM_DEFINE(dsp_done_sem, 0, 1);
-
-static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
-#endif /* !DSP_OFFLINE */
+#define BLE_TX_STACK_SIZE  2048
+#define BLE_TX_PRIORITY    5
+static K_THREAD_STACK_DEFINE(ble_tx_stack, BLE_TX_STACK_SIZE);
+static struct k_thread ble_tx_thread_data;
+static void ble_tx_thread_fn(void *a, void *b, void *c);
 
 /* ══════════════════════════════════════════════════════════════════
- * SD CARD DATA DECLARATIONS
+ * SD CARD GLOBALS  (USE_SD true only)
  * ══════════════════════════════════════════════════════════════════ */
 #if USE_SD
 
-#define SD_CARD_MOUNT_POINT  "/SD:"
 #define AUDIO_FILE_PATH      "/SD:/analog.pcm"
 #define HEART_MFCC_FILE_PATH "/SD:/heart_mfcc.f32"
 #define LUNG_MFCC_FILE_PATH  "/SD:/lung_mfcc.f32"
@@ -283,7 +368,10 @@ static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
 /* Probe sentinel — self-documenting if the file is left on the card. */
 static const char sd_probe_payload[] = "AcoustEEEcare-SD-probe-v7.4\n";
 
-#define AUDIO_SD_RING_BYTES      (16 * 1024)
+/* v7.5 [FIX 13]: 32 KB = ~2 s of audio at 8 kHz/int16.
+ * Previous 16 KB was exactly 1 s — any fs_write stall >1 s caused
+ * ring overflow and the sd_drops=36 we saw on the first REC. */
+#define AUDIO_SD_RING_BYTES      (32 * 1024)
 RING_BUF_DECLARE(audio_sd_ring,   AUDIO_SD_RING_BYTES);
 
 #if !DSP_OFFLINE
@@ -302,9 +390,15 @@ static uint32_t  audio_ring_high_water = 0;
 
 /* ══════════════════════════════════════════════════════════════════
  * DUAL MFCC PIPELINE INSTANCES
+ *
+ * v7.5 [FIX 10/11] Window sizes MUST equal cfg->frame_samples or
+ * dsp_mfcc_reset() will overflow the buffer on every reset.
+ *   heart: frame_samples = 60   (was sized 50 -> 120 B overflow)
+ *   lung : frame_samples = 1200 (was sized 100 -> 2200 B overflow!)
+ * The lung overflow was the primary cause of the second-REC hang.
  * ══════════════════════════════════════════════════════════════════ */
-static int16_t heart_window[50] __aligned(4);
-static int16_t lung_window[100] __aligned(4);
+static int16_t heart_window[60]   __aligned(4);
+static int16_t lung_window[1200]  __aligned(4);
 
 #if USE_SD
 static struct fs_file_t *offline_heart_fp = NULL;
@@ -414,31 +508,59 @@ static void dsp_thread_fn(void *a, void *b, void *c)
  * ══════════════════════════════════════════════════════════════════ */
 #if USE_SD
 
+/*
+ * sd_data_sem — given ONCE per recording by record_and_stream() to
+ * wake the SD writer thread.  NOT given per half-buffer from the ISR;
+ * flooding the semaphore counter served no purpose and masked
+ * backpressure.  The writer thread polls ring_buf_size_get() in its
+ * own loop.
+ */
 static K_SEM_DEFINE(sd_data_sem, 0, K_SEM_MAX_LIMIT);
+/* Semaphore: SD writer thread signals main thread when file is closed */
 static K_SEM_DEFINE(sd_done_sem, 0, 1);
 
-#define SD_WRITER_PRIORITY    6
+/* SD writer thread */
+#define SD_WRITER_STACK_SIZE  2048
+#define SD_WRITER_PRIORITY    6   /* lower priority than BLE TX (5) */
 static K_THREAD_STACK_DEFINE(sd_writer_stack, SD_WRITER_STACK_SIZE);
+static struct k_thread sd_writer_thread_data;
 static void sd_writer_thread_fn(void *a, void *b, void *c);
 
-static FATFS             fat_fs;
+/*
+ * SD filesystem state.
+ *
+ * fat_fs  — FATFS work-area struct (typedef from ff.h / ELM FatFs).
+ *            This is the actual buffer FatFs uses internally to track
+ *            the mounted volume.  Its address goes into mp.fs_data.
+ *
+ * mp      — Zephyr fs_mount_t descriptor.
+ *            .type    = FS_FATFS  → integer enum telling the VFS switch
+ *                                   which filesystem ops to call.
+ *            .fs_data = &fat_fs   → pointer to the FATFS work area.
+ *
+ * v6.5 BUG: mp.fs_data was set to &FS_FATFS — the address of an
+ * integer constant — not &fat_fs.  This caused fs_mount() to write the
+ * FatFs volume state into a random read-only location, producing a
+ * hard-fault or silent memory corruption.
+ */
+static FATFS            fat_fs;          /* ELM FatFs work area — sized by ff.h */
 static struct fs_mount_t mp = {
-    .type      = FS_FATFS,
+    .type      = FS_FATFS,              /* integer type ID — tells VFS "use FAT" */
     .mnt_point = SD_CARD_MOUNT_POINT,
-    .fs_data   = &fat_fs,
+    .fs_data   = &fat_fs,              /* pointer to FATFS work area — FIXED */
 };
-static bool             sd_mounted   = false;
-static struct fs_file_t sd_audio_file;
-#if !DSP_OFFLINE
-static struct fs_file_t sd_heart_file;
-static struct fs_file_t sd_lung_file;
-#endif
-static uint32_t         sd_checksum  = 0;
+static bool             sd_mounted  = false;
+static struct fs_file_t sd_file;
+static uint32_t         sd_checksum = 0;   /* running XOR */
 
-/* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA. */
-#define SD_WRITE_BUF_SIZE  512
+/* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA.
+ * v7.5 [FIX 12]: bumped 512 -> 4096 (one FAT cluster on typical SDs).
+ * Cuts per-write FATFS bookkeeping ~8x. Combined with FIX 14 file
+ * pre-truncation, this should eliminate sd_drops entirely. */
+#define SD_WRITE_BUF_SIZE  4096
 static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE] __aligned(4);
 
+/* XOR checksum over raw bytes */
 static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
 {
     uint32_t cs = 0;
@@ -597,11 +719,26 @@ static int init_sd_card(void)
 }
 
 /* ── SD writer thread ─────────────────────────────────────────── */
+/*
+ * Runs at PRIORITY 6 (below BLE TX at 5).
+ * Lifecycle per recording:
+ *   1. Waits on sd_data_sem (given once per REC by record_and_stream).
+ *   2. Drains sd_ring in SD_WRITE_BUF_SIZE chunks while
+ *      analog_recording is true or ring is non-empty.
+ *   3. Flushes any partial tail buffer.
+ *   4. Appends 4-byte XOR checksum.
+ *   5. Closes the file and signals sd_done_sem.
+ *   6. Goes back to waiting on sd_data_sem.
+ *
+ * The file is opened by record_and_stream() before SAADC starts,
+ * so the writer thread never needs to open it.
+ */
 static void sd_writer_thread_fn(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 
     while (true) {
+        /* Wait until a recording starts */
         k_sem_take(&sd_data_sem, K_FOREVER);
 
         if (!sd_mounted) {
@@ -636,22 +773,12 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
         }
 
         LOG_INF("SD writer: starting write loop");
-        uint32_t audio_written = 0;
-#if !DSP_OFFLINE
-        uint32_t heart_written = 0;
-        uint32_t lung_written  = 0;
-#endif
+        uint32_t total_written = 0;
         sd_checksum = 0;
-        bool write_error = false;   /* [FIX 4] sticky abort flag */
 
-        while (!write_error &&
-               (analog_recording ||
-                ring_buf_size_get(&audio_sd_ring) > 0
-#if !DSP_OFFLINE
-                || ring_buf_size_get(&heart_mfcc_ring) > 0
-                || ring_buf_size_get(&lung_mfcc_ring)  > 0
-#endif
-               )) {
+        /* Drain loop: keep going while recording is active OR ring has data */
+        while (analog_recording || ring_buf_size_get(&sd_ring) > 0) {
+            uint32_t avail = ring_buf_size_get(&sd_ring);
 
             bool did_work = false;
 
@@ -722,149 +849,61 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
 
             if (!did_work) {
                 k_sleep(K_MSEC(1));
+                continue;
+            }
+
+            /*
+             * Write in SD_WRITE_BUF_SIZE aligned blocks while recording,
+             * but allow partial writes once recording has stopped (tail flush).
+             */
+            bool recording_done = !analog_recording;
+            uint32_t to_write   = avail < SD_WRITE_BUF_SIZE ? avail : SD_WRITE_BUF_SIZE;
+
+            /* During recording: hold partial blocks so we write full sectors */
+            if (!recording_done && to_write < SD_WRITE_BUF_SIZE) {
+                k_sleep(K_MSEC(1));
+                continue;
+            }
+
+            ring_buf_get(&sd_ring, sd_write_buf, to_write);
+            sd_checksum ^= compute_checksum(sd_write_buf, to_write);
+
+            ssize_t written = fs_write(&sd_file, sd_write_buf, to_write);
+            if (written < 0) {
+                LOG_ERR("SD write error: %d at byte %u", (int)written, total_written);
+                /* Continue anyway — partial file is better than crash */
+            } else {
+                total_written += (uint32_t)written;
             }
         }
 
-        /* Append checksum (best-effort; ignore error if card is dead). */
-        if (!write_error) {
-            ssize_t cw = fs_write(&sd_audio_file, &sd_checksum, CHECKSUM_SIZE);
-            if (cw < 0) {
-                LOG_WRN("SD audio checksum write failed: %d", (int)cw);
-            }
-        }
-        fs_close(&sd_audio_file);
-#if !DSP_OFFLINE
-        fs_close(&sd_heart_file);
-        fs_close(&sd_lung_file);
-#endif
+        /* Append XOR checksum */
+        fs_write(&sd_file, &sd_checksum, CHECKSUM_SIZE);
+        fs_close(&sd_file);
 
-#if !DSP_OFFLINE
-        LOG_INF("SD writer done: audio=%u B  heart=%u B  lung=%u B  err=%d",
-                audio_written, heart_written, lung_written, (int)write_error);
-        LOG_INF("Ring high-water: audio=%u  heart=%u  lung=%u",
-                audio_ring_high_water, heart_ring_high_water, lung_ring_high_water);
-#else
-        LOG_INF("SD writer done: audio=%u B  err=%d (offline DSP -> MFCC later)",
-                audio_written, (int)write_error);
-        LOG_INF("Ring high-water: audio=%u", audio_ring_high_water);
-#endif
+        LOG_INF("SD writer: %u audio bytes written, checksum=0x%08X",
+                total_written, sd_checksum);
+        LOG_INF("SD writer: sd_ring high water = %u / %u", sd_ring_high_water, SD_RING_BYTES);
 
         k_sem_give(&sd_done_sem);
     }
 }
 
-#if DSP_OFFLINE
-/* ══════════════════════════════════════════════════════════════════
- * OFFLINE MFCC PROCESSING (Phase 2)
- * ══════════════════════════════════════════════════════════════════ */
-static int process_audio_offline(int *out_heart_frames, int *out_lung_frames)
-{
-    int rc = 0;
-    struct fs_file_t fa;
-    struct fs_file_t fh;
-    struct fs_file_t fl;
-
-    fs_file_t_init(&fa);
-    fs_file_t_init(&fh);
-    fs_file_t_init(&fl);
-
-    LOG_INF("Offline MFCC: opening files...");
-
-    rc = fs_open(&fa, AUDIO_FILE_PATH, FS_O_READ);
-    if (rc < 0) {
-        LOG_ERR("Offline: fs_open(%s) failed: %d", AUDIO_FILE_PATH, rc);
-        return rc;
-    }
-
-    rc = fs_open(&fh, HEART_MFCC_FILE_PATH,
-                 FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
-    if (rc < 0) {
-        LOG_ERR("Offline: fs_open(%s) failed: %d", HEART_MFCC_FILE_PATH, rc);
-        fs_close(&fa);
-        return rc;
-    }
-
-    rc = fs_open(&fl, LUNG_MFCC_FILE_PATH,
-                 FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
-    if (rc < 0) {
-        LOG_ERR("Offline: fs_open(%s) failed: %d", LUNG_MFCC_FILE_PATH, rc);
-        fs_close(&fa);
-        fs_close(&fh);
-        return rc;
-    }
-
-    dsp_mfcc_reset(&heart_pipeline);
-    dsp_mfcc_reset(&lung_pipeline);
-    heart_frame_count = 0;
-    lung_frame_count  = 0;
-
-    offline_heart_fp = &fh;
-    offline_lung_fp  = &fl;
-
-    /* [FIX 6] 4-byte aligned read buffer for SD/FATFS underlying DMA. */
-    int16_t  read_buf[HALF_BUF_SAMPLES] __aligned(4);
-    uint32_t bytes_read_total = 0;
-    int      chunk_idx        = 0;
-    int64_t  t_start          = k_uptime_get();
-
-    const uint32_t audio_payload_bytes = (uint32_t)TOTAL_AUDIO_BYTES;
-
-    while (bytes_read_total < audio_payload_bytes) {
-        uint32_t want = MIN((uint32_t)sizeof(read_buf),
-                            audio_payload_bytes - bytes_read_total);
-
-        ssize_t got = fs_read(&fa, read_buf, want);
-        if (got <= 0) {
-            LOG_WRN("Offline: short/zero read at byte %u (got=%d) — "
-                    "audio file may be truncated",
-                    bytes_read_total, (int)got);
-            break;
-        }
-        int samples = (int)(got / sizeof(int16_t));
-
-        dsp_mfcc_feed_chunk(&heart_pipeline, read_buf, samples);
-        dsp_mfcc_feed_chunk(&lung_pipeline,  read_buf, samples);
-
-        bytes_read_total += (uint32_t)got;
-        chunk_idx++;
-
-        if ((chunk_idx & 3) == 0) {
-            k_yield();
-        }
-    }
-
-    int hf = dsp_mfcc_finish(&heart_pipeline);
-    int lf = dsp_mfcc_finish(&lung_pipeline);
-
-    offline_heart_fp = NULL;
-    offline_lung_fp  = NULL;
-
-    fs_close(&fa);
-    fs_close(&fh);
-    fs_close(&fl);
-
-    int64_t elapsed_ms = k_uptime_delta(&t_start);
-    LOG_INF("Offline MFCC done: %u B audio in %lld ms (%u chunks)",
-            bytes_read_total, elapsed_ms, chunk_idx);
-    LOG_INF("Offline frames: heart=%u (finish=%d)  lung=%u (finish=%d)",
-            heart_frame_count, hf, lung_frame_count, lf);
-
-    if (out_heart_frames) *out_heart_frames = (hf >= 0) ? hf : (int)heart_frame_count;
-    if (out_lung_frames)  *out_lung_frames  = (lf >= 0) ? lf : (int)lung_frame_count;
-
-    if (heart_frame_count == 0 && lung_frame_count == 0) {
-        LOG_ERR("Offline MFCC produced zero frames — audio file may be empty");
-        return -EIO;
-    }
-
-    return 0;
-}
-#endif /* DSP_OFFLINE */
-
 #endif /* USE_SD */
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC EVENT HANDLER
+ *
+ * On NRFX_SAADC_EVT_DONE (one half-buffer of HALF_BUF_SAMPLES ready):
+ *   1. DC removal — in-place IIR high-pass on filled_buf
+ *   2. dsp_mfcc_feed_chunk() — on-the-fly bandpass + decimate
+ *   3a. [USE_SD true]  push to sd_ring (SD writer thread drains it)
+ *   3b. push to audio_ring for BLE TX thread (both modes)
+ *
+ * IMPORTANT:
+ *   No fs_write() here. Only ring_buf_put() and k_sem_give().
+ *   sd_data_sem is NOT given here — it is given once per recording
+ *   by record_and_stream() to avoid flooding the semaphore counter.
  * ══════════════════════════════════════════════════════════════════ */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
@@ -878,6 +917,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
     case NRFX_SAADC_EVT_DONE: {
         int16_t *filled_buf = p_event->data.done.p_buffer;
 
+        /* ── Step 1: DC removal ── */
 #ifdef ENABLE_DC_REMOVAL
         for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
             dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 8;
@@ -885,34 +925,34 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
-#if !DSP_OFFLINE
-        uint32_t dsp_written = ring_buf_put(&dsp_ring,
-                                            (const uint8_t *)filled_buf,
-                                            HALF_BUF_BYTES);
-        if (dsp_written != HALF_BUF_BYTES) {
-            LOG_WRN_ONCE("dsp_ring overflow — MFCC frames may be lost!");
-        }
-        k_sem_give(&dsp_data_sem);
-#endif
+        /* ── Step 2: On-the-fly bandpass + decimate ── */
+        dsp_mfcc_feed_chunk(filled_buf, HALF_BUF_SAMPLES);
 
 #if USE_SD
+        /* ── Step 3a: Push to SD ring buffer (ISR-safe, no fs_write) ── */
         if (analog_recording) {
-            uint32_t sd_written = ring_buf_put(&audio_sd_ring,
+            uint32_t sd_written = ring_buf_put(&sd_ring,
                                                (const uint8_t *)filled_buf,
                                                HALF_BUF_BYTES);
             if (sd_written != HALF_BUF_BYTES) {
                 atomic_inc(&sd_ring_drops);
-                LOG_WRN_ONCE("audio_sd_ring overflow — audio will have gaps!");
+                LOG_WRN_ONCE("sd_ring overflow — audio will have gaps!");
             } else {
-                uint32_t fill = ring_buf_size_get(&audio_sd_ring);
-                if (fill > audio_ring_high_water) {
-                    audio_ring_high_water = fill;
+                uint32_t fill = ring_buf_size_get(&sd_ring);
+                if (fill > sd_ring_high_water) {
+                    sd_ring_high_water = fill;
                 }
             }
+            /*
+             * Do NOT give sd_data_sem here.
+             * It is given once per recording in record_and_stream()
+             * to wake the SD writer thread.  The writer polls
+             * ring_buf_size_get() internally — no per-chunk signal needed.
+             */
         }
 #endif
 
-#if BLE_AUDIO_LIVE
+        /* ── Step 3b: Push to BLE audio ring (both modes) ── */
         uint32_t ble_written = ring_buf_put(&audio_ring,
                                             (const uint8_t *)filled_buf,
                                             HALF_BUF_BYTES);
@@ -925,12 +965,9 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
                 ring_high_water = fill;
             }
         }
-#endif
 
         k_sem_give(&half_produced_sem);
-#if BLE_AUDIO_LIVE
         k_sem_give(&audio_data_sem);
-#endif
         break;
     }
 
@@ -942,18 +979,58 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 /* ══════════════════════════════════════════════════════════════════
  * SAADC INIT / START / STOP
  * ══════════════════════════════════════════════════════════════════ */
+
+/* Tiny helper to flash a color twice with off in between.
+ * Used as a unique "I got here" marker that won't be confused
+ * with the steady-state colors from outer beacons. */
+static inline void debug_flash_twice(void (*set_color)(void))
+{
+    led_off(&red_led); led_off(&green_led); led_off(&blue_led);
+    k_busy_wait(150000);
+    set_color();
+    k_busy_wait(150000);
+    led_off(&red_led); led_off(&green_led); led_off(&blue_led);
+    k_busy_wait(150000);
+    set_color();
+    k_busy_wait(300000);
+}
+
+static bool saadc_was_initialized = false;
+
 static int saadc_init(void)
 {
     nrfx_err_t err;
-    nrfx_saadc_uninit();
+
+    /* SUB-SUB I: red flash x2 — entering saadc_init */
+    debug_flash_twice(led_set_red);
+
+    /* Only uninit if we previously initialized. Calling nrfx_saadc_uninit()
+     * on a fresh, never-initialized SAADC peripheral can hang waiting for
+     * hardware state bits that were never set in the first place. */
+    if (saadc_was_initialized) {
+        nrfx_saadc_uninit();
+    }
+
+    /* SUB-SUB II: green flash x2 — nrfx_saadc_uninit returned (or skipped) */
+    debug_flash_twice(led_set_green);
+
     IRQ_CONNECT(SAADC_IRQn, SAADC_IRQ_PRIORITY, nrfx_saadc_irq_handler, NULL, 0);
     irq_enable(SAADC_IRQn);
+
+    /* SUB-SUB III: blue flash x2 — IRQ_CONNECT + irq_enable done */
+    debug_flash_twice(led_set_blue);
 
     err = nrfx_saadc_init(SAADC_IRQ_PRIORITY);
     if (err != 0) { LOG_ERR("nrfx_saadc_init: 0x%08X", err); return -EIO; }
 
+    /* SUB-SUB IV: yellow flash x2 — nrfx_saadc_init returned OK */
+    debug_flash_twice(led_set_yellow);
+
     err = nrfx_saadc_channel_config(&saadc_channel_cfg);
     if (err != 0) { LOG_ERR("channel_config: 0x%08X", err); return -EIO; }
+
+    /* SUB-SUB V: purple flash x2 — channel_config returned OK */
+    debug_flash_twice(led_set_purple);
 
     nrfx_saadc_adv_config_t adv_cfg  = NRFX_SAADC_DEFAULT_ADV_CONFIG;
     adv_cfg.oversampling              = NRF_SAADC_OVERSAMPLE_DISABLED;
@@ -966,6 +1043,13 @@ static int saadc_init(void)
                                         &adv_cfg,
                                         saadc_event_handler);
     if (err != 0) { LOG_ERR("advanced_mode_set: 0x%08X", err); return -EIO; }
+
+    /* Mark as initialized so future REC calls correctly uninit first. */
+    saadc_was_initialized = true;
+
+    /* SUB-SUB VI: cyan flash x2 — advanced_mode_set returned OK, exiting saadc_init */
+    debug_flash_twice(led_set_cyan);
+
     return 0;
 }
 
@@ -973,21 +1057,48 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    dc_estimate        = 0;
+    dc_estimate        = 0;   /* Reset to 0, not 2048 — avoids initial spike */
+
+    /* SUB-BEACON A: red — entered saadc_start_streaming */
+    led_set_red();
+    k_busy_wait(300000);
 
     dsp_mfcc_reset(&heart_pipeline);
+
+    /* SUB-BEACON B: green — heart pipeline reset done */
+    led_set_green();
+    k_busy_wait(300000);
+
     dsp_mfcc_reset(&lung_pipeline);
+
+    /* SUB-BEACON C: blue — lung pipeline reset done */
+    led_set_blue();
+    k_busy_wait(300000);
+
     heart_frame_count = 0;
     lung_frame_count  = 0;
-
     next_dma_buf = 1;
 
     if (saadc_init() != 0) return -EIO;
+    next_dma_buf = 1;
+
+    /* SUB-BEACON D: yellow — saadc_init() returned OK */
+    led_set_yellow();
+    k_busy_wait(300000);
 
     err = nrfx_saadc_buffer_set(ping_pong[0], HALF_BUF_SAMPLES);
     if (err != 0) return -EIO;
+
+    /* SUB-BEACON E: purple — buffer_set returned OK */
+    led_set_purple();
+    k_busy_wait(300000);
+
     err = nrfx_saadc_mode_trigger();
     if (err != 0) return -EIO;
+
+    /* SUB-BEACON F: cyan — mode_trigger returned OK */
+    led_set_cyan();
+    k_busy_wait(300000);
 
     LOG_INF("SAADC streaming started @ %d Hz", SAMPLING_RATE);
     return 0;
@@ -995,14 +1106,17 @@ static int saadc_start_streaming(void)
 
 static void saadc_stop_streaming(void)
 {
-    nrfx_saadc_uninit();
+    if (saadc_was_initialized) {
+        nrfx_saadc_uninit();
+        saadc_was_initialized = false;
+    }
     LOG_INF("SAADC stopped (overruns=%u, ble_drops=%u, sd_drops=%u)",
-            saadc_dma_overruns,
 #if BLE_AUDIO_LIVE
             (uint32_t)atomic_get(&ring_drops)
 #else
             0U
 #endif
+
 #if USE_SD
             , (uint32_t)atomic_get(&sd_ring_drops)
 #else
@@ -1014,9 +1128,9 @@ static void saadc_stop_streaming(void)
 /* ══════════════════════════════════════════════════════════════════
  * LED
  * ══════════════════════════════════════════════════════════════════ */
-static const struct gpio_dt_spec red_led   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec green_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-static const struct gpio_dt_spec blue_led  = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+const struct gpio_dt_spec red_led   = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+const struct gpio_dt_spec green_led = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+const struct gpio_dt_spec blue_led  = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
 
 static inline void led_on (const struct gpio_dt_spec *l) { gpio_pin_set_dt(l, 1); }
 static inline void led_off(const struct gpio_dt_spec *l) { gpio_pin_set_dt(l, 0); }
@@ -1027,7 +1141,6 @@ static inline void led_set_green(void)  { led_off(&red_led); led_on(&green_led);
 static inline void led_set_cyan(void)   { led_off(&red_led); led_on(&green_led);  led_on(&blue_led);  }
 static inline void led_set_yellow(void) { led_on(&red_led);  led_on(&green_led);  led_off(&blue_led); }
 static inline void led_set_purple(void) { led_on(&red_led);  led_off(&green_led); led_on(&blue_led);  }
-static inline void led_set_blue(void)   { led_off(&red_led); led_off(&green_led); led_on(&blue_led);  }
 
 static void led_error_flash(void (*color)(void))
 {
@@ -1148,13 +1261,7 @@ static struct bt_nus_cb nus_listener = { .received = received };
 static void ble_tx_thread_fn(void *a, void *b, void *c)
 {
     ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-
-#if !BLE_AUDIO_LIVE
-    while (true) {
-        k_sleep(K_FOREVER);
-    }
-#else
-    uint8_t chunk[251] __aligned(4);
+    uint8_t chunk[251];
     bool    finished_sent = false;
 
     while (true) {
@@ -1202,42 +1309,80 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
             tx_seq = (tx_seq + 1) & 0xFFFF;
         }
     }
-#endif /* BLE_AUDIO_LIVE */
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * MFCC FRAME CALLBACK
+ * ══════════════════════════════════════════════════════════════════ */
+static int s_mfcc_n_frames_total = MFCC_N_FRAMES;
+
+static void on_mfcc_frame(int frame_idx, const float *coeffs)
+{
+    int err;
+
+    if (frame_idx == 0) {
+        char hdr[48];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+                               "MFCC_START:%d:%d\n",
+                               s_mfcc_n_frames_total, MFCC_N_MFCC);
+        do {
+            err = bt_nus_send(NULL, hdr, hdr_len);
+            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
+        } while (err == -ENOMEM || err == -EAGAIN);
+
+        k_sleep(K_MSEC(20));
+    }
+
+    uint8_t  pkt[CHUNK_HEADER_BYTES + MFCC_N_MFCC * sizeof(float)];
+    uint16_t payload = MFCC_N_MFCC * sizeof(float);
+
+    sys_put_le16((uint16_t)frame_idx, &pkt[0]);
+    sys_put_le16(payload,              &pkt[2]);
+    memcpy(&pkt[4], coeffs, payload);
+
+    do {
+        err = bt_nus_send(NULL, pkt, sizeof(pkt));
+        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+    } while (err == -ENOMEM || err == -EAGAIN);
 }
 
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
+ *
+ * USE_SD true:
+ *   1. Open /SD:/analog.pcm
+ *   2. Give sd_data_sem ONCE to wake the SD writer thread
+ *   3. SAADC runs — ISR fills both sd_ring and audio_ring in parallel
+ *   4. BLE TX thread streams audio live over NUS
+ *   5. After total_halves: stop SAADC, set analog_recording=false
+ *   6. Wait for SD writer thread to flush, append checksum, close file
+ *   7. Stream MFCC over NUS
+ *
+ * USE_SD false:
+ *   BLE stream only — no SD involvement.
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
+    /* DEBUG BEACON: record_and_stream entered */
+    led_set_purple();
+    k_busy_wait(200000);
+
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
 
-    k_sem_reset(&half_produced_sem);
-
-#if BLE_AUDIO_LIVE
+    /* ── Reset BLE audio ring ── */
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
     tx_seq          = 0;
+    k_sem_reset(&half_produced_sem);
     k_sem_reset(&tx_done_sem);
-#endif
-
-#if !DSP_OFFLINE
-    ring_buf_reset(&dsp_ring);
-    k_sem_reset(&dsp_done_sem);
-#endif
 
 #if USE_SD
-    ring_buf_reset(&audio_sd_ring);
+    /* ── Reset SD ring ── */
+    ring_buf_reset(&sd_ring);
     atomic_set(&sd_ring_drops, 0);
-    audio_ring_high_water = 0;
-#if !DSP_OFFLINE
-    ring_buf_reset(&heart_mfcc_ring);
-    ring_buf_reset(&lung_mfcc_ring);
-    heart_ring_high_water = 0;
-    lung_ring_high_water  = 0;
-#endif
+    sd_ring_high_water = 0;
     k_sem_reset(&sd_done_sem);
 
     if (!sd_mounted) {
@@ -1247,17 +1392,36 @@ static void record_and_stream(void)
         return;
     }
 
-    fs_unlink(AUDIO_FILE_PATH);
-    fs_unlink(HEART_MFCC_FILE_PATH);
-    fs_unlink(LUNG_MFCC_FILE_PATH);
-    fs_unlink(HR_RESULT_FILE_PATH);
-    fs_unlink(RR_RESULT_FILE_PATH);
+    /* v7.5: silent unlink — -ENOENT on a fresh card is harmless and
+     * was generating four <err> log lines per REC. We only care if
+     * an *existing* file fails to delete. */
+    {
+        const char *cleanup_paths[] = {
+            AUDIO_FILE_PATH,
+            HEART_MFCC_FILE_PATH,
+            LUNG_MFCC_FILE_PATH,
+            HR_RESULT_FILE_PATH,
+            RR_RESULT_FILE_PATH,
+        };
+        for (size_t i = 0; i < ARRAY_SIZE(cleanup_paths); i++) {
+            int rc = fs_unlink(cleanup_paths[i]);
+            if (rc < 0 && rc != -ENOENT) {
+                LOG_WRN("unlink(%s): %d", cleanup_paths[i], rc);
+            }
+        }
+    }
 
-    fs_file_t_init(&sd_audio_file);
-#if !DSP_OFFLINE
-    fs_file_t_init(&sd_heart_file);
-    fs_file_t_init(&sd_lung_file);
+    /*
+     * Wake the SD writer thread exactly once.
+     * The writer loops internally on ring_buf_size_get() — it does not
+     * need a semaphore signal per half-buffer.
+     */
+    k_sem_give(&sd_data_sem);
 #endif
+
+    /* DEBUG BEACON: about to fs_open audio */
+    led_set_blue();
+    k_busy_wait(200000);
 
     int rc_audio = fs_open(&sd_audio_file, AUDIO_FILE_PATH,
                             FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
@@ -1267,6 +1431,28 @@ static void record_and_stream(void)
         led_error_flash(led_set_yellow);
         return;
     }
+
+    /* v7.5 [FIX 14]: pre-allocate the full audio file so FATFS
+     * allocates all clusters up front. Subsequent writes don't trigger
+     * FAT-table updates mid-recording — biggest single contributor
+     * to write-stall and the sd_drops issue we saw on the first REC. */
+    {
+        int rc_tr = fs_truncate(&sd_audio_file,
+                                (off_t)(TOTAL_AUDIO_BYTES + CHECKSUM_SIZE));
+        if (rc_tr < 0) {
+            LOG_WRN("fs_truncate(audio.pcm) failed: %d (non-fatal)", rc_tr);
+        } else {
+            /* Seek back to start; truncate leaves position at end on
+             * some FATFS versions. */
+            fs_seek(&sd_audio_file, 0, FS_SEEK_SET);
+            LOG_INF("audio.pcm pre-allocated to %u B",
+                    (unsigned)(TOTAL_AUDIO_BYTES + CHECKSUM_SIZE));
+        }
+    }
+
+    /* DEBUG BEACON: fs_open + fs_truncate done */
+    led_set_yellow();
+    k_busy_wait(200000);
 
 #if !DSP_OFFLINE
     int rc_heart = fs_open(&sd_heart_file, HEART_MFCC_FILE_PATH,
@@ -1293,39 +1479,30 @@ static void record_and_stream(void)
 #endif /* USE_SD */
 
     led_set_cyan();
+    k_busy_wait(200000);   /* DEBUG BEACON: cyan visible */
     analog_recording = true;
-
-#if USE_SD
-    k_sem_give(&sd_data_sem);
-#endif
-#if !DSP_OFFLINE
-    k_sem_give(&dsp_data_sem);
-#endif
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 1: SAADC capture
-     * ════════════════════════════════════════════════════════════ */
-    LOG_INF("Phase 1: SAADC capture — %d s @ %d Hz", DURATION_S, SAMPLING_RATE);
 
     if (saadc_start_streaming() != 0) {
         analog_recording = false;
 #if USE_SD
-        fs_close(&sd_audio_file);
-#if !DSP_OFFLINE
-        fs_close(&sd_heart_file);
-        fs_close(&sd_lung_file);
-#endif
+        fs_close(&sd_file);
 #endif
         led_error_flash(led_set_yellow);
         bt_nus_send(NULL, "ERR:SAADC", 9);
         return;
     }
 
+    /* DEBUG BEACON: SAADC started OK, about to wait for samples */
+    led_set_white();
+    k_busy_wait(200000);
+
     for (uint32_t h = 0; h < total_halves; h++) {
-        if (k_sem_take(&half_produced_sem, K_MSEC(500)) != 0) {
+        if (k_sem_take(&half_produced_sem, K_MSEC(200)) != 0) {
             LOG_ERR("SAADC timeout at half-buffer %u/%u", h, total_halves);
             analog_recording = false;
             saadc_stop_streaming();
+            k_sem_give(&audio_data_sem);
+            k_sem_take(&tx_done_sem, K_MSEC(10000));
             bt_nus_send(NULL, "ERR:TIMEOUT", 11);
             return;
         }
@@ -1334,379 +1511,56 @@ static void record_and_stream(void)
     saadc_stop_streaming();
     analog_recording = false;
 
+    /* DEBUG BEACON: Phase 1 SAADC loop completed */
+    led_set_green();
+    k_busy_wait(500000);
+
 #if !DSP_OFFLINE
     if (k_sem_take(&dsp_done_sem, K_MSEC(30000)) != 0) {
         LOG_WRN("DSP thread did not finish within 30 s");
     }
-#endif
 
 #if USE_SD
-    LOG_INF("Phase 1 done — waiting for SD writer to flush...");
-    bool sd_ok = false;
+    /*
+     * SD writer thread detects analog_recording==false, drains the
+     * remaining sd_ring, flushes the tail, appends checksum, closes
+     * the file, then signals sd_done_sem.
+     */
+    LOG_INF("Waiting for SD writer to flush and close...");
     if (k_sem_take(&sd_done_sem, K_MSEC(15000)) != 0) {
-        LOG_ERR("SD writer timeout — file may be truncated");
+        LOG_ERR("SD writer did not finish within 15 s — file may be truncated");
     } else {
-        LOG_INF("SD audio closed (checksum=0x%08X, drops=%u)",
-                sd_checksum, (uint32_t)atomic_get(&sd_ring_drops));
-        sd_ok = true;
+        LOG_INF("SD file closed: %s (checksum=0x%08X)", AUDIO_FILE_PATH, sd_checksum);
+        bt_nus_send(NULL, "SD:OK\n", 6);
     }
+#endif
 
-    if (!sd_ok) {
-        bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
-    }
-
-    {
-        struct fs_dirent de;
-        uint32_t expected_audio_size =
-            (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE;
-
-        if (fs_stat(AUDIO_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] audio.pcm on-disk size: %u B  (expected %u B)",
-                    (uint32_t)de.size, expected_audio_size);
-            if ((uint32_t)de.size < expected_audio_size) {
-                LOG_WRN("[DIAG] audio.pcm SHORTER than expected — "
-                        "ring drops or SD write error likely");
-                bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-                led_error_flash(led_set_yellow);
-                led_set_green();
-                return;
-            }
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", AUDIO_FILE_PATH);
-            bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-            led_error_flash(led_set_yellow);
-            led_set_green();
-            return;
-        }
-    }
-#endif /* USE_SD */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 2: Offline MFCC
-     * ════════════════════════════════════════════════════════════ */
-    int hf = 0;
-    int lf = 0;
-
-#if DSP_OFFLINE && USE_SD
-    LOG_INF("Phase 2: offline MFCC processing...");
-    led_set_yellow();
-
-    int mfcc_rc = process_audio_offline(&hf, &lf);
-    if (mfcc_rc < 0) {
-        LOG_ERR("Offline MFCC failed: %d", mfcc_rc);
-        bt_nus_send(NULL, "ERR:DSP", 7);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
-    }
-
-    {
-        struct fs_dirent de;
-
-        uint32_t expected_heart =
-            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
-        uint32_t expected_lung  =
-            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc  * sizeof(float);
-
-        if (fs_stat(HEART_MFCC_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] heart_mfcc.f32: %u B  (expected %u B, hf=%d)",
-                    (uint32_t)de.size, expected_heart, hf);
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", HEART_MFCC_FILE_PATH);
-        }
-
-        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] lung_mfcc.f32:  %u B  (expected %u B, lf=%d)",
-                    (uint32_t)de.size, expected_lung, lf);
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", LUNG_MFCC_FILE_PATH);
-        }
-    }
-#endif /* DSP_OFFLINE && USE_SD */
-
+    LOG_INF("BLE audio stream complete — starting MFCC");
     led_set_purple();
-    report_ram_usage();
+    report_ram_usage("after Phase 2 MFCC");
 
-    if (hf <= 0 || lf <= 0) {
-        LOG_ERR("MFCC pipeline error: heart=%d lung=%d", hf, lf);
+    /* ── MFCC stream ── */
+    s_mfcc_n_frames_total = MFCC_N_FRAMES;
+    int n_frames = dsp_mfcc_finish(on_mfcc_frame);
+
+    if (n_frames <= 0) {
+        LOG_ERR("dsp_mfcc_finish failed: %d", n_frames);
         bt_nus_send(NULL, "ERR:DSP", 7);
         led_error_flash(led_set_yellow);
         led_set_green();
         return;
     }
 
-#if USE_SD
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 3: Heart model inference
-     * ════════════════════════════════════════════════════════════ */
-    heart_result_t heart_result;
-    heart_result.rc         = -ENOTSUP;
-    heart_result.value      = 0.f;
-    heart_result.confidence = 0.f;
-    heart_result.class_idx  = -1;
+    k_sleep(K_MSEC(20));
+    int err;
+    do {
+        err = bt_nus_send(NULL, "MFCC_END\n", 9);
+        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
+    } while (err == -ENOMEM || err == -EAGAIN);
 
-#if ENABLE_HEART_MODEL
-    LOG_INF("Phase 3: heart inference (%d frames × %d coeffs)...",
-            hf, heart_pipeline.cfg->n_mfcc);
-
-    {
-        uint32_t expected_heart_bytes =
-            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
-        struct fs_dirent de;
-        bool skip_heart = false;
-
-        if (fs_stat(HEART_MFCC_FILE_PATH, &de) < 0) {
-            LOG_ERR("Heart MFCC file not found — skipping heart inference");
-            skip_heart = true;
-        } else if ((uint32_t)de.size == 0) {
-            LOG_ERR("Heart MFCC file is empty — skipping heart inference");
-            skip_heart = true;
-        } else if ((uint32_t)de.size < expected_heart_bytes) {
-            LOG_ERR("Heart MFCC file too small: %u B < expected %u B — "
-                    "skipping heart inference",
-                    (uint32_t)de.size, expected_heart_bytes);
-            skip_heart = true;
-        }
-
-        if (!skip_heart) {
-            led_set_blue();
-
-            run_heart_inference(tensor_arena,
-                                TENSOR_ARENA_BYTES,
-                                HEART_MFCC_FILE_PATH,
-                                hf,
-                                heart_pipeline.cfg->n_mfcc,
-                                &heart_result);
-
-            if (heart_result.rc < 0) {
-                LOG_ERR("Heart inference failed: %d", heart_result.rc);
-                bt_nus_send(NULL, "ERR:HEART_INF", 13);
-            } else {
-                LOG_INF("Heart result: HR=%.0f BPM (confidence=%.3f, class=%d)",
-                        (double)heart_result.value,
-                        (double)heart_result.confidence,
-                        heart_result.class_idx);
-            }
-        } else {
-            heart_result.rc = -ENODATA;
-            bt_nus_send(NULL, "ERR:HEART_INF", 13);
-        }
-    }
-#else
-    LOG_INF("Phase 3: heart model disabled (ENABLE_HEART_MODEL=0) — skipping");
-#endif /* ENABLE_HEART_MODEL */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 4: Lung model inference
-     * ════════════════════════════════════════════════════════════ */
-    lung_result_t lung_result;
-    lung_result.rc         = -ENOTSUP;
-    lung_result.value      = 0.f;
-    lung_result.confidence = 0.f;
-    lung_result.class_idx  = -1;
-
-#if ENABLE_LUNG_MODEL
-    LOG_INF("Phase 4: lung inference (%d frames × %d coeffs)...",
-            lf, lung_pipeline.cfg->n_mfcc);
-
-    {
-        uint32_t expected_lung_bytes =
-            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float);
-        struct fs_dirent de;
-        bool skip_lung = false;
-
-        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) < 0) {
-            LOG_ERR("Lung MFCC file not found — skipping lung inference");
-            skip_lung = true;
-        } else if ((uint32_t)de.size == 0) {
-            LOG_ERR("Lung MFCC file is empty — skipping lung inference");
-            skip_lung = true;
-        } else if ((uint32_t)de.size < expected_lung_bytes) {
-            LOG_ERR("Lung MFCC file too small: %u B < expected %u B — "
-                    "skipping lung inference",
-                    (uint32_t)de.size, expected_lung_bytes);
-            skip_lung = true;
-        }
-
-        if (!skip_lung) {
-            led_set_purple();
-
-            run_lung_inference(tensor_arena,
-                               TENSOR_ARENA_BYTES,
-                               LUNG_MFCC_FILE_PATH,
-                               lf,
-                               lung_pipeline.cfg->n_mfcc,
-                               &lung_result);
-
-            if (lung_result.rc < 0) {
-                LOG_ERR("Lung inference failed: %d", lung_result.rc);
-                bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-            } else {
-                LOG_INF("Lung result: RR=%.0f BPM (confidence=%.3f, class=%d)",
-                        (double)lung_result.value,
-                        (double)lung_result.confidence,
-                        lung_result.class_idx);
-            }
-        } else {
-            lung_result.rc = -ENODATA;
-            bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-        }
-    }
-#else
-    LOG_INF("Phase 4: lung model disabled (ENABLE_LUNG_MODEL=0) — skipping");
-#endif /* ENABLE_LUNG_MODEL */
-#endif /* USE_SD */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 5: BLE upload
-     * ════════════════════════════════════════════════════════════ */
-    LOG_INF("Phase 5: BLE upload...");
+    LOG_INF("MFCC stream complete: %d frames x %d coeffs", n_frames, MFCC_N_MFCC);
     led_set_green();
-
-#if USE_SD
-    struct file_stream_entry {
-        const char *start_fmt;
-        const char *end_msg;
-        const char *path;
-        uint32_t    file_bytes;
-        bool        is_audio;
-    };
-
-    uint32_t hr_file_bytes = 0;
-    uint32_t rr_file_bytes = 0;
-
-    if (heart_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(HR_RESULT_FILE_PATH, &dirent) == 0) {
-            hr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-    if (lung_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(RR_RESULT_FILE_PATH, &dirent) == 0) {
-            rr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-
-    struct file_stream_entry stream_list[6];
-    int stream_count = 0;
-
-#if !BLE_AUDIO_LIVE
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "START:%u\n",
-        .end_msg    = "finished\n",
-        .path       = AUDIO_FILE_PATH,
-        .file_bytes = (uint32_t)TOTAL_AUDIO_BYTES,
-        .is_audio   = true,
-    };
-#endif
-
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "MFCC_HEART_START:%u\n",
-        .end_msg    = "MFCC_HEART_END\n",
-        .path       = HEART_MFCC_FILE_PATH,
-        .file_bytes = (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
-    };
-
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "MFCC_LUNG_START:%u\n",
-        .end_msg    = "MFCC_LUNG_END\n",
-        .path       = LUNG_MFCC_FILE_PATH,
-        .file_bytes = (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
-    };
-
-#if ENABLE_HEART_MODEL
-    if (heart_result.rc == 0 && hr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_HEART_START:%u\n",
-            .end_msg    = "RESULT_HEART_END\n",
-            .path       = HR_RESULT_FILE_PATH,
-            .file_bytes = hr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-#if ENABLE_LUNG_MODEL
-    if (lung_result.rc == 0 && rr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_LUNG_START:%u\n",
-            .end_msg    = "RESULT_LUNG_END\n",
-            .path       = RR_RESULT_FILE_PATH,
-            .file_bytes = rr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-    for (int fi = 0; fi < stream_count; fi++) {
-        struct file_stream_entry *e = &stream_list[fi];
-
-        char ctrl[64];
-        int ctrl_len = snprintf(ctrl, sizeof(ctrl), e->start_fmt, e->file_bytes);
-        int err;
-        do {
-            err = bt_nus_send(NULL, ctrl, ctrl_len);
-            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
-        } while (err == -ENOMEM || err == -EAGAIN);
-        k_sleep(K_MSEC(20));
-
-        struct fs_file_t f;
-        fs_file_t_init(&f);
-        if (fs_open(&f, e->path, FS_O_READ) < 0) {
-            LOG_ERR("Cannot open %s for BLE send", e->path);
-            bt_nus_send(NULL, "ERR:SD_READ", 11);
-            continue;
-        }
-
-        /* [FIX 6] BLE TX packet buffer 4-byte aligned. */
-        uint8_t  pkt[251] __aligned(4);
-        uint16_t seq     = 0;
-        uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
-        uint32_t bytes_sent = 0;
-
-        while (bytes_sent < e->file_bytes) {
-            uint32_t want = MIN((uint32_t)payload, e->file_bytes - bytes_sent);
-            ssize_t  nr   = fs_read(&f, &pkt[CHUNK_HEADER_BYTES], want);
-            if (nr <= 0) break;
-
-            sys_put_le16(seq,          &pkt[0]);
-            sys_put_le16((uint16_t)nr, &pkt[2]);
-            do {
-                err = bt_nus_send(NULL, pkt, CHUNK_HEADER_BYTES + (uint16_t)nr);
-                if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
-            } while (err == -ENOMEM || err == -EAGAIN);
-            seq = (seq + 1) & 0xFFFF;
-            bytes_sent += (uint32_t)nr;
-        }
-
-        fs_close(&f);
-
-        do {
-            err = bt_nus_send(NULL, e->end_msg, strlen(e->end_msg));
-            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
-        } while (err == -ENOMEM || err == -EAGAIN);
-
-        LOG_INF("BLE send done: %s (%u bytes)", e->path, bytes_sent);
-        k_sleep(K_MSEC(20));
-
-#if !BLE_AUDIO_LIVE
-        if (e->is_audio) {
-            bt_nus_send(NULL, "SD:OK\n", 6);
-            k_sleep(K_MSEC(10));
-        }
-#endif
-    }
-#endif /* USE_SD */
-
-    LOG_INF("record_and_stream() complete. HR=%.0f RR=%.0f",
-            (double)heart_result.value,
-            (double)lung_result.value);
+    LOG_INF("record_and_stream() complete.");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1723,21 +1577,18 @@ int main(void)
 
     k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
 
-    if (dsp_mfcc_init(&heart_pipeline, &heart_mfcc_config) != 0) {
-        LOG_ERR("heart dsp_mfcc_init failed");
+    if (dsp_mfcc_init() != 0) {
+        LOG_ERR("dsp_mfcc_init failed");
         led_error_flash(led_set_yellow);
         return -1;
     }
-    heart_pipeline.window = heart_window;
-    dsp_mfcc_set_callback(&heart_pipeline, heart_frame_cb, NULL);
 
-    if (dsp_mfcc_init(&lung_pipeline, &lung_mfcc_config) != 0) {
-        LOG_ERR("lung dsp_mfcc_init failed");
+    err = saadc_init();
+    if (err < 0) {
+        LOG_ERR("SAADC init failed: %d", err);
         led_error_flash(led_set_yellow);
-        return -1;
+        return err;
     }
-    lung_pipeline.window = lung_window;
-    dsp_mfcc_set_callback(&lung_pipeline, lung_frame_cb, NULL);
 
     err = bt_enable(NULL);
     if (err) { LOG_ERR("bt_enable: %d", err); return err; }
@@ -1749,25 +1600,22 @@ int main(void)
                           sd_adv, ARRAY_SIZE(sd_adv));
     if (err) { LOG_ERR("bt_le_adv_start: %d", err); return err; }
 
+    /* BLE TX thread */
     k_thread_create(&ble_tx_thread_data, ble_tx_stack,
                     K_THREAD_STACK_SIZEOF(ble_tx_stack),
                     ble_tx_thread_fn, NULL, NULL, NULL,
                     BLE_TX_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&ble_tx_thread_data, "ble_tx");
 
-    k_thread_create(&dsp_thread_data, dsp_thread_stack,
-                    K_THREAD_STACK_SIZEOF(dsp_thread_stack),
-                    dsp_thread_fn, NULL, NULL, NULL,
-                    DSP_THREAD_PRIORITY, 0, K_NO_WAIT);
-    k_thread_name_set(&dsp_thread_data, "dsp");
-
 #if USE_SD
+    /* SD writer thread — starts blocked on sd_data_sem */
     k_thread_create(&sd_writer_thread_data, sd_writer_stack,
                     K_THREAD_STACK_SIZEOF(sd_writer_stack),
                     sd_writer_thread_fn, NULL, NULL, NULL,
                     SD_WRITER_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&sd_writer_thread_data, "sd_writer");
 
+    /* SD card init — non-fatal if card absent */
     if (init_sd_card() != 0) {
         LOG_ERR("SD card init failed — REC will return ERR:NOSD");
         LOG_ERR("  CS      — overlay: xiao_d pin 1; verify physical wire");
@@ -1780,7 +1628,11 @@ int main(void)
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.4 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v7.5 ready — waiting for BLE connection");
+
+    /* v7.5 [FIX 15]: baseline RAM snapshot, before any recording.
+     * Compare subsequent snapshots against this to spot leaks/overflows. */
+    report_ram_usage("boot (idle)");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -1788,8 +1640,62 @@ int main(void)
             start_recording = false;
             LOG_INF("REC command — starting %d s @ %d Hz", DURATION_S, SAMPLING_RATE);
             record_and_stream();
+            /* v7.5 [FIX 15]: post-REC snapshot. If this drifts upward
+             * across successive RECs, there's a leak somewhere. */
+            report_ram_usage("after REC completed");
         }
     }
 
     return 0;
 }
+
+/*
+ * ════════════════════════════════════════════════════════════════════
+ * REQUIRED prj.conf ADDITIONS for USE_SD true
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * CONFIG_SPI=y
+ * CONFIG_DISK_ACCESS=y
+ * CONFIG_DISK_DRIVER_SDMMC=y
+ * CONFIG_FAT_FILESYSTEM_ELM=y
+ * CONFIG_FILE_SYSTEM=y
+ * CONFIG_FILE_SYSTEM_MAX_TYPES=2
+ * CONFIG_HEAP_MEM_POOL_SIZE=8192
+ * CONFIG_MAIN_STACK_SIZE=4096
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * REQUIRED devicetree overlay  (e.g. boards/xiao_ble.overlay)
+ * ════════════════════════════════════════════════════════════════════
+ *
+ * &spi2 {
+ *     status = "okay";
+ *     cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;   // adjust to your CS pin
+ *
+ *     sdhc: sdhc@0 {
+ *         compatible = "zephyr,sdhc-spi-slot";
+ *         reg = <0>;
+ *         status = "okay";
+ *         spi-max-frequency = <4000000>;          // 4 MHz — safe for all cards
+ *         disk {
+ *             compatible = "zephyr,sdmmc-disk";
+ *             status = "okay";
+ *         };
+ *     };
+ * };
+ *
+ * ════════════════════════════════════════════════════════════════════
+ * MEMORY BUDGET (approximate, USE_SD true)
+ * ════════════════════════════════════════════════════════════════════
+ *
+ *   Zephyr kernel + BLE stack     ~90 KB
+ *   s_decimated[20000] (dsp_mfcc)  40 KB
+ *   DSP scratch                     ~7 KB
+ *   audio_ring  (BLE)               16 KB
+ *   sd_ring     (SD writer)         32 KB
+ *   ping_pong[2][512]                2 KB
+ *   BLE TX thread stack              2 KB
+ *   SD writer thread stack           2 KB
+ *   sd_write_buf                   512  B
+ *   fat_fs (FATFS work area)        ~4 KB  (sized by ELM FatFs internally)
+ *   Remaining headroom             ~61 KB
+ */

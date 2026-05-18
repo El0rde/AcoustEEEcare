@@ -49,7 +49,7 @@ from scipy.fft import fft, fftfreq
 # ▼▼▼  EDIT THESE SETTINGS  ▼▼▼
 # ══════════════════════════════════════════════════════════════
 
-RECORDINGS_DIR = r"d:/zephyrdev/AcoustEEEcare/recordings"
+RECORDINGS_DIR = r"C:\Users\JM\zephyrproject\AcoustEEEcare\recordings_DSP2"
 
 # Set to a filename string to pin a specific file, e.g.:
 # WAV_FILE = "recording_001_20260501_104853.wav"

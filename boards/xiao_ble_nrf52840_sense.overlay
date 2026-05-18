@@ -23,28 +23,13 @@
 
 &xiao_spi {
     status = "okay";
-
-    /* v5.4: VERIFY this matches the SD module's CS pin on the
-     * breadboard. main.c FIX 9 documented pin 1; the original
-     * overlay had pin 2. The right value is whichever matches the
-     * actual wiring. */
-    cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
+    cs-gpios = <&xiao_d 2 GPIO_ACTIVE_LOW>;
 
     sdhc0: sdhc@0 {
         compatible = "zephyr,sdhc-spi-slot";
         reg = <0>;
         status = "okay";
-<<<<<<< Updated upstream
         spi-max-frequency = <10000000>;
-=======
-
-        /* v5.4: 4 MHz -> 8 MHz.
-         * nRF52840 SPI can do 8 MHz reliably with most SD modules.
-         * If you see init failures or data corruption, drop back to
-         * 4000000. */
-        spi-max-frequency = <8000000>;
-
->>>>>>> Stashed changes
         mmc {
             compatible = "zephyr,sdmmc-disk";
             disk-name = "SD";

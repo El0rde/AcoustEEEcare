@@ -9,22 +9,25 @@ zephyr_include_directories(
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx/drivers/include
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx/mdk
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
  
-target_sources(app PRIVATE
-    src/main.c
-    src/dsp_mfcc.c
-)
- 
-# Global model-enable toggles. These are seen by ALL translation units
-# (main.c, tflm_inference.cc, etc.) so we don't end up with the model
-# enabled in main.c but disabled inside tflm_inference.cc.
-# Set to 1 to enable, 0 to disable.
+   target_sources(app PRIVATE
+       src/main.c
+       src/dsp_mfcc.c
+       src/generated/heart_mfcc_tables.c
+       src/generated/lung_mfcc_tables.c
+       src/tflm_inference.cc    
+   )
+
+# Global model-enable toggles. Seen by ALL translation units
+# (main.c, tflm_inference.cc) so the model isn't enabled in main.c
+# but disabled inside tflm_inference.cc.
 target_compile_definitions(app PRIVATE
     ENABLE_HEART_MODEL=1
     ENABLE_LUNG_MODEL=1
 )
-
+ 
 # CMSIS-DSP is bundled with Zephyr's SDK — we just need to declare
 # the dependency so Kconfig enables arm_math.h and the right sources.
 # This is handled via prj.conf: CONFIG_CMSIS_DSP=y

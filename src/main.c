@@ -807,12 +807,12 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
         }
 
         LOG_INF("SD writer: starting write loop");
-        k_sleep(K_MSEC(100)); /* v7.8 FIX 3: after fs_open+fs_seek(0) on the
-                                * pre-allocated file, FATFS writes FAT metadata
-                                * (timestamps, dir entry). The card may still be
-                                * busy from that update when the first fs_write
-                                * hits. 100 ms guarantees the card has finished
-                                * before we touch it. */
+        // k_sleep(K_MSEC(100)); /* v7.8 FIX 3: after fs_open+fs_seek(0) on the
+        //                         * pre-allocated file, FATFS writes FAT metadata
+        //                         * (timestamps, dir entry). The card may still be
+        //                         * busy from that update when the first fs_write
+        //                         * hits. 100 ms guarantees the card has finished
+        //                         * before we touch it. */
         uint32_t audio_written = 0;
 #if !DSP_OFFLINE
         uint32_t heart_written = 0;
@@ -852,19 +852,17 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                      * At 8 kHz int16 audio (16 KB/s) and 512-byte writes
                      * (one write every 32 ms), 2 ms is 6% overhead — far
                      * less than the retry latency we were eating. */
-                    k_sleep(K_MSEC(50)); /* v7.8 FIX 2: was 2 ms — not enough for
-                                          * this card's internal program cycle.
-                                          * Zephyr #52931 reporter needed ~10-20 ms
-                                          * (a printk); 50 ms is safe given the
-                                          * 32 KB ring (~2 s headroom at 16 KB/s). */
+
                     /* v7.6 FIX F: retry transient -EIO before bailing. */
                     ssize_t wr = -1;
-                    for (int retry = 0; retry < 3; retry++) {
+                    for (int retry = 0; retry < 5; retry++) {
                         wr = fs_write(&sd_audio_file, sd_write_buf, n);
                         if (wr >= 0) break;
-                        LOG_WRN("SD audio fs_write transient err: %d "
-                                "(retry %d/3)", (int)wr, retry + 1);
-                        k_sleep(K_MSEC(50)); /* v7.8 FIX 2b: was 10 ms */
+                        LOG_WRN("SD audio fs_write err: %d (retry %d/5)", (int)wr, retry + 1);
+                        /* Reactive backoff only on actual failure. Start short,
+                        * grow: 5, 10, 20, 40, 80 ms. Total worst-case = 155 ms,
+                        * well within the 32 KB ring (~2 s headroom). */
+                        k_sleep(K_MSEC(5 << retry));
                     }
                     if (wr < 0) {
                         LOG_ERR("SD audio fs_write failed after retries: %d "

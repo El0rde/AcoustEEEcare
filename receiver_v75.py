@@ -397,101 +397,109 @@ async def run():
 
     print(f"  Found: {DEVICE_NAME} [{device.address}]")
 
-    async with BleakClient(device) as client:
+    client = BleakClient(device)
+    try:
+        await client.connect()
         mtu = getattr(client, "mtu_size", "?")
         print(f"Connected!  MTU = {mtu}")
         await client.start_notify(NUS_TX_CHAR_UUID, handle_notification)
         print("Subscribed to NUS notifications.\nPress Ctrl+C to stop.\n")
 
         rec_num = 1
-        try:
-            while True:
-                inp = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: input(
-                        f"{'─'*50}\n"
-                        f"[Ready] ENTER = start recording #{rec_num}  "
-                        f"(q+ENTER = quit): "
-                    )
+        while True:
+            inp = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: input(
+                    f"{'─'*50}\n"
+                    f"[Ready] ENTER = start recording #{rec_num}  "
+                    f"(q+ENTER = quit): "
                 )
-                if inp.strip().lower() == "q":
+            )
+            if inp.strip().lower() == "q":
+                break
+
+            state.reset()
+            print(f"\nRecording #{rec_num} — sending REC …")
+            await client.write_gatt_char(NUS_RX_CHAR_UUID, b"REC", response=False)
+            print(f"  Sequence: audio → SD flush → heart MFCC → lung MFCC "
+                  f"→ inference → results")
+            print(f"  Timeout:  {REC_TIMEOUT:.0f} s total "
+                  f"(result grace: {RESULT_GRACE_S:.0f} s)")
+
+            deadline = time.monotonic() + REC_TIMEOUT
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                if _all_done():
+                    print(f"\n  [DONE  ] All streams complete.")
                     break
+            else:
+                print(f"\n  [WARN  ] Timeout — saving whatever was received.")
 
-                state.reset()
-                print(f"\nRecording #{rec_num} — sending REC …")
-                await client.write_gatt_char(NUS_RX_CHAR_UUID, b"REC", response=False)
-                print(f"  Sequence: audio → SD flush → heart MFCC → lung MFCC "
-                      f"→ inference → results")
-                print(f"  Timeout:  {REC_TIMEOUT:.0f} s total "
-                      f"(result grace: {RESULT_GRACE_S:.0f} s)")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                deadline = time.monotonic() + REC_TIMEOUT
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(0.05)
-                    if _all_done():
-                        print(f"\n  [DONE  ] All streams complete.")
-                        break
-                else:
-                    print(f"\n  [WARN  ] Timeout — saving whatever was received.")
+            # ── Save audio ──
+            if state.audio_samples:
+                wav_fn = OUTPUT_DIR / f"rec_{rec_num:03d}_{ts}.wav"
+                print(f"\n  Audio: chunks={state.audio_chunks} "
+                      f"bytes={len(state.audio_samples)}/{state.expected_bytes} "
+                      f"gaps={state.audio_gaps}")
+                save_wav(bytearray(state.audio_samples), wav_fn)
+            else:
+                print("  [WARN  ] No audio received — WAV not saved.")
 
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # ── Save heart MFCC ──
+            if state.heart_bytes:
+                heart_fn = OUTPUT_DIR / f"heart_mfcc_{rec_num:03d}_{ts}.npy"
+                print(f"  Heart:  chunks={state.heart_chunks} "
+                      f"bytes={len(state.heart_bytes)}/{state.heart_expected_b} "
+                      f"gaps={state.heart_gaps}")
+                save_mfcc_npy(bytearray(state.heart_bytes), heart_fn,
+                              HEART_N_FRAMES, HEART_N_MFCC, "heart")
+            else:
+                print("  [WARN  ] No heart MFCC data received.")
 
-                # ── Save audio ──
-                if state.audio_samples:
-                    wav_fn = OUTPUT_DIR / f"rec_{rec_num:03d}_{ts}.wav"
-                    print(f"\n  Audio: chunks={state.audio_chunks} "
-                          f"bytes={len(state.audio_samples)}/{state.expected_bytes} "
-                          f"gaps={state.audio_gaps}")
-                    save_wav(bytearray(state.audio_samples), wav_fn)
-                else:
-                    print("  [WARN  ] No audio received — WAV not saved.")
+            # ── Save lung MFCC ──
+            if state.lung_bytes:
+                lung_fn = OUTPUT_DIR / f"lung_mfcc_{rec_num:03d}_{ts}.npy"
+                print(f"  Lung:   chunks={state.lung_chunks} "
+                      f"bytes={len(state.lung_bytes)}/{state.lung_expected_b} "
+                      f"gaps={state.lung_gaps}")
+                save_mfcc_npy(bytearray(state.lung_bytes), lung_fn,
+                              LUNG_N_FRAMES, LUNG_N_MFCC, "lung")
+            else:
+                print("  [WARN  ] No lung MFCC data received.")
 
-                # ── Save heart MFCC ──
-                if state.heart_bytes:
-                    heart_fn = OUTPUT_DIR / f"heart_mfcc_{rec_num:03d}_{ts}.npy"
-                    print(f"  Heart:  chunks={state.heart_chunks} "
-                          f"bytes={len(state.heart_bytes)}/{state.heart_expected_b} "
-                          f"gaps={state.heart_gaps}")
-                    save_mfcc_npy(bytearray(state.heart_bytes), heart_fn,
-                                  HEART_N_FRAMES, HEART_N_MFCC, "heart")
-                else:
-                    print("  [WARN  ] No heart MFCC data received.")
+            # ── Save heart result ──
+            if state.hr_bytes:
+                hr_fn = OUTPUT_DIR / f"hr_{rec_num:03d}_{ts}.txt"
+                save_result_txt(bytearray(state.hr_bytes), hr_fn, "HR")
+            else:
+                print("  [INFO  ] No heart result received "
+                      "(model disabled or inference failed).")
 
-                # ── Save lung MFCC ──
-                if state.lung_bytes:
-                    lung_fn = OUTPUT_DIR / f"lung_mfcc_{rec_num:03d}_{ts}.npy"
-                    print(f"  Lung:   chunks={state.lung_chunks} "
-                          f"bytes={len(state.lung_bytes)}/{state.lung_expected_b} "
-                          f"gaps={state.lung_gaps}")
-                    save_mfcc_npy(bytearray(state.lung_bytes), lung_fn,
-                                  LUNG_N_FRAMES, LUNG_N_MFCC, "lung")
-                else:
-                    print("  [WARN  ] No lung MFCC data received.")
+            # ── Save lung result ──
+            if state.rr_bytes:
+                rr_fn = OUTPUT_DIR / f"rr_{rec_num:03d}_{ts}.txt"
+                save_result_txt(bytearray(state.rr_bytes), rr_fn, "RR")
+            else:
+                print("  [INFO  ] No lung result received "
+                      "(model disabled or inference failed).")
 
-                # ── Save heart result ──
-                if state.hr_bytes:
-                    hr_fn = OUTPUT_DIR / f"hr_{rec_num:03d}_{ts}.txt"
-                    save_result_txt(bytearray(state.hr_bytes), hr_fn, "HR")
-                else:
-                    print("  [INFO  ] No heart result received "
-                          "(model disabled or inference failed).")
+            rec_num += 1
 
-                # ── Save lung result ──
-                if state.rr_bytes:
-                    rr_fn = OUTPUT_DIR / f"rr_{rec_num:03d}_{ts}.txt"
-                    save_result_txt(bytearray(state.rr_bytes), rr_fn, "RR")
-                else:
-                    print("  [INFO  ] No lung result received "
-                          "(model disabled or inference failed).")
-
-                rec_num += 1
-
-        except KeyboardInterrupt:
-            print("\nInterrupted.")
-        finally:
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+    finally:
+        print("Disconnecting …")
+        try:
             await client.stop_notify(NUS_TX_CHAR_UUID)
-            print("Disconnected.")
-
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        print("Disconnected.")
 
 if __name__ == "__main__":
     asyncio.run(run())

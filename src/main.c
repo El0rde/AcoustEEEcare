@@ -1238,7 +1238,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
     bt_conn_le_phy_update(conn, &phy);
 
     static const struct bt_le_conn_param fast_conn = {
-        .interval_min = 6, .interval_max = 12, .latency = 0, .timeout = 400,
+        .interval_min = 6, .interval_max = 12, .latency = 0, .timeout = 200,
     };
     bt_conn_le_param_update(conn, &fast_conn);
     bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -1249,7 +1249,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
     if (analog_recording) saadc_stop_streaming();
     analog_recording = false;
-    is_connected     = false;
+    is_connected     = false; 
     start_recording  = false;
     mtu_exchanged    = false;
     nus_chunk_size   = 244;
@@ -1954,6 +1954,7 @@ int main(void)
                     SD_WRITER_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&sd_writer_thread_data, "sd_writer");
 
+    k_msleep(500);
     if (init_sd_card() != 0) {
         LOG_ERR("SD card init failed — REC will return ERR:NOSD");
         LOG_ERR("  CS      — overlay: xiao_d pin 1; verify physical wire");

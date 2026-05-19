@@ -415,6 +415,14 @@ static struct fs_file_t *offline_lung_fp  = NULL;
 
 static void heart_frame_cb(int idx, const float *coeffs, void *user)
 {
+    if (idx < 3) {
+        LOG_INF("heart MFCC[%d]: c0=%.3f c1=%.3f c2=%.3f",
+                idx,
+                (double)coeffs[0],
+                (double)coeffs[1],
+                (double)coeffs[2]);
+    }
+    
     (void)user; (void)idx;
     heart_frame_count++;
 
@@ -1234,6 +1242,9 @@ static int saadc_init(void)
 
     return 0;
 }
+
+#define WARMUP_SAMPLES 256
+static uint32_t warmup_remaining;
 
 static int saadc_start_streaming(void)
 {

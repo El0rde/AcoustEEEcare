@@ -1,45 +1,47 @@
 /*
  * AcoustEEEcare — SAADC BLE + SD Card + TFLite Micro Edition
  * ============================================================
- * v7.5 — BSS-corruption fixes + RAM usage instrumentation
+ * v7.9 — Abandon pre-alloc overwrite; use FS_O_TRUNC on every REC
  *
- * CHANGES FROM v7.4:
+ * CHANGES FROM v7.8:
  *
- *   [FIX 10] heart_window sized 50 -> 60 to match heart frame_samples=60.
- *            Previously memset(p->window, 0, 60*2)=120 bytes overflowed
- *            a 100-byte buffer on every dsp_mfcc_reset(), silently
- *            corrupting whatever sat next in BSS.
+ *   [Option A] fs_open for audio.pcm now uses FS_O_CREATE|FS_O_WRITE|FS_O_TRUNC
+ *              on every recording, replacing the v7.7 pre-allocate-then-overwrite
+ *              strategy. Opening without TRUNC + fs_seek(0) left FATFS writing
+ *              directory metadata, keeping the card busy when the first real
+ *              fs_write arrived — causing -EIO on every write regardless of delay.
+ *              TRUNC gives FATFS a clean state. The ~50 ms first-write erase is
+ *              absorbed by the 32 KB ring (~2 s headroom at 16 KB/s).
  *
- *   [FIX 11] lung_window sized 100 -> 1200 to match lung frame_samples=1200.
- *            The previous 200-byte buffer was being memset'd with
- *            2400 bytes on every reset — a 2200-byte BSS overflow.
- *            THIS WAS THE PRIMARY CAUSE OF THE SECOND-REC HANG.
+ * CHANGES FROM v7.7 (preserved from v7.8):
  *
- *   [FIX 12] SD_WRITE_BUF_SIZE bumped 512 -> 4096 (one FAT cluster on
- *            most SD cards). Cuts per-write FATFS overhead ~8x, which
- *            is what was causing the sd_drops=36 (~36 KB of dropped
- *            audio on the first REC).
+ *   [FIX 1] SAADC_IRQ_PRIORITY: 6 -> 5.
+ *           Priority 7 (tried first) exceeded IRQ_PRIO_LOWEST on
+ *           nRF52840 and failed to compile. Raised to 5 instead —
+ *           higher priority means the SAADC ISR completes faster and
+ *           yields the CPU sooner, reducing the window where it can
+ *           interfere with SPI bus timing during SD card writes.
  *
- *   [FIX 13] AUDIO_SD_RING_BYTES bumped 16 KB -> 32 KB. Was exactly 1 s
- *            of audio at 8 kHz/int16. Any fs_write stall >1 s caused
- *            ring overflow. 32 KB gives ~2 s of headroom.
+ *   [FIX 2] Pre-write k_sleep: 2 ms -> 50 ms.
+ *           Retry backoff k_sleep: 10 ms -> 50 ms.
+ *           The Zephyr #52931 reporter found a printk (~10-20 ms) was
+ *           sufficient to let the card finish its internal program
+ *           cycle. 2 ms was clearly not enough for this card. 50 ms
+ *           is safe: at 16 KB/s audio (one 512-byte write per 32 ms),
+ *           the 32 KB ring holds ~2 s of headroom. Total worst-case
+ *           write latency (50 ms sleep + 3 x 50 ms retry) = 200 ms,
+ *           well within the ring's capacity.
  *
- *   [FIX 14] audio.pcm file is pre-truncated to expected size right
- *            after fs_open. FATFS allocates clusters up front so
- *            subsequent writes skip FAT updates entirely.
+ *   [FIX 3] 100 ms settle delay at the start of the SD writer loop.
+ *           (Kept for safety; rationale partially superseded by v7.9
+ *           Option A which removes the fs_seek that triggered the
+ *           metadata write in the first place.)
  *
- *   [FIX 15] report_ram_usage() now also dumps:
- *            - tensor_arena last "used" bytes (set by tflm_inference)
- *            - heap stats via sys_heap_runtime_stats_get()
- *            - per-thread stack high-water using k_thread_foreach()
- *            Called BEFORE recording starts AND after each phase.
- *
- *   [FIX 16] _bss_end symbol name resolved with weak fallback for
- *            both Zephyr linker script flavours (__bss_end vs _end).
- *
- * ALL PREVIOUS FIXES (v7.4 / v7.3 / v7.2 / v7.1 / v6.8) ARE PRESERVED.
+ * ALL PREVIOUS FIXES (v7.7 / v7.6 / v7.5 / v7.4 / v7.3 / v7.2 /
+ * v7.1 / v6.8) ARE PRESERVED.
  * ============================================================
  */
+
 
 #define USE_SD  true
 
@@ -271,7 +273,12 @@ static void report_ram_usage(const char *label)
  * SAADC CONFIG
  * ══════════════════════════════════════════════════════════════════ */
 #define SAADC_CC_VALUE      2000U
-#define SAADC_IRQ_PRIORITY  6
+#define SAADC_IRQ_PRIORITY  5   /* v7.8 FIX 1: was 6 (same as SD_WRITER_PRIORITY).
+                                 * Priority 7 exceeded IRQ_PRIO_LOWEST on nRF52840.
+                                 * Raised to 5 instead — higher priority means the
+                                 * SAADC ISR completes faster and releases CPU sooner,
+                                 * reducing the window where it can interfere with the
+                                 * SPI bus timing during SD writes. */
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
     .channel_config = {
@@ -531,10 +538,20 @@ static struct fs_file_t sd_lung_file;
 static uint32_t         sd_checksum  = 0;
 
 /* [FIX 1] sd_write_buf forced to 4-byte alignment for nRF52 EasyDMA.
- * v7.5 [FIX 12]: bumped 512 -> 4096 (one FAT cluster on typical SDs).
+ * v7.6 FIX E: dropped back to 512 (one disk sector) after the field
+ * log showed "Only 1 blocks of 1 were written / Write failed / fs:
+ * file write error (-5)" on the FIRST write of a 4 KB block. Cheap
+ * SDHC cards on hand-wired breadboards stall during internal
+ * wear-leveling and can fail multi-sector writes at 8 MHz SPI; the
+ * card responded fine to the 28-byte probe write but rejected the
+ * 4 KB production write. 512 B writes are atomic from the card's
+ * perspective and survive the stalls. FATFS bookkeeping overhead
+ * is higher per-write but the 32 KB ring absorbs it.
+ *
+ * v7.5 [FIX 12]: was 512 -> 4096 (one FAT cluster on typical SDs).
  * Cuts per-write FATFS bookkeeping ~8x. Combined with FIX 14 file
  * pre-truncation, this should eliminate sd_drops entirely. */
-#define SD_WRITE_BUF_SIZE  4096
+#define SD_WRITE_BUF_SIZE  512
 static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE] __aligned(4);
 
 static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
@@ -691,6 +708,62 @@ static int init_sd_card(void)
     }
 
     LOG_INF("[6/6] probe write+read+verify OK  → SD is writable");
+
+    /* ── Step 7: pre-allocate analog.pcm ────────────────────────────
+     * Write TOTAL_AUDIO_BYTES + CHECKSUM_SIZE bytes of zeros now, at
+     * boot, so the SD card erases all required flash blocks before any
+     * recording starts.  During recording the SD writer overwrites
+     * these pre-allocated clusters — no block erase is triggered, so
+     * every 512-byte write completes in ~1–5 ms instead of hanging the
+     * SPI bus for ~10 s (the root cause of audio=0 B / sd_drops=126).
+     *
+     * zero_sector lives in BSS (static const → zero-initialised by the
+     * C runtime), so it costs no extra RAM beyond what is already used.
+     */
+    LOG_INF("[7/7] Pre-allocating %s (%u B) — this may take a few seconds ...",
+            AUDIO_FILE_PATH,
+            (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE);
+    {
+        static const uint8_t zero_sector[SD_WRITE_BUF_SIZE]; /* BSS = 0 */
+        struct fs_file_t pa;
+        fs_file_t_init(&pa);
+
+        ret = fs_open(&pa, AUDIO_FILE_PATH, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
+        if (ret != 0) {
+            LOG_WRN("[7/7] pre-alloc fs_open failed (%d) — "
+                    "recording writes may be slow", ret);
+        } else {
+            uint32_t remaining =
+                (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE;
+            bool pa_ok = true;
+
+            while (remaining > 0 && pa_ok) {
+                uint32_t n = MIN(remaining, (uint32_t)SD_WRITE_BUF_SIZE);
+                ssize_t pw = fs_write(&pa, zero_sector, n);
+                if (pw < 0) {
+                    LOG_WRN("[7/7] pre-alloc write stalled at offset %u (%d) "
+                            "— skipping remainder",
+                            (uint32_t)TOTAL_AUDIO_BYTES +
+                            (uint32_t)CHECKSUM_SIZE - remaining,
+                            (int)pw);
+                    pa_ok = false;
+                } else {
+                    remaining -= (uint32_t)pw;
+                }
+                /* Yield so BLE stack and logging stay responsive. */
+                k_yield();
+            }
+
+            fs_close(&pa);
+
+            if (pa_ok) {
+                LOG_INF("[7/7] pre-alloc OK — %u B written to %s",
+                        (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE,
+                        AUDIO_FILE_PATH);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -734,6 +807,12 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
         }
 
         LOG_INF("SD writer: starting write loop");
+        k_sleep(K_MSEC(100)); /* v7.8 FIX 3: after fs_open+fs_seek(0) on the
+                                * pre-allocated file, FATFS writes FAT metadata
+                                * (timestamps, dir entry). The card may still be
+                                * busy from that update when the first fs_write
+                                * hits. 100 ms guarantees the card has finished
+                                * before we touch it. */
         uint32_t audio_written = 0;
 #if !DSP_OFFLINE
         uint32_t heart_written = 0;
@@ -761,11 +840,35 @@ static void sd_writer_thread_fn(void *a, void *b, void *c)
                     uint32_t n = MIN(avail, (uint32_t)SD_WRITE_BUF_SIZE);
                     ring_buf_get(&audio_sd_ring, sd_write_buf, n);
                     sd_checksum ^= compute_checksum(sd_write_buf, n);
-                    ssize_t wr = fs_write(&sd_audio_file, sd_write_buf, n);
+                    /* v7.6 FIX G: workaround for Zephyr SD-over-SPI issue
+                     * #52931. The Zephyr SD subsystem polls card status
+                     * immediately after a write, but on some cards the
+                     * card hasn't actually finished its internal program
+                     * cycle and returns "still busy" — which the subsys
+                     * misreads as -EIO. The reporter found that simply
+                     * inserting a delay before fs_write (they used a
+                     * printk) made the bug disappear. A 2 ms k_sleep is
+                     * cheap and lets the card finish the previous block.
+                     * At 8 kHz int16 audio (16 KB/s) and 512-byte writes
+                     * (one write every 32 ms), 2 ms is 6% overhead — far
+                     * less than the retry latency we were eating. */
+                    k_sleep(K_MSEC(50)); /* v7.8 FIX 2: was 2 ms — not enough for
+                                          * this card's internal program cycle.
+                                          * Zephyr #52931 reporter needed ~10-20 ms
+                                          * (a printk); 50 ms is safe given the
+                                          * 32 KB ring (~2 s headroom at 16 KB/s). */
+                    /* v7.6 FIX F: retry transient -EIO before bailing. */
+                    ssize_t wr = -1;
+                    for (int retry = 0; retry < 3; retry++) {
+                        wr = fs_write(&sd_audio_file, sd_write_buf, n);
+                        if (wr >= 0) break;
+                        LOG_WRN("SD audio fs_write transient err: %d "
+                                "(retry %d/3)", (int)wr, retry + 1);
+                        k_sleep(K_MSEC(50)); /* v7.8 FIX 2b: was 10 ms */
+                    }
                     if (wr < 0) {
-                        /* [FIX 4] Bail out instead of hammering the card. */
-                        LOG_ERR("SD audio fs_write failed: %d — aborting writer",
-                                (int)wr);
+                        LOG_ERR("SD audio fs_write failed after retries: %d "
+                                "— aborting writer", (int)wr);
                         write_error = true;
                         break;
                     }
@@ -907,6 +1010,17 @@ static int process_audio_offline(int *out_heart_frames, int *out_lung_frames)
 
     const uint32_t audio_payload_bytes = (uint32_t)TOTAL_AUDIO_BYTES;
 
+    /* v7.6 FIX D: aggregate min/max/mean across the whole audio file
+     * during offline DSP. If the SD write path silently produced a
+     * zero-filled file (the root cause we suspected for HR=321), this
+     * will print min=0 max=0 mean=0 and tell you immediately. Healthy
+     * mic recording: min/max around ±a few thousand, mean near zero
+     * after the bandpass settles. */
+    int32_t  diag_sum = 0;
+    int16_t  diag_mn  = INT16_MAX;
+    int16_t  diag_mx  = INT16_MIN;
+    uint32_t diag_n   = 0;
+
     while (bytes_read_total < audio_payload_bytes) {
         uint32_t want = MIN((uint32_t)sizeof(read_buf),
                             audio_payload_bytes - bytes_read_total);
@@ -920,6 +1034,15 @@ static int process_audio_offline(int *out_heart_frames, int *out_lung_frames)
         }
         int samples = (int)(got / sizeof(int16_t));
 
+        /* v7.6 FIX D: accumulate diagnostic stats. */
+        for (int i = 0; i < samples; i++) {
+            int16_t s = read_buf[i];
+            if (s < diag_mn) diag_mn = s;
+            if (s > diag_mx) diag_mx = s;
+            diag_sum += s;
+        }
+        diag_n += (uint32_t)samples;
+
         dsp_mfcc_feed_chunk(&heart_pipeline, read_buf, samples);
         dsp_mfcc_feed_chunk(&lung_pipeline,  read_buf, samples);
 
@@ -928,6 +1051,20 @@ static int process_audio_offline(int *out_heart_frames, int *out_lung_frames)
 
         if ((chunk_idx & 3) == 0) {
             k_yield();
+        }
+    }
+
+    /* v7.6 FIX D: report stats. If min=max=0 the audio file is empty —
+     * SD write path is broken. If min/max are tiny (<10) the mic input
+     * is dead or DC-only. Healthy signal has |samples| in the hundreds
+     * to low thousands after bandpass. */
+    if (diag_n > 0) {
+        LOG_INF("[DIAG] analog.pcm stats: min=%d max=%d mean=%d (n=%u)",
+                (int)diag_mn, (int)diag_mx,
+                (int)(diag_sum / (int32_t)diag_n), diag_n);
+        if (diag_mn == 0 && diag_mx == 0) {
+            LOG_ERR("[DIAG] analog.pcm is ALL ZEROS — SD write path failed; "
+                    "MFCC will be garbage and model output will saturate");
         }
     }
 
@@ -1104,7 +1241,15 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    dc_estimate        = 0;
+    /* v7.6 FIX A: dc_estimate must seed to the ADC midpoint (~2048 for
+     * 12-bit single-ended @ VDD/4 ref), NOT 0. Starting at 0 means the
+     * IIR HPF needs ~256 samples to converge, and during those samples
+     * the bandpass filter sees a huge DC step that rings for hundreds
+     * of additional samples. That ringing dominates the MFCC frames at
+     * the start of the recording and pushes the model output into
+     * saturation (HR=321 = output_q=127, the int8 ceiling).
+     * Matches the value used in the known-good BLE-only firmware. */
+    dc_estimate        = 2048;
 
     dsp_mfcc_reset(&heart_pipeline);
     dsp_mfcc_reset(&lung_pipeline);
@@ -1389,8 +1534,10 @@ static void record_and_stream(void)
      * was generating four <err> log lines per REC. We only care if
      * an *existing* file fails to delete. */
     {
+        /* Do NOT unlink AUDIO_FILE_PATH — it was pre-allocated at boot.
+         * Deleting it frees the clusters and the next open triggers a
+         * fresh block erase during recording, reproducing the hang.   */
         const char *cleanup_paths[] = {
-            AUDIO_FILE_PATH,
             HEART_MFCC_FILE_PATH,
             LUNG_MFCC_FILE_PATH,
             HR_RESULT_FILE_PATH,
@@ -1414,6 +1561,13 @@ static void record_and_stream(void)
     led_set_blue();
     k_busy_wait(200000);
 
+    /* v7.9 Option A: abandon the pre-allocate-then-overwrite strategy.
+     * Opening without FS_O_TRUNC + fs_seek(0) caused FATFS to update
+     * directory metadata, leaving the card busy exactly when the first
+     * fs_write arrived — producing -EIO on every write attempt regardless
+     * of how long we waited. FS_O_TRUNC gives FATFS a clean slate.
+     * The first-write block erase may take ~50 ms but the 32 KB ring
+     * (~2 s headroom at 16 KB/s) easily absorbs it.                   */
     int rc_audio = fs_open(&sd_audio_file, AUDIO_FILE_PATH,
                             FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
     if (rc_audio < 0) {
@@ -1423,25 +1577,7 @@ static void record_and_stream(void)
         return;
     }
 
-    /* v7.5 [FIX 14]: pre-allocate the full audio file so FATFS
-     * allocates all clusters up front. Subsequent writes don't trigger
-     * FAT-table updates mid-recording — biggest single contributor
-     * to write-stall and the sd_drops issue we saw on the first REC. */
-    {
-        int rc_tr = fs_truncate(&sd_audio_file,
-                                (off_t)(TOTAL_AUDIO_BYTES + CHECKSUM_SIZE));
-        if (rc_tr < 0) {
-            LOG_WRN("fs_truncate(audio.pcm) failed: %d (non-fatal)", rc_tr);
-        } else {
-            /* Seek back to start; truncate leaves position at end on
-             * some FATFS versions. */
-            fs_seek(&sd_audio_file, 0, FS_SEEK_SET);
-            LOG_INF("audio.pcm pre-allocated to %u B",
-                    (unsigned)(TOTAL_AUDIO_BYTES + CHECKSUM_SIZE));
-        }
-    }
-
-    /* DEBUG BEACON: fs_open + fs_truncate done */
+    /* DEBUG BEACON: fs_open + seek done */
     led_set_yellow();
     k_busy_wait(200000);
 
@@ -1850,7 +1986,10 @@ static void record_and_stream(void)
             continue;
         }
 
-        /* [FIX 6] BLE TX packet buffer 4-byte aligned. */
+        /* [FIX 6] BLE TX packet buffer 4-byte aligned.
+         * v7.6: chunked [seq16][len16][payload] is correct for ALL
+         * files (audio, MFCC, results) — receiver expects this and
+         * strips the header before writing to disk. */
         uint8_t  pkt[251] __aligned(4);
         uint16_t seq     = 0;
         uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
@@ -1966,7 +2105,7 @@ int main(void)
 #endif
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v7.5 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v7.7 ready — waiting for BLE connection");
 
     /* v7.5 [FIX 15]: baseline RAM snapshot, before any recording.
      * Compare subsequent snapshots against this to spot leaks/overflows. */

@@ -2,6 +2,12 @@
  * app.overlay — AcoustEEEcare hardware bindings
  * SPDX-License-Identifier: Apache-2.0
  *
+ * v7.6 (from v5.4):
+ *   - spi-max-frequency: 8 MHz -> 4 MHz. Field test showed -EIO on
+ *     the first 4 KB fs_write at 8 MHz. The card is otherwise healthy
+ *     (probe write passes) — it just can't sustain 8 MHz SPI under
+ *     load on the breadboard. 4 MHz is plenty for 16 KB/s of audio.
+ *
  * v5.4 (was v5.3):
  *   - spi-max-frequency: 4 MHz -> 8 MHz. Combined with the larger
  *     SD_WRITE_BUF_SIZE (now 4096) and audio.pcm pre-allocation in
@@ -35,11 +41,32 @@
         reg = <0>;
         status = "okay";
 
-        /* v5.4: 4 MHz -> 8 MHz.
-         * nRF52840 SPI can do 8 MHz reliably with most SD modules.
-         * If you see init failures or data corruption, drop back to
-         * 4000000. */
-        spi-max-frequency = <8000000>;
+        /* v7.6: 8 MHz -> 1 MHz.
+         *
+         * After dropping to 4 MHz, the field log still showed
+         * "Only 1 blocks of 1 were written" on every fs_write.
+         *
+         * The actual root cause is Zephyr SD-over-SPI bug #52931:
+         * the SD subsystem polls card status immediately after a
+         * write, before the card has finished its internal program
+         * cycle. Some cards (Lexar, Transcend, the cheap modules
+         * commonly used on breadboards) reply "still busy" → Zephyr
+         * misreads as -EIO. This is fundamentally a Zephyr bug, not
+         * a hardware bug, but firmware can work around it by:
+         *   (a) inserting a delay before each fs_write (FIX G in
+         *       main.c), and
+         *   (b) dropping the SPI clock so the post-write window is
+         *       longer, giving the card more clock cycles to
+         *       complete its program before status is polled.
+         *
+         * 1 MHz is 16x our actual audio throughput (16 KB/s of
+         * 8 kHz int16) so there is huge headroom. We are not
+         * speed-bound here.
+         *
+         * If the card still fails at 1 MHz the problem is electrical
+         * (wiring, power, capacitance) — try a different SD card or
+         * solder direct wires instead of breadboard jumpers. */
+        spi-max-frequency = <1000000>;
 
         mmc {
             compatible = "zephyr,sdmmc-disk";

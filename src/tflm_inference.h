@@ -1,37 +1,15 @@
 /*
  * tflm_inference.h — TFLite Micro heart + lung inference
  * =========================================================
- * v2.2 — synced with tflm_inference.cc v2.2 (lung integrated).
+ * v3.1 — merged v2.2 + v3.0 (BLE SD-free additions).
  *
- * Sequential inference on a shared tensor arena:
+ * run_heart_inference / run_lung_inference now take a pre-quantized
+ * int8 pointer (BLE path).  The SD mfcc_path string argument is
+ * removed from the public API; SD quantization is handled internally
+ * in tflm_inference.cc if needed.
  *
- *   run_heart_inference(arena, arena_bytes, mfcc_path, n_frames, n_mfcc, &result);
- *   // arena is now logically free
- *   run_lung_inference (arena, arena_bytes, mfcc_path, n_frames, n_mfcc, &result);
- *
- * Both functions:
- *   1. Validate n_frames / n_mfcc match the model's expected input shape.
- *   2. Build a MicroInterpreter on the provided arena.
- *   3. Stream-quantize the MFCC .f32 file from SD directly into the
- *      int8 input tensor (no intermediate float buffer).
- *   4. Invoke the model.
- *   5. Dequantize the scalar output.
- *   6. Write a small text result file to SD.
- *
- * Heart model (best_mcu_int8.tflite):
- *   Input  shape  [1, 665, 25, 1]   int8
- *   Output shape  [1, 1]             int8
- *   Regression: output[0] is HR in BPM after dequantization.
- *   MFCC config must match heart_winning_config (665 frames × 25 mfcc).
- *
- * Lung model (best_mcu_lung_int8.tflite):
- *   Input  shape  [1, 324, 26, 1]   int8   (derived from
- *                 lung_winning_config: frame=300 ms, hop=10%)
- *   Output: regression scalar (RR in BPM).
- *
- * Output files written to SD:
- *   /SD:/hr.txt    e.g. "HR:72\n"
- *   /SD:/rr.txt    e.g. "RR:15\n"
+ * get_heart_quant_params / get_lung_quant_params added so main.c
+ * can send scale+zp to the host over BLE at startup.
  */
 
 #pragma once
@@ -45,58 +23,67 @@ extern "C" {
 
 /* ── Result structs ──────────────────────────────────────────────── */
 typedef struct {
-    float    value;        /* HR in BPM (dequantized regression output) */
-    float    confidence;   /* 1.0 for regression (no probability)       */
-    int      class_idx;    /* -1 for regression                         */
-    int      rc;           /* 0 = ok, negative errno on failure         */
+    float value;        /* HR in BPM (dequantized regression output) */
+    float confidence;   /* 1.0 for regression models                  */
+    int   class_idx;    /* -1 for regression                          */
+    int   rc;           /* 0 = ok, negative errno on failure          */
 } heart_result_t;
 
 typedef struct {
-    float    value;        /* RR in BPM (regression output)             */
-    float    confidence;   /* 1.0 for regression                        */
-    int      class_idx;    /* -1 for regression                         */
-    int      rc;
+    float value;        /* RR in breaths/min                          */
+    float confidence;
+    int   class_idx;
+    int   rc;
 } lung_result_t;
 
-/* ── Public API ──────────────────────────────────────────────────── */
-
 /**
- * Run heart inference.
+ * run_heart_inference()
  *
- * @param arena        Shared tensor arena buffer.
- * @param arena_bytes  Size of the arena in bytes.  Heart needs ~92 KB; 100 KB recommended.
- * @param mfcc_path    SD path to heart_mfcc.f32 (e.g. "/SD:/heart_mfcc.f32").
- * @param n_frames     Frames written by the offline MFCC pass.  Must == 665.
- * @param n_mfcc       Coefficients per frame.  Must == 25.
- * @param result       Output struct.  result->rc < 0 on failure.
- *
- * On success: writes "/SD:/hr.txt" with "HR:<value>\n".
- * Leaves the arena in an indeterminate state — safe to reuse for
- * run_lung_inference() because that call re-initialises everything.
+ * @param arena        Shared tensor arena (72 KB recommended).
+ * @param arena_bytes  Size of arena in bytes.
+ * @param mfcc_int8    Pre-quantized int8 MFCC, row-major [n_frames][n_mfcc].
+ *                     Must be exactly n_frames * n_mfcc bytes.
+ *                     Quantized by host using QUANT_HEART scale/zp.
+ * @param n_frames     Must == 665.
+ * @param n_mfcc       Must == 25.
+ * @param result       Output. result->rc < 0 on failure.
  */
-void run_heart_inference(uint8_t       *arena,
-                         size_t         arena_bytes,
-                         const char    *mfcc_path,
-                         int            n_frames,
-                         int            n_mfcc,
+void run_heart_inference(uint8_t        *arena,
+                         size_t          arena_bytes,
+                         const int8_t   *mfcc_int8,
+                         int             n_frames,
+                         int             n_mfcc,
                          heart_result_t *result);
 
 /**
- * Run lung inference.
+ * run_lung_inference()
  *
- * Same contract as run_heart_inference().
- *   n_frames must == 324, n_mfcc must == 26 (per lung_winning_config).
- *
- * On success: writes "/SD:/rr.txt" with "RR:<value>\n".
- * When ENABLE_LUNG_MODEL is 0 or undefined, returns -ENOTSUP without
- * doing anything.
+ * @param mfcc_int8  Pre-quantized int8, row-major [n_frames][n_mfcc].
+ * @param n_frames   Must == 324.
+ * @param n_mfcc     Must == 26.
  */
-void run_lung_inference(uint8_t      *arena,
-                        size_t        arena_bytes,
-                        const char   *mfcc_path,
-                        int           n_frames,
-                        int           n_mfcc,
+void run_lung_inference(uint8_t       *arena,
+                        size_t         arena_bytes,
+                        const int8_t  *mfcc_int8,
+                        int            n_frames,
+                        int            n_mfcc,
                         lung_result_t *result);
+
+/**
+ * get_heart_quant_params() / get_lung_quant_params()
+ *
+ * Retrieve the input tensor's quantization parameters by briefly
+ * instantiating the model on the arena.  Call once after BLE connect,
+ * before any recording.  The host uses scale/zp to quantize MFCC
+ * float32 → int8 before sending over BLE.
+ *
+ * @return 0 on success, negative errno on failure.
+ */
+int get_heart_quant_params(uint8_t *arena, size_t arena_bytes,
+                           float *out_scale, int32_t *out_zp);
+
+int get_lung_quant_params(uint8_t *arena, size_t arena_bytes,
+                          float *out_scale, int32_t *out_zp);
 
 #ifdef __cplusplus
 }

@@ -65,6 +65,7 @@
  * INCLUDES
  * ══════════════════════════════════════════════════════════════════ */
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -114,15 +115,6 @@ static int  saadc_start_streaming(void);
 static void saadc_stop_streaming(void);
 /* Issue #8: forward declaration so saadc_init() can reference handler */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event);
-
-/* ══════════════════════════════════════════════════════════════════
- * COMPILE-TIME SANITY (Issue #7)
- * ══════════════════════════════════════════════════════════════════ */
-/* BP_SCRATCH_MAX in dsp_mfcc.c is 512. HALF_BUF_SAMPLES must not
- * exceed it or dsp_mfcc_feed_chunk() will silently truncate. */
-#define BP_SCRATCH_MAX_SHADOW 512
-BUILD_ASSERT(HALF_BUF_SAMPLES <= BP_SCRATCH_MAX_SHADOW,
-             "HALF_BUF_SAMPLES must not exceed BP_SCRATCH_MAX in dsp_mfcc.c");
 
 /* ══════════════════════════════════════════════════════════════════
  * TENSOR ARENA
@@ -190,6 +182,13 @@ static int32_t dc_estimate = 0;
 
 #define HALF_BUF_SAMPLES     512
 #define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))
+
+/* Issue #7: BP_SCRATCH_MAX in dsp_mfcc.c is 512. HALF_BUF_SAMPLES must not
+ * exceed it or dsp_mfcc_feed_chunk() silently truncates. Placed here so
+ * _Static_assert sees an already-defined integer constant expression. */
+#define BP_SCRATCH_MAX_SHADOW 512
+BUILD_ASSERT(HALF_BUF_SAMPLES <= BP_SCRATCH_MAX_SHADOW,
+             "HALF_BUF_SAMPLES must not exceed BP_SCRATCH_MAX in dsp_mfcc.c");
 
 static int16_t ping_pong[2][HALF_BUF_SAMPLES] __aligned(4);
 static volatile uint8_t  next_dma_buf     = 1;

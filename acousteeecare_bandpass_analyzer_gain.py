@@ -68,11 +68,11 @@ FILTER_ORDER  = 4      # Butterworth order (shared by both filters)
 EXPECTED_RATE = 8000   # must match firmware SAMPLING_RATE
 
 # ── Gain settings — applied to figures AND saved WAV ──────────
-AMPLIFY_GAIN      = 500.0  # linear gain for MAIN (heart) bandpass.
+AMPLIFY_GAIN      = 100.0  # linear gain for MAIN (heart) bandpass.
                             # Applied to figure plots AND the saved WAV.
                             # Clipping is auto-handled by np.clip.
 
-RESP_AMPLIFY_GAIN = 500.0  # linear gain for RESPIRATORY bandpass.
+RESP_AMPLIFY_GAIN = 100.0  # linear gain for RESPIRATORY bandpass.
                             # Applied to figure plots only
                             # (resp band is not saved as a separate WAV).
 

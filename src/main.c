@@ -34,6 +34,34 @@
  *   [IMP 7] Confirmed TENSOR_ARENA_BYTES kept at 72 KB; arena_used_bytes
  *           logged after AllocateTensors() via g_tflm_arena_used_bytes.
  *
+ * PATCH FIXES (applied over v8.1):
+ *
+ *   [FIX A] drops variable scope: moved outside #if BLE_AUDIO_LIVE block
+ *           so LOG_INF at end of record_and_stream() always compiles.
+ *
+ *   [FIX B] NACK retransmit window expanded from 1 to NACK_WINDOW (4)
+ *           slots. Firmware can now retransmit any of the last 4 chunks,
+ *           covering cases where NACK arrives after subsequent sends.
+ *
+ *   [FIX C] DC removal time constant changed from >> 8 (~32 ms) to
+ *           >> 10 (~128 ms) for a gentler HPF that preserves low-frequency
+ *           content before BPF.
+ *
+ *   [FIX D] BLE TX thread priority lowered from 5 to 4 so it preempts
+ *           the main thread during inference and keeps the audio ring
+ *           draining.
+ *
+ *   [FIX E] ble_tx_saw_recording converted from volatile bool to atomic_t
+ *           to ensure correct cross-thread visibility without races.
+ *
+ *   [FIX F] saadc_init() IRQ_CONNECT / irq_enable moved to a one-time
+ *           saadc_init_once() called from main(). IRQ_CONNECT is a
+ *           compile-time linker macro and must not be called repeatedly.
+ *
+ *   [NOTE ] BPF coefficients (heart_bpf_coeffs) are still placeholder
+ *           values. Replace with scipy-generated Q15 Butterworth coeffs
+ *           before clinical use (see comment below).
+ *
  * ALL PREVIOUS FIXES (v7.9 / v7.8 / v7.7 / … / v6.8) ARE PRESERVED
  * where they still apply to the no-SD build.
  * ==================================================
@@ -111,6 +139,7 @@ static inline void led_set_purple(void);
 static inline void led_set_cyan(void);
 static int  saadc_start_streaming(void);
 static void saadc_stop_streaming(void);
+static void saadc_init_once(void);   /* [FIX F] one-time IRQ setup */
 
 /* ══════════════════════════════════════════════════════════════════
  * SHARED TENSOR ARENA
@@ -143,6 +172,10 @@ extern char _image_ram_start;
 extern char _image_ram_end;
 
 /* [IMP 1] 32 KB — enlarged from 16 KB for ~3 s slack at 8 kHz int16 */
+/* [FIX D] BLE_TX_PRIORITY lowered to 4 (was 5 = same as main).
+ *         This ensures BLE TX preempts the main thread during
+ *         inference so the audio ring keeps draining. */
+#define BLE_TX_PRIORITY       4
 #define BLE_TX_STACK_SIZE     3072   /* [IMP 6] enlarged from 2048 for CRC/NACK path */
 #define DSP_THREAD_STACK_SIZE 4096
 
@@ -264,18 +297,19 @@ static int32_t dc_estimate = 0;
  *   sos = butter(2, [20, 950], btype='bandpass', fs=8000, output='sos')
  *   # convert to Q15: round(sos * 32768)
  *
- * Replace placeholder values below with your computed coefficients.
+ * !! NOTE: Values below are PLACEHOLDERS. Replace with your scipy-
+ * !! computed coefficients before clinical/production use. Incorrect
+ * !! coefficients will silently corrupt MFCC input.
+ *
  * Format: {b0, b1, b2, -a1, -a2} for each biquad stage (CMSIS-DSP
  * convention negates a1/a2).
  * ══════════════════════════════════════════════════════════════════ */
-/* Two second-order sections for a 2nd-order bandpass (one biquad each
- * stage; adjust HEART_BPF_STAGES if you use a higher-order design).   */
 #define HEART_BPF_STAGES  2
 
 static const q15_t heart_bpf_coeffs[5 * HEART_BPF_STAGES] = {
-    /* Stage 1 — replace with scipy-generated Q15 values */
+    /* Stage 1 — PLACEHOLDER: replace with scipy-generated Q15 values */
      1382,  2764,  1382, -25576,  12610,
-    /* Stage 2 */
+    /* Stage 2 — PLACEHOLDER */
      1382, -2764,  1382,  25576,  12610,
 };
 static q15_t                       heart_bpf_state[4 * HEART_BPF_STAGES];
@@ -317,12 +351,22 @@ static uint16_t tx_seq = 0;
 
 /* [FIX] Prevents the BLE TX thread from sending "finished\n" before the
  * recording session has started. Set true when analog_recording is first
- * observed true; reset to false at the start of each REC. */
-static volatile bool ble_tx_saw_recording = false;
+ * observed true; reset to false at the start of each REC.
+ * [FIX E] Converted from volatile bool to atomic_t for correct cross-thread
+ * visibility without data races. */
+static atomic_t ble_tx_saw_recording = ATOMIC_INIT(0);
 
-/* [IMP 5] Sequence tracking for NACK retransmit */
-static atomic_t  nack_requested;         /* set to (seq + 1) when NACK received */
-static uint16_t  nack_seq = 0xFFFF;      /* 0xFFFF = no pending NACK */
+/* [IMP 5] / [FIX B] NACK retransmit window.
+ * Expanded from 1 slot to NACK_WINDOW (4) slots so we can retransmit
+ * any of the last 4 chunks, covering NACK arrival after subsequent sends. */
+#define NACK_WINDOW  4
+
+static uint8_t  nack_buf[NACK_WINDOW][251]   __aligned(4);
+static uint16_t nack_buf_seq[NACK_WINDOW];
+static uint16_t nack_buf_len[NACK_WINDOW];
+
+static atomic_t  nack_requested;
+static uint16_t  nack_seq_pending = 0xFFFF;
 static K_MUTEX_DEFINE(nack_mutex);
 #endif /* BLE_AUDIO_LIVE */
 
@@ -343,9 +387,6 @@ static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
 
 /* ══════════════════════════════════════════════════════════════════
  * DUAL MFCC PIPELINE INSTANCES
- *
- * Window sizes MUST equal cfg->frame_samples:
- *   heart: 60 samples   lung: 1200 samples
  * ══════════════════════════════════════════════════════════════════ */
 static int16_t heart_window[60]   __aligned(4);
 static int16_t lung_window[1200]  __aligned(4);
@@ -382,7 +423,6 @@ static void lung_frame_cb(int idx, const float *coeffs, void *user)
     }
 }
 
-#define BLE_TX_PRIORITY     5
 #define DSP_THREAD_PRIORITY 7
 
 static K_THREAD_STACK_DEFINE(ble_tx_stack,     BLE_TX_STACK_SIZE);
@@ -437,20 +477,22 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 
 #ifdef ENABLE_DC_REMOVAL
         for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
-            dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 8;
+            /* [FIX C] HPF time constant changed from >> 8 (~32 ms) to
+             * >> 10 (~128 ms) for a gentler high-pass that preserves
+             * low-frequency content going into the BPF. */
+            dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 10;
             filled_buf[i] = (int16_t)((int32_t)filled_buf[i] - dc_estimate);
         }
 #endif
 
-        /* [IMP 3] Heart band-pass filter: 20–950 Hz, 2nd-order Butterworth
-         * Applied after DC removal, in-place. Rejects low-frequency
-         * motion artifacts and high-frequency noise before MFCC. */
+        /* [IMP 3] Heart band-pass filter: 20–950 Hz, 2nd-order Butterworth.
+         * Applied after DC removal, in-place. */
         arm_biquad_cascade_df1_q15(&heart_bpf,
                                    (q15_t *)filled_buf,
                                    (q15_t *)filled_buf,
                                    HALF_BUF_SAMPLES);
 
-        /* DSP ring (always fed; DSP thread processes both heart and lung) */
+        /* DSP ring */
         uint32_t dsp_written = ring_buf_put(&dsp_ring,
                                             (const uint8_t *)filled_buf,
                                             HALF_BUF_BYTES);
@@ -488,6 +530,9 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC INIT / START / STOP
+ * [FIX F] IRQ_CONNECT and irq_enable moved to saadc_init_once(),
+ * called once from main(). IRQ_CONNECT expands to a linker-section
+ * entry and must not be in a runtime loop.
  * ══════════════════════════════════════════════════════════════════ */
 static inline void debug_flash_twice(void (*set_color)(void))
 {
@@ -502,6 +547,13 @@ static inline void debug_flash_twice(void (*set_color)(void))
 }
 
 static bool saadc_was_initialized = false;
+
+/* [FIX F] One-time IRQ registration — call from main() only. */
+static void saadc_init_once(void)
+{
+    IRQ_CONNECT(SAADC_IRQn, SAADC_IRQ_PRIORITY, nrfx_saadc_irq_handler, NULL, 0);
+    irq_enable(SAADC_IRQn);
+}
 
 static int saadc_init(void)
 {
@@ -519,8 +571,7 @@ static int saadc_init(void)
                                     heart_bpf_state,
                                     1 /* postShift */);
 
-    IRQ_CONNECT(SAADC_IRQn, SAADC_IRQ_PRIORITY, nrfx_saadc_irq_handler, NULL, 0);
-    irq_enable(SAADC_IRQn);
+    /* [FIX F] IRQ_CONNECT removed from here — now in saadc_init_once() */
 
     err = nrfx_saadc_init(SAADC_IRQ_PRIORITY);
     if (err != 0) { LOG_ERR("nrfx_saadc_init: 0x%08X", err); return -EIO; }
@@ -708,8 +759,7 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 
 /* ══════════════════════════════════════════════════════════════════
  * NUS CALLBACKS
- * [IMP 5] Handle "NACK:<seq>\n" from host: set nack_seq so the BLE TX
- * thread can retransmit the missing chunk on next iteration.
+ * [IMP 5] Handle "NACK:<seq>\n" from host.
  * ══════════════════════════════════════════════════════════════════ */
 static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
 {
@@ -721,7 +771,6 @@ static void received(struct bt_conn *conn, const void *data, uint16_t len, void 
     }
 
 #if BLE_AUDIO_LIVE
-    /* [IMP 5] NACK handler: "NACK:<seq_decimal>\n" */
     const char *msg = (const char *)data;
     if (len > 5 && memcmp(msg, "NACK:", 5) == 0) {
         char seq_str[8] = {0};
@@ -730,7 +779,7 @@ static void received(struct bt_conn *conn, const void *data, uint16_t len, void 
         memcpy(seq_str, msg + 5, copy_len);
         uint16_t requested = (uint16_t)strtoul(seq_str, NULL, 10);
         k_mutex_lock(&nack_mutex, K_FOREVER);
-        nack_seq = requested;
+        nack_seq_pending = requested;
         k_mutex_unlock(&nack_mutex);
         LOG_WRN("NACK received for seq=%u — will retransmit", requested);
     }
@@ -742,8 +791,8 @@ static struct bt_nus_cb nus_listener = { .received = received };
 /* ══════════════════════════════════════════════════════════════════
  * BLE TX THREAD
  * [IMP 5] Extended chunk header: [seq16][len16][crc16] = 6 bytes.
- *         CRC-16/CCITT computed over the payload bytes only.
- *         On NACK, the thread retransmits the requested sequence.
+ * [FIX B] NACK retransmit window: keeps last NACK_WINDOW chunks
+ *         so retransmit works even if NACK arrives after later sends.
  * ══════════════════════════════════════════════════════════════════ */
 static void ble_tx_thread_fn(void *a, void *b, void *c)
 {
@@ -754,41 +803,48 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
         k_sleep(K_FOREVER);
     }
 #else
-    /* Retransmit buffer: keeps the last sent chunk in case NACK arrives */
-    uint8_t  chunk[251]      __aligned(4);
-    uint8_t  last_chunk[251] __aligned(4);
-    uint16_t last_chunk_len  = 0;
-    uint16_t last_chunk_seq  = 0xFFFF;
-    bool     finished_sent   = false;
+    uint8_t  chunk[251] __aligned(4);
+    bool     finished_sent = false;
 
     while (true) {
         k_sem_take(&audio_data_sem, K_FOREVER);
 
         if (analog_recording) {
-            finished_sent        = false;
-            ble_tx_saw_recording = true;
+            finished_sent = false;
+            /* [FIX E] Use atomic_set instead of plain bool assignment */
+            atomic_set(&ble_tx_saw_recording, 1);
         }
 
         while (true) {
-            /* [IMP 5] Check for pending NACK before sending new data */
+            /* [FIX B] Check for pending NACK — search window for matching seq */
             k_mutex_lock(&nack_mutex, K_FOREVER);
-            uint16_t pending_nack = nack_seq;
+            uint16_t pending_nack = nack_seq_pending;
             if (pending_nack != 0xFFFF) {
-                nack_seq = 0xFFFF;   /* consume */
+                nack_seq_pending = 0xFFFF;   /* consume */
             }
             k_mutex_unlock(&nack_mutex);
 
-            if (pending_nack != 0xFFFF &&
-                last_chunk_len > 0 &&
-                last_chunk_seq == pending_nack) {
-                /* Retransmit the last chunk verbatim (header + payload) */
-                LOG_INF("Retransmitting seq=%u (%u B)", pending_nack, last_chunk_len);
-                int err;
-                do {
-                    err = bt_nus_send(NULL, last_chunk, last_chunk_len);
-                    if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
-                } while (err == -ENOMEM || err == -EAGAIN);
-                continue;   /* re-check NACK before advancing */
+            if (pending_nack != 0xFFFF) {
+                /* Search NACK_WINDOW for the requested seq */
+                bool retransmitted = false;
+                for (int i = 0; i < NACK_WINDOW; i++) {
+                    if (nack_buf_len[i] > 0 && nack_buf_seq[i] == pending_nack) {
+                        LOG_INF("Retransmitting seq=%u (%u B) from window[%d]",
+                                pending_nack, nack_buf_len[i], i);
+                        int err;
+                        do {
+                            err = bt_nus_send(NULL, nack_buf[i], nack_buf_len[i]);
+                            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+                        } while (err == -ENOMEM || err == -EAGAIN);
+                        retransmitted = true;
+                        break;
+                    }
+                }
+                if (!retransmitted) {
+                    LOG_WRN("NACK seq=%u not in retransmit window — cannot retransmit",
+                            pending_nack);
+                }
+                continue;
             }
 
             uint16_t payload_bytes = nus_chunk_size - CHUNK_HEADER_BYTES;
@@ -797,7 +853,9 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
             uint32_t available = ring_buf_size_get(&audio_ring);
 
             if (available == 0) {
-                if (!analog_recording && !finished_sent && ble_tx_saw_recording) {
+                /* [FIX E] Use atomic_get for ble_tx_saw_recording */
+                if (!analog_recording && !finished_sent &&
+                    atomic_get(&ble_tx_saw_recording)) {
                     int err;
                     do {
                         err = bt_nus_send(NULL, "finished\n", 9);
@@ -827,11 +885,12 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
             uint16_t total_len = CHUNK_HEADER_BYTES + send_bytes;
 
-            /* Keep a copy for potential NACK retransmit */
-            if (total_len <= sizeof(last_chunk)) {
-                memcpy(last_chunk, chunk, total_len);
-                last_chunk_len = total_len;
-                last_chunk_seq = tx_seq;
+            /* [FIX B] Store chunk in circular NACK window */
+            int slot = tx_seq % NACK_WINDOW;
+            if (total_len <= sizeof(nack_buf[slot])) {
+                memcpy(nack_buf[slot], chunk, total_len);
+                nack_buf_seq[slot] = tx_seq;
+                nack_buf_len[slot] = total_len;
             }
 
             int err;
@@ -870,18 +929,24 @@ static void record_and_stream(void)
 
     k_sem_reset(&half_produced_sem);
 
+    /* [FIX A] drops declared unconditionally so LOG_INF at end always compiles.
+     * Value is populated inside #if BLE_AUDIO_LIVE below. */
+    uint32_t drops = 0;
+
 #if BLE_AUDIO_LIVE
     k_sem_reset(&audio_data_sem);
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
-    ring_high_water      = 0;
-    tx_seq               = 0;
-    ble_tx_saw_recording = false;   /* [FIX] reset guard for this session */
+    ring_high_water = 0;
+    tx_seq          = 0;
+    /* [FIX E] Use atomic_set */
+    atomic_set(&ble_tx_saw_recording, 0);
     k_sem_reset(&tx_done_sem);
 
-    /* [IMP 5] Clear any stale NACK state */
+    /* Clear NACK window */
+    memset(nack_buf_len, 0, sizeof(nack_buf_len));
     k_mutex_lock(&nack_mutex, K_FOREVER);
-    nack_seq = 0xFFFF;
+    nack_seq_pending = 0xFFFF;
     k_mutex_unlock(&nack_mutex);
 #endif
 
@@ -941,7 +1006,7 @@ static void record_and_stream(void)
     k_sem_take(&tx_done_sem, K_MSEC(15000));
 
     /* [IMP 2] Drop warning — sent after TX drain so host has audio first */
-    uint32_t drops = (uint32_t)atomic_get(&ring_drops);
+    drops = (uint32_t)atomic_get(&ring_drops);
     if (drops > 0) {
         char warn[32];
         int  wlen = snprintf(warn, sizeof(warn), "WARN:DROPS:%u\n", drops);
@@ -992,6 +1057,7 @@ static void record_and_stream(void)
         nus_send_blocking("ERR:LUNG_INF\n", 13);
     }
 
+    /* [FIX A] drops is now always in scope here */
     LOG_INF("Done. HR=%.0f RR=%.0f drops=%u",
             (double)hr.value, (double)rr.value, drops);
     led_set_green();
@@ -1010,6 +1076,9 @@ int main(void)
     led_set_white();
 
     k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
+
+    /* [FIX F] One-time SAADC IRQ registration */
+    saadc_init_once();
 
     /* ── MFCC pipeline init ──────────────────────────────────────── */
     if (dsp_mfcc_init(&heart_pipeline, &heart_mfcc_config) != 0) {

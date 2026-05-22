@@ -48,10 +48,15 @@ DEVICE_NAME   = "AcoustEEEcare"
 SAMPLE_RATE   = 8000
 OUTPUT_DIR    = Path("final_device_recording_22_05_26")
 SCAN_TIMEOUT  = 20.0
-REC_TIMEOUT   = 60.0    # 10 s capture + ~15 s inference + margin
+# FIX [low]: Increased from 60 s — 10 s capture + ~15 s inference + BLE TX
+# drain + possible NACK retransmits on congested 2M PHY needs more margin.
+REC_TIMEOUT   = 90.0
 
 # v8.1: header is [seq:u16][len:u16][crc16:u16] = 6 bytes
 CHUNK_HEADER  = 6
+
+# Max valid NUS payload size (MTU 255 - 3 ATT overhead - 6 header)
+_MAX_NUS_PAYLOAD = 244
 
 
 # ── CRC-16/CCITT (matches Zephyr crc16_ccitt, init=0xFFFF) ──────────────────
@@ -112,6 +117,11 @@ rec = RecState()
 # can send NACKs without a callback parameter.
 _ble_client: BleakClient | None = None
 
+# FIX [high]: Store the running event loop at startup so the Bleak
+# notification thread can safely call call_soon_threadsafe() without
+# triggering the DeprecationWarning from get_event_loop() on Python 3.10+.
+_loop: asyncio.AbstractEventLoop | None = None
+
 
 # ── Notification handler ──────────────────────────────────────────────────────
 
@@ -127,12 +137,10 @@ def _looks_like_audio_chunk(data: bytearray) -> bool:
 
 
 def handle_notification(_sender, data: bytearray):
-    # Always dispatch to the event loop first — never read rec.mode here.
-    # The Bleak notification thread may deliver audio chunks before the
-    # call_soon_threadsafe for "START:..." has executed and set rec.mode=AUDIO.
-    # Classifying here would therefore misroute early chunks as text.
-    # _dispatch() runs on the event loop where ordering is guaranteed.
-    asyncio.get_event_loop().call_soon_threadsafe(_dispatch, bytes(data))
+    # FIX [high]: Use stored _loop reference instead of get_event_loop(),
+    # which is deprecated in Python 3.10+ when called from a non-async thread.
+    if _loop is not None:
+        _loop.call_soon_threadsafe(_dispatch, bytes(data))
 
 
 def _dispatch(data: bytes):
@@ -238,17 +246,14 @@ def _handle_audio_chunk(data: bytearray):
     # ── Sequence-gap detection ────────────────────────────────────
     if seq != rec.audio_seq:
         gap_pkts  = (seq - rec.audio_seq) & 0xFFFF
-        gap_bytes = gap_pkts * ln          # best-effort; ln is current chunk size
+        # FIX [medium]: Clamp ln before multiplying to prevent huge zero-fills
+        # if ln is somehow 0 or corrupted.
+        ln_clamped = max(2, min(ln, _MAX_NUS_PAYLOAD))
+        gap_bytes  = gap_pkts * ln_clamped
         print(f"\n  [GAP   ] audio seq {rec.audio_seq}→{seq} "
               f"({gap_pkts} pkt(s), ~{gap_bytes} B zeroed)")
         rec.audio_samples += b"\x00\x00" * (gap_bytes // 2)
         rec.audio_gaps    += gap_pkts
-
-
-    
-    # print(f"  [DEBUG ] seq={seq} ln={ln} rx_crc=0x{rx_crc:04X} "
-    #   f"calc_0000=0x{_crc16_firmware(payload):04X}")
-    
 
     rec.audio_samples += payload
     rec.audio_seq      = (seq + 1) & 0xFFFF
@@ -280,19 +285,24 @@ async def _nack_sender_loop():
     Background task: waits for rec.nack_event, then sends NACK:<seq>\n to
     the firmware.  Runs for the lifetime of one recording session.
     """
-    while True:
-        await rec.nack_event.wait()
-        rec.nack_event.clear()
-        seq = rec.nack_seq
-        if seq is not None and _ble_client is not None:
-            nack_msg = f"NACK:{seq}\n".encode()
-            try:
-                await _ble_client.write_gatt_char(NUS_RX_CHAR_UUID,
-                                                  nack_msg,
-                                                  response=False)
-                print(f"\n  [NACK  ] Sent NACK for seq={seq}")
-            except Exception as e:
-                print(f"\n  [WARN  ] Failed to send NACK: {e}")
+    # FIX [low]: Handle CancelledError cleanly so cancellation at end of
+    # recording doesn't produce spurious tracebacks in the console.
+    try:
+        while True:
+            await rec.nack_event.wait()
+            rec.nack_event.clear()
+            seq = rec.nack_seq
+            if seq is not None and _ble_client is not None:
+                nack_msg = f"NACK:{seq}\n".encode()
+                try:
+                    await _ble_client.write_gatt_char(NUS_RX_CHAR_UUID,
+                                                      nack_msg,
+                                                      response=False)
+                    print(f"\n  [NACK  ] Sent NACK for seq={seq}")
+                except Exception as e:
+                    print(f"\n  [WARN  ] Failed to send NACK: {e}")
+    except asyncio.CancelledError:
+        pass  # clean exit when recording session ends
 
 
 # ── Save helpers ──────────────────────────────────────────────────────────────
@@ -301,6 +311,10 @@ def save_wav(samples: bytearray, filename: Path) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     target = rec.expected_bytes
     if len(samples) > target:
+        # FIX [low]: Log when excess bytes are discarded so the user knows
+        # the firmware sent more data than announced in START:N.
+        excess = len(samples) - target
+        print(f"  [WARN  ] Received {excess} excess bytes — truncating to {target} B")
         samples = samples[:target]
     elif len(samples) < target:
         samples += b"\x00" * (target - len(samples))
@@ -340,7 +354,7 @@ async def find_device():
 
     # Pass 2: NUS service UUID (Windows may not resolve name on first scan)
     for device, adv in results.values():
-        service_uuids = [u.lower() for u in (adv.service_uuids or [])]
+        service_uuids = [u.lower() for u in (adv.service_uids or [])]
         if NUS_SERVICE_UUID in service_uuids:
             print(f"  Found via NUS UUID: [{device.address}]  "
                   f"name={device.name!r}  RSSI={adv.rssi}")
@@ -372,7 +386,11 @@ async def _async_input(prompt: str) -> str:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def run():
-    global _ble_client
+    global _ble_client, _loop
+
+    # FIX [high]: Capture the running loop here so the Bleak notification
+    # callback thread can use it safely without calling get_event_loop().
+    _loop = asyncio.get_running_loop()
 
     device = await find_device()
     if device is None:
@@ -449,6 +467,11 @@ async def run():
                     print("\n  [WARN  ] Timeout — saving whatever was received.")
 
                 nack_task.cancel()
+                # Allow the cancelled task to finish cleanly
+                try:
+                    await nack_task
+                except asyncio.CancelledError:
+                    pass
 
                 ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
                 suffix  = "_DEGRADED" if rec.audio_degraded else ""
@@ -489,6 +512,7 @@ async def run():
             print("\nInterrupted.")
         finally:
             _ble_client = None
+            _loop = None
             try:
                 await client.stop_notify(NUS_TX_CHAR_UUID)
             except Exception:

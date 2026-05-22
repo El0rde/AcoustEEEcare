@@ -246,8 +246,8 @@ def _handle_audio_chunk(data: bytearray):
 
 
     
-    print(f"  [DEBUG ] seq={seq} ln={ln} rx_crc=0x{rx_crc:04X} "
-      f"calc_0000=0x{_crc16_firmware(payload):04X}")
+    # print(f"  [DEBUG ] seq={seq} ln={ln} rx_crc=0x{rx_crc:04X} "
+    #   f"calc_0000=0x{_crc16_firmware(payload):04X}")
     
 
     rec.audio_samples += payload

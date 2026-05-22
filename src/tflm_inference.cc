@@ -371,6 +371,60 @@ static int run_inference(const uint8_t *model_data,
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * RAM-based inference runner — MFCC already int8-quantized in RAM.
+ * Same as run_inference() but step 6 is a memcpy instead of SD read.
+ * ══════════════════════════════════════════════════════════════════ */
+static int run_inference_ram(const uint8_t *model_data, const char *model_name,
+                             uint8_t *arena, size_t arena_bytes,
+                             const int8_t *features, int n_frames, int n_mfcc,
+                             int exp_frames, int exp_mfcc, float *out_value)
+{
+    if (n_mfcc != exp_mfcc || n_frames != exp_frames) {
+        LOG_ERR("%s: shape mismatch fw=[%d,%d] model=[%d,%d]",
+                model_name, n_frames, n_mfcc, exp_frames, exp_mfcc);
+        return -EINVAL;
+    }
+    const tflite::Model *model = tflite::GetModel(model_data);
+    if (model->version() != TFLITE_SCHEMA_VERSION) return -EINVAL;
+
+    tflite::MicroMutableOpResolver<8> resolver;
+    if (resolver.AddConv2D()         != kTfLiteOk ||
+        resolver.AddMaxPool2D()      != kTfLiteOk ||
+        resolver.AddMean()           != kTfLiteOk ||
+        resolver.AddFullyConnected() != kTfLiteOk) return -ENOTSUP;
+
+    tflite::MicroInterpreter interpreter(model, resolver, arena, arena_bytes);
+    if (interpreter.AllocateTensors() != kTfLiteOk) {
+        LOG_ERR("%s: AllocateTensors failed (arena=%u)", model_name,
+                (unsigned)arena_bytes);
+        return -ENOMEM;
+    }
+    g_tflm_arena_used_bytes = (uint32_t)interpreter.arena_used_bytes();
+
+    TfLiteTensor *input = interpreter.input(0);
+    if (input == nullptr || input->type != kTfLiteInt8) return -EINVAL;
+    const size_t need = (size_t)n_frames * (size_t)n_mfcc;
+    if (input->bytes != need) {
+        LOG_ERR("%s: input bytes %u != %u", model_name,
+                (unsigned)input->bytes, (unsigned)need);
+        return -EINVAL;
+    }
+
+    /* Features already int8-quantized with model scale/zp -> copy in. */
+    memcpy(input->data.int8, features, need);
+
+    int64_t t0 = k_uptime_get();
+    if (interpreter.Invoke() != kTfLiteOk) return -EIO;
+    LOG_INF("%s: inference done in %lld ms", model_name, k_uptime_delta(&t0));
+
+    TfLiteTensor *output = interpreter.output(0);
+    if (output == nullptr) return -EINVAL;
+    *out_value = dequantize_output_scalar(output);
+    LOG_INF("%s: output dequantized = %.3f", model_name, (double)*out_value);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * Public API — heart
  * ══════════════════════════════════════════════════════════════════ */
 extern "C"
@@ -448,4 +502,32 @@ void run_lung_inference(uint8_t      *arena,
     result->rc = -ENOTSUP;
     LOG_INF("lung inference skipped (ENABLE_LUNG_MODEL=0)");
 #endif
+}
+/* ══════════════════════════════════════════════════════════════════
+ * Public API — RAM-input wrappers (no SD, features pre-quantized)
+ * ══════════════════════════════════════════════════════════════════ */
+extern "C"
+void run_heart_inference_ram(uint8_t *arena, size_t arena_bytes,
+                             const int8_t *features, int n_frames, int n_mfcc,
+                             heart_result_t *result)
+{
+    memset(result, 0, sizeof(*result));
+    result->class_idx = -1; result->confidence = 1.0f;
+    result->rc = run_inference_ram(g_heart_model_data, "heart",
+                                   arena, arena_bytes, features, n_frames, n_mfcc,
+                                   HEART_EXPECTED_FRAMES, HEART_EXPECTED_N_MFCC,
+                                   &result->value);
+}
+
+extern "C"
+void run_lung_inference_ram(uint8_t *arena, size_t arena_bytes,
+                            const int8_t *features, int n_frames, int n_mfcc,
+                            lung_result_t *result)
+{
+    memset(result, 0, sizeof(*result));
+    result->class_idx = -1; result->confidence = 1.0f;
+    result->rc = run_inference_ram(g_lung_model_data, "lung",
+                                   arena, arena_bytes, features, n_frames, n_mfcc,
+                                   LUNG_EXPECTED_FRAMES, LUNG_EXPECTED_N_MFCC,
+                                   &result->value);
 }

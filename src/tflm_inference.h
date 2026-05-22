@@ -98,6 +98,16 @@ void run_lung_inference(uint8_t      *arena,
                         int           n_mfcc,
                         lung_result_t *result);
 
+/* Inference from an in-RAM, already-int8-quantized MFCC buffer (no SD).
+ * features = n_frames*n_mfcc int8 values, row-major [frame][mfcc],
+ * quantized with the model's input scale/zero_point. */
+void run_heart_inference_ram(uint8_t *arena, size_t arena_bytes,
+                             const int8_t *features, int n_frames, int n_mfcc,
+                             heart_result_t *result);
+void run_lung_inference_ram(uint8_t *arena, size_t arena_bytes,
+                            const int8_t *features, int n_frames, int n_mfcc,
+                            lung_result_t *result);
+
 #ifdef __cplusplus
 }
 #endif

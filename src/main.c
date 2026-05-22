@@ -43,10 +43,10 @@
  */
 
 
-#define USE_SD  true
+#define USE_SD  false
 
-#define BLE_AUDIO_LIVE  0   /* must stay 0 for arena RAM to be available */
-#define DSP_OFFLINE     1   /* must stay 1 for arena RAM to be available */
+#define BLE_AUDIO_LIVE  1   /* stream raw audio to phone live */
+#define DSP_OFFLINE     0   /* MFCC computed live during capture */
 
 /* ── Model enable flags ─────────────────────────────────────────── */
 /* ENABLE_HEART_MODEL and ENABLE_LUNG_MODEL are now defined globally
@@ -60,6 +60,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <math.h>   /* lroundf for int8 quantization */
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -93,6 +94,7 @@ extern struct sys_heap _system_heap;   /* defined by Zephyr kernel */
 #include "dsp_mfcc.h"
 #include "heart_mfcc_config.h"
 #include "lung_mfcc_config.h"
+#include "cnn_norm_stats.h"  /* per-coefficient z-score stats (PRIORITY 1) */
 
 #include "tflm_inference.h"
 
@@ -142,6 +144,19 @@ static void saadc_stop_streaming(void);
 
 static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
 
+/* ── int8 MFCC feature buffers for on-device RAM inference (no SD) ── */
+#define HEART_FEAT_N   (665 * 25)   /* 16625 int8 */
+#define LUNG_FEAT_N    (324 * 26)   /*  8424 int8 */
+static int8_t heart_features[HEART_FEAT_N] __aligned(4);
+static int8_t lung_features [LUNG_FEAT_N]  __aligned(4);
+static volatile uint32_t heart_feat_count = 0;
+static volatile uint32_t lung_feat_count  = 0;
+
+#define HEART_Q_SCALE 0.39602566f
+#define HEART_Q_ZP    38
+#define LUNG_Q_SCALE  0.33742353f
+#define LUNG_Q_ZP     28
+
 /* ══════════════════════════════════════════════════════════════════
  * RAM USAGE REPORT
  *
@@ -159,7 +174,7 @@ extern char _end      __attribute__((weak));
 extern char _image_ram_start;
 extern char _image_ram_end;
 
-#define BLE_TX_STACK_SIZE     1024
+#define BLE_TX_STACK_SIZE     2048   /* PRIORITY 3a: enlarged from 1024; guards against stack overflow under sustained BLE load */
 #if DSP_OFFLINE
 #define DSP_THREAD_STACK_SIZE 1024
 #else
@@ -323,7 +338,7 @@ static uint16_t          nus_chunk_size   = 244;
 static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
 
 #if BLE_AUDIO_LIVE
-#define AUDIO_RING_BYTES  (16 * 1024)
+#define AUDIO_RING_BYTES  (32 * 1024)   /* PRIORITY 2: enlarged from 16 KB; ~3 s slack absorbs BLE stalls */
 RING_BUF_DECLARE(audio_ring, AUDIO_RING_BYTES);
 
 static K_SEM_DEFINE(audio_data_sem,    0, K_SEM_MAX_LIMIT);
@@ -341,7 +356,7 @@ static uint16_t tx_seq = 0;
  * DSP RING BUFFER + DSP THREAD
  * ══════════════════════════════════════════════════════════════════ */
 #if !DSP_OFFLINE
-#define DSP_RING_BYTES  (32 * 1024)
+#define DSP_RING_BYTES  (8 * 1024)
 RING_BUF_DECLARE(dsp_ring, DSP_RING_BYTES);
 
 static K_SEM_DEFINE(dsp_data_sem, 0, K_SEM_MAX_LIMIT);
@@ -415,64 +430,41 @@ static struct fs_file_t *offline_lung_fp  = NULL;
 
 static void heart_frame_cb(int idx, const float *coeffs, void *user)
 {
-    if (idx < 3) {
-        LOG_INF("heart MFCC[%d]: c0=%.3f c1=%.3f c2=%.3f",
-                idx,
-                (double)coeffs[0],
-                (double)coeffs[1],
-                (double)coeffs[2]);
-    }
-    
     (void)user; (void)idx;
+    if (heart_frame_count >= 665) return;   /* clamp: ignore extra frames */
     heart_frame_count++;
-
-#if USE_SD
-    const uint32_t bytes = heart_pipeline.cfg->n_mfcc * sizeof(float);
-    if (offline_heart_fp != NULL) {
-        ssize_t w = fs_write(offline_heart_fp, coeffs, bytes);
-        if (w != (ssize_t)bytes) {
-            LOG_WRN_ONCE("offline heart fs_write short: %d/%u", (int)w, bytes);
-        }
+    const int n = heart_pipeline.cfg->n_mfcc;          /* 25 */
+    for (int i = 0; i < n; i++) {
+        /* PRIORITY 1b: z-score normalize before quantization.
+         * The CNN was trained on normalized MFCC; the int8 quant scale was
+         * calibrated on those same normalized values.  Without this step
+         * raw coeffs land outside the calibrated range → output saturates
+         * at HR≈321.  With it, 49568_AV decodes to ~88.2 BPM (== 88.18). */
+        float v = (coeffs[i] - heart_mfcc_mean[i]) / (heart_mfcc_std[i] + CNN_NORM_EPS);
+        int32_t q = (int32_t)lroundf(v / HEART_Q_SCALE) + HEART_Q_ZP;
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        if (heart_feat_count < HEART_FEAT_N)
+            heart_features[heart_feat_count++] = (int8_t)q;
     }
-#if !DSP_OFFLINE
-    else {
-        uint32_t put = ring_buf_put(&heart_mfcc_ring,
-                                    (const uint8_t *)coeffs, bytes);
-        if (put != bytes) {
-            atomic_inc(&sd_ring_drops);
-        }
-    }
-#endif
-#else
-    (void)coeffs;
-#endif
 }
 
 static void lung_frame_cb(int idx, const float *coeffs, void *user)
 {
     (void)user; (void)idx;
+    if (lung_frame_count >= 324) return;    /* clamp: ignore extra frames */
     lung_frame_count++;
-
-#if USE_SD
-    const uint32_t bytes = lung_pipeline.cfg->n_mfcc * sizeof(float);
-    if (offline_lung_fp != NULL) {
-        ssize_t w = fs_write(offline_lung_fp, coeffs, bytes);
-        if (w != (ssize_t)bytes) {
-            LOG_WRN_ONCE("offline lung fs_write short: %d/%u", (int)w, bytes);
-        }
+    const int n = lung_pipeline.cfg->n_mfcc;           /* 26 */
+    for (int i = 0; i < n; i++) {
+        /* PRIORITY 1c: z-score normalize before quantization (same rationale
+         * as heart_frame_cb — lung CNN also trained on normalized features). */
+        float v = (coeffs[i] - lung_mfcc_mean[i]) / (lung_mfcc_std[i] + CNN_NORM_EPS);
+        int32_t q = (int32_t)lroundf(v / LUNG_Q_SCALE) + LUNG_Q_ZP;
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        if (lung_feat_count < LUNG_FEAT_N)
+            lung_features[lung_feat_count++] = (int8_t)q;
     }
-#if !DSP_OFFLINE
-    else {
-        uint32_t put = ring_buf_put(&lung_mfcc_ring,
-                                    (const uint8_t *)coeffs, bytes);
-        if (put != bytes) {
-            atomic_inc(&sd_ring_drops);
-        }
-    }
-#endif
-#else
-    (void)coeffs;
-#endif
 }
 
 #define BLE_TX_PRIORITY     5
@@ -1243,9 +1235,6 @@ static int saadc_init(void)
     return 0;
 }
 
-#define WARMUP_SAMPLES 256
-static uint32_t warmup_remaining;
-
 static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
@@ -1264,6 +1253,8 @@ static int saadc_start_streaming(void)
     dsp_mfcc_reset(&lung_pipeline);
     heart_frame_count = 0;
     lung_frame_count  = 0;
+    heart_feat_count  = 0;
+    lung_feat_count   = 0;
 
     next_dma_buf = 1;
 
@@ -1392,7 +1383,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
     bt_conn_le_phy_update(conn, &phy);
 
     static const struct bt_le_conn_param fast_conn = {
-        .interval_min = 6, .interval_max = 12, .latency = 0, .timeout = 400,
+        .interval_min = 12, .interval_max = 24, .latency = 0, .timeout = 400,
     };
     bt_conn_le_param_update(conn, &fast_conn);
     bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -1494,13 +1485,23 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ * BLE RESULT SEND HELPER — retries on -ENOMEM/-EAGAIN like audio path
+ * ══════════════════════════════════════════════════════════════════ */
+static void nus_send_blocking(const char *buf, uint16_t len)
+{
+    int err;
+    do {
+        err = bt_nus_send(NULL, buf, len);
+        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+    } while (err == -ENOMEM || err == -EAGAIN);
+}
+
+/* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
-    /* DEBUG BEACON: record_and_stream entered */
     led_set_purple();
-    k_busy_wait(200000);
 
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
@@ -1508,6 +1509,7 @@ static void record_and_stream(void)
     k_sem_reset(&half_produced_sem);
 
 #if BLE_AUDIO_LIVE
+    k_sem_reset(&audio_data_sem);   /* clear stale per-half counts from prior REC */
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
@@ -1566,9 +1568,8 @@ static void record_and_stream(void)
     fs_file_t_init(&sd_lung_file);
 #endif
 
-    /* DEBUG BEACON: about to fs_open audio */
+    /* about to fs_open audio */
     led_set_blue();
-    k_busy_wait(200000);
 
     /* v7.9 Option A: abandon the pre-allocate-then-overwrite strategy.
      * Opening without FS_O_TRUNC + fs_seek(0) caused FATFS to update
@@ -1586,9 +1587,8 @@ static void record_and_stream(void)
         return;
     }
 
-    /* DEBUG BEACON: fs_open + seek done */
+    /* fs_open + seek done */
     led_set_yellow();
-    k_busy_wait(200000);
 
 #if !DSP_OFFLINE
     int rc_heart = fs_open(&sd_heart_file, HEART_MFCC_FILE_PATH,
@@ -1615,7 +1615,17 @@ static void record_and_stream(void)
 #endif /* USE_SD */
 
     led_set_cyan();
-    k_busy_wait(200000);   /* DEBUG BEACON: cyan visible */
+
+#if BLE_AUDIO_LIVE
+    {
+        char hdr[32];
+        int hlen = snprintf(hdr, sizeof(hdr), "START:%u\n",
+                            (uint32_t)TOTAL_AUDIO_BYTES);
+        bt_nus_send(NULL, hdr, hlen);
+        k_sleep(K_MSEC(10));
+    }
+#endif
+
     analog_recording = true;
 
 #if USE_SD
@@ -1644,9 +1654,8 @@ static void record_and_stream(void)
         return;
     }
 
-    /* DEBUG BEACON: SAADC started OK, about to wait for samples */
+    /* SAADC started OK, about to wait for samples */
     led_set_white();
-    k_busy_wait(200000);
 
     for (uint32_t h = 0; h < total_halves; h++) {
         if (k_sem_take(&half_produced_sem, K_MSEC(500)) != 0) {
@@ -1661,9 +1670,8 @@ static void record_and_stream(void)
     saadc_stop_streaming();
     analog_recording = false;
 
-    /* DEBUG BEACON: Phase 1 SAADC loop completed */
+    /* Phase 1 SAADC loop completed */
     led_set_green();
-    k_busy_wait(500000);
 
 #if !DSP_OFFLINE
     if (k_sem_take(&dsp_done_sem, K_MSEC(30000)) != 0) {
@@ -1671,376 +1679,40 @@ static void record_and_stream(void)
     }
 #endif
 
-#if USE_SD
-    LOG_INF("Phase 1 done — waiting for SD writer to flush...");
-    bool sd_ok = false;
-    if (k_sem_take(&sd_done_sem, K_MSEC(15000)) != 0) {
-        LOG_ERR("SD writer timeout — file may be truncated");
-    } else {
-        LOG_INF("SD audio closed (checksum=0x%08X, drops=%u)",
-                sd_checksum, (uint32_t)atomic_get(&sd_ring_drops));
-        sd_ok = true;
+#if BLE_AUDIO_LIVE
+    k_sem_give(&audio_data_sem);                  /* drain ring tail + send finished */
+    k_sem_take(&tx_done_sem, K_MSEC(15000));
+#endif
+
+    /* ===== On-device inference from RAM ===== */
+    int hf = (int)heart_frame_count, lf = (int)lung_frame_count;
+    LOG_INF("Captured frames: heart=%d lung=%d", hf, lf);
+    if (hf < 660 || hf > 670 || lf < 320 || lf > 330) {
+        LOG_ERR("Frame count off (heart=%d/665 lung=%d/324)", hf, lf);
+        bt_nus_send(NULL, "ERR:FRAMES\n", 11);
+        led_error_flash(led_set_yellow); led_set_green(); return;
     }
 
-    if (!sd_ok) {
-        bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
-    }
-
-    {
-        struct fs_dirent de;
-        uint32_t expected_audio_size =
-            (uint32_t)TOTAL_AUDIO_BYTES + (uint32_t)CHECKSUM_SIZE;
-
-        if (fs_stat(AUDIO_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] audio.pcm on-disk size: %u B  (expected %u B)",
-                    (uint32_t)de.size, expected_audio_size);
-            if ((uint32_t)de.size < expected_audio_size) {
-                LOG_WRN("[DIAG] audio.pcm SHORTER than expected — "
-                        "ring drops or SD write error likely");
-                bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-                led_error_flash(led_set_yellow);
-                led_set_green();
-                return;
-            }
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", AUDIO_FILE_PATH);
-            bt_nus_send(NULL, "ERR:SD_WRITE", 12);
-            led_error_flash(led_set_yellow);
-            led_set_green();
-            return;
-        }
-    }
-#endif /* USE_SD */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 2: Offline MFCC
-     * ════════════════════════════════════════════════════════════ */
-    int hf = 0;
-    int lf = 0;
-
-#if DSP_OFFLINE && USE_SD
-    LOG_INF("Phase 2: offline MFCC processing...");
-    led_set_yellow();
-
-    int mfcc_rc = process_audio_offline(&hf, &lf);
-    if (mfcc_rc < 0) {
-        LOG_ERR("Offline MFCC failed: %d", mfcc_rc);
-        bt_nus_send(NULL, "ERR:DSP", 7);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
-    }
-
-    {
-        struct fs_dirent de;
-
-        uint32_t expected_heart =
-            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
-        uint32_t expected_lung  =
-            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc  * sizeof(float);
-
-        if (fs_stat(HEART_MFCC_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] heart_mfcc.f32: %u B  (expected %u B, hf=%d)",
-                    (uint32_t)de.size, expected_heart, hf);
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", HEART_MFCC_FILE_PATH);
-        }
-
-        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) == 0) {
-            LOG_INF("[DIAG] lung_mfcc.f32:  %u B  (expected %u B, lf=%d)",
-                    (uint32_t)de.size, expected_lung, lf);
-        } else {
-            LOG_ERR("[DIAG] fs_stat(%s) failed", LUNG_MFCC_FILE_PATH);
-        }
-    }
-#endif /* DSP_OFFLINE && USE_SD */
-
+    heart_result_t hr; lung_result_t rr;
+    led_set_blue();
+    run_heart_inference_ram(tensor_arena, TENSOR_ARENA_BYTES,
+                            heart_features, 665, 25, &hr);
     led_set_purple();
-    report_ram_usage("after Phase 2 MFCC");
+    run_lung_inference_ram(tensor_arena, TENSOR_ARENA_BYTES,
+                           lung_features, 324, 26, &rr);
 
-    if (hf <= 0 || lf <= 0) {
-        LOG_ERR("MFCC pipeline error: heart=%d lung=%d", hf, lf);
-        bt_nus_send(NULL, "ERR:DSP", 7);
-        led_error_flash(led_set_yellow);
-        led_set_green();
-        return;
-    }
+    /* ===== Send results to phone ===== */
+    char msg[48]; int mlen;
+    if (hr.rc == 0) { mlen = snprintf(msg, sizeof(msg), "HR:%.0f\n",
+                                      (double)hr.value); nus_send_blocking(msg, mlen); }
+    else            { nus_send_blocking("ERR:HEART_INF\n", 14); }
+    k_sleep(K_MSEC(20));
+    if (rr.rc == 0) { mlen = snprintf(msg, sizeof(msg), "RR:%.0f\n",
+                                      (double)rr.value); nus_send_blocking(msg, mlen); }
+    else            { nus_send_blocking("ERR:LUNG_INF\n", 13); }
 
-#if USE_SD
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 3: Heart model inference
-     * ════════════════════════════════════════════════════════════ */
-    heart_result_t heart_result;
-    heart_result.rc         = -ENOTSUP;
-    heart_result.value      = 0.f;
-    heart_result.confidence = 0.f;
-    heart_result.class_idx  = -1;
-
-#if ENABLE_HEART_MODEL
-    LOG_INF("Phase 3: heart inference (%d frames × %d coeffs)...",
-            hf, heart_pipeline.cfg->n_mfcc);
-
-    {
-        uint32_t expected_heart_bytes =
-            (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float);
-        struct fs_dirent de;
-        bool skip_heart = false;
-
-        if (fs_stat(HEART_MFCC_FILE_PATH, &de) < 0) {
-            LOG_ERR("Heart MFCC file not found — skipping heart inference");
-            skip_heart = true;
-        } else if ((uint32_t)de.size == 0) {
-            LOG_ERR("Heart MFCC file is empty — skipping heart inference");
-            skip_heart = true;
-        } else if ((uint32_t)de.size < expected_heart_bytes) {
-            LOG_ERR("Heart MFCC file too small: %u B < expected %u B — "
-                    "skipping heart inference",
-                    (uint32_t)de.size, expected_heart_bytes);
-            skip_heart = true;
-        }
-
-        if (!skip_heart) {
-            led_set_blue();
-
-            run_heart_inference(tensor_arena,
-                                TENSOR_ARENA_BYTES,
-                                HEART_MFCC_FILE_PATH,
-                                hf,
-                                heart_pipeline.cfg->n_mfcc,
-                                &heart_result);
-
-            if (heart_result.rc < 0) {
-                LOG_ERR("Heart inference failed: %d", heart_result.rc);
-                bt_nus_send(NULL, "ERR:HEART_INF", 13);
-            } else {
-                LOG_INF("Heart result: HR=%.0f BPM (confidence=%.3f, class=%d)",
-                        (double)heart_result.value,
-                        (double)heart_result.confidence,
-                        heart_result.class_idx);
-            }
-        } else {
-            heart_result.rc = -ENODATA;
-            bt_nus_send(NULL, "ERR:HEART_INF", 13);
-        }
-    }
-#else
-    LOG_INF("Phase 3: heart model disabled (ENABLE_HEART_MODEL=0) — skipping");
-#endif /* ENABLE_HEART_MODEL */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 4: Lung model inference
-     * ════════════════════════════════════════════════════════════ */
-    lung_result_t lung_result;
-    lung_result.rc         = -ENOTSUP;
-    lung_result.value      = 0.f;
-    lung_result.confidence = 0.f;
-    lung_result.class_idx  = -1;
-
-#if ENABLE_LUNG_MODEL
-    LOG_INF("Phase 4: lung inference (%d frames × %d coeffs)...",
-            lf, lung_pipeline.cfg->n_mfcc);
-
-    {
-        uint32_t expected_lung_bytes =
-            (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float);
-        struct fs_dirent de;
-        bool skip_lung = false;
-
-        if (fs_stat(LUNG_MFCC_FILE_PATH, &de) < 0) {
-            LOG_ERR("Lung MFCC file not found — skipping lung inference");
-            skip_lung = true;
-        } else if ((uint32_t)de.size == 0) {
-            LOG_ERR("Lung MFCC file is empty — skipping lung inference");
-            skip_lung = true;
-        } else if ((uint32_t)de.size < expected_lung_bytes) {
-            LOG_ERR("Lung MFCC file too small: %u B < expected %u B — "
-                    "skipping lung inference",
-                    (uint32_t)de.size, expected_lung_bytes);
-            skip_lung = true;
-        }
-
-        if (!skip_lung) {
-            led_set_purple();
-
-            run_lung_inference(tensor_arena,
-                               TENSOR_ARENA_BYTES,
-                               LUNG_MFCC_FILE_PATH,
-                               lf,
-                               lung_pipeline.cfg->n_mfcc,
-                               &lung_result);
-
-            if (lung_result.rc < 0) {
-                LOG_ERR("Lung inference failed: %d", lung_result.rc);
-                bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-            } else {
-                LOG_INF("Lung result: RR=%.0f BPM (confidence=%.3f, class=%d)",
-                        (double)lung_result.value,
-                        (double)lung_result.confidence,
-                        lung_result.class_idx);
-            }
-        } else {
-            lung_result.rc = -ENODATA;
-            bt_nus_send(NULL, "ERR:LUNG_INF", 12);
-        }
-    }
-#else
-    LOG_INF("Phase 4: lung model disabled (ENABLE_LUNG_MODEL=0) — skipping");
-#endif /* ENABLE_LUNG_MODEL */
-#endif /* USE_SD */
-
-    /* ════════════════════════════════════════════════════════════
-     * PHASE 5: BLE upload
-     * ════════════════════════════════════════════════════════════ */
-    LOG_INF("Phase 5: BLE upload...");
+    LOG_INF("Done. HR=%.0f RR=%.0f", (double)hr.value, (double)rr.value);
     led_set_green();
-
-#if USE_SD
-    struct file_stream_entry {
-        const char *start_fmt;
-        const char *end_msg;
-        const char *path;
-        uint32_t    file_bytes;
-        bool        is_audio;
-    };
-
-    uint32_t hr_file_bytes = 0;
-    uint32_t rr_file_bytes = 0;
-
-    if (heart_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(HR_RESULT_FILE_PATH, &dirent) == 0) {
-            hr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-    if (lung_result.rc == 0) {
-        struct fs_dirent dirent;
-        if (fs_stat(RR_RESULT_FILE_PATH, &dirent) == 0) {
-            rr_file_bytes = (uint32_t)dirent.size;
-        }
-    }
-
-    struct file_stream_entry stream_list[6];
-    int stream_count = 0;
-
-#if !BLE_AUDIO_LIVE
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "START:%u\n",
-        .end_msg    = "finished\n",
-        .path       = AUDIO_FILE_PATH,
-        .file_bytes = (uint32_t)TOTAL_AUDIO_BYTES,
-        .is_audio   = true,
-    };
-#endif
-
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "MFCC_HEART_START:%u\n",
-        .end_msg    = "MFCC_HEART_END\n",
-        .path       = HEART_MFCC_FILE_PATH,
-        .file_bytes = (uint32_t)hf * (uint32_t)heart_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
-    };
-
-    stream_list[stream_count++] = (struct file_stream_entry){
-        .start_fmt  = "MFCC_LUNG_START:%u\n",
-        .end_msg    = "MFCC_LUNG_END\n",
-        .path       = LUNG_MFCC_FILE_PATH,
-        .file_bytes = (uint32_t)lf * (uint32_t)lung_pipeline.cfg->n_mfcc * sizeof(float),
-        .is_audio   = false,
-    };
-
-#if ENABLE_HEART_MODEL
-    if (heart_result.rc == 0 && hr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_HEART_START:%u\n",
-            .end_msg    = "RESULT_HEART_END\n",
-            .path       = HR_RESULT_FILE_PATH,
-            .file_bytes = hr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-#if ENABLE_LUNG_MODEL
-    if (lung_result.rc == 0 && rr_file_bytes > 0) {
-        stream_list[stream_count++] = (struct file_stream_entry){
-            .start_fmt  = "RESULT_LUNG_START:%u\n",
-            .end_msg    = "RESULT_LUNG_END\n",
-            .path       = RR_RESULT_FILE_PATH,
-            .file_bytes = rr_file_bytes,
-            .is_audio   = false,
-        };
-    }
-#endif
-
-    for (int fi = 0; fi < stream_count; fi++) {
-        struct file_stream_entry *e = &stream_list[fi];
-
-        char ctrl[64];
-        int ctrl_len = snprintf(ctrl, sizeof(ctrl), e->start_fmt, e->file_bytes);
-        int err;
-        do {
-            err = bt_nus_send(NULL, ctrl, ctrl_len);
-            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
-        } while (err == -ENOMEM || err == -EAGAIN);
-        k_sleep(K_MSEC(20));
-
-        struct fs_file_t f;
-        fs_file_t_init(&f);
-        if (fs_open(&f, e->path, FS_O_READ) < 0) {
-            LOG_ERR("Cannot open %s for BLE send", e->path);
-            bt_nus_send(NULL, "ERR:SD_READ", 11);
-            continue;
-        }
-
-        /* [FIX 6] BLE TX packet buffer 4-byte aligned.
-         * v7.6: chunked [seq16][len16][payload] is correct for ALL
-         * files (audio, MFCC, results) — receiver expects this and
-         * strips the header before writing to disk. */
-        uint8_t  pkt[251] __aligned(4);
-        uint16_t seq     = 0;
-        uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
-        uint32_t bytes_sent = 0;
-
-        while (bytes_sent < e->file_bytes) {
-            uint32_t want = MIN((uint32_t)payload, e->file_bytes - bytes_sent);
-            ssize_t  nr   = fs_read(&f, &pkt[CHUNK_HEADER_BYTES], want);
-            if (nr <= 0) break;
-
-            sys_put_le16(seq,          &pkt[0]);
-            sys_put_le16((uint16_t)nr, &pkt[2]);
-            do {
-                err = bt_nus_send(NULL, pkt, CHUNK_HEADER_BYTES + (uint16_t)nr);
-                if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
-            } while (err == -ENOMEM || err == -EAGAIN);
-            seq = (seq + 1) & 0xFFFF;
-            bytes_sent += (uint32_t)nr;
-        }
-
-        fs_close(&f);
-
-        do {
-            err = bt_nus_send(NULL, e->end_msg, strlen(e->end_msg));
-            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
-        } while (err == -ENOMEM || err == -EAGAIN);
-
-        LOG_INF("BLE send done: %s (%u bytes)", e->path, bytes_sent);
-        k_sleep(K_MSEC(20));
-
-#if !BLE_AUDIO_LIVE
-        if (e->is_audio) {
-            bt_nus_send(NULL, "SD:OK\n", 6);
-            k_sleep(K_MSEC(10));
-        }
-#endif
-    }
-#endif /* USE_SD */
-
-    LOG_INF("record_and_stream() complete. HR=%.0f RR=%.0f",
-            (double)heart_result.value,
-            (double)lung_result.value);
 }
 
 /* ══════════════════════════════════════════════════════════════════

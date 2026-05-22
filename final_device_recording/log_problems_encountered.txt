@@ -1,0 +1,833 @@
+PS D:\zephyrdev\AcoustEEEcare> & "C:\Users\mark louie pasturan\AppData\Local\Python\pythoncore-3.14-64\python.exe" d:/zephyrdev/AcoustEEEcare/receiver_v77.py
+Scanning for 'AcoustEEEcare' (timeout=20 s) …
+  Found: AcoustEEEcare [E0:58:73:04:C7:D3]  RSSI=-40
+Connecting to E0:58:73:04:C7:D3 …
+Connected!  MTU = 251
+Subscribed to NUS notifications.
+Firmware stream: audio -> finished -> HR:<n> -> RR:<n>
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #1  (q+ENTER = quit): 
+
+Recording #1 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][████████████████████] 100%    160064/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 24 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_001_20260521_233401.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_001_20260521_233401.txt  -> 'HR:321\nRR:24'
+
+  ── Summary #1 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  24 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #2  (q+ENTER = quit): 
+
+Recording #2 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][███████████████████░]  99%    158844/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 21 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_002_20260521_233414.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_002_20260521_233414.txt  -> 'HR:321\nRR:21'
+
+  ── Summary #2 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  21 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #3  (q+ENTER = quit): 
+
+Recording #3 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][███████████████████░]  99%    158600/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 23 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_003_20260521_233426.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_003_20260521_233426.txt  -> 'HR:321\nRR:23'
+
+  ── Summary #3 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  23 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #4  (q+ENTER = quit): 
+
+Recording #4 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][████████████████████] 100%    160308/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 22 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_004_20260521_233438.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_004_20260521_233438.txt  -> 'HR:321\nRR:22'
+
+  ── Summary #4 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  22 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #5  (q+ENTER = quit): 
+
+Recording #5 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  68%    109800/160000 B
+  [AUDIO ] finished — 110324/160000 B  chunks=453  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 23 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_005_20260521_233452.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_005_20260521_233452.txt  -> 'HR:321\nRR:23'
+
+  ── Summary #5 ──────────────────────────────
+     Audio:      110324 / 160000 B  (453 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  23 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #6  (q+ENTER = quit): 
+
+Recording #6 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  68%    110288/160000 B
+  [AUDIO ] finished — 110812/160000 B  chunks=455  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 24 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_006_20260521_233530.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_006_20260521_233530.txt  -> 'HR:321\nRR:24'
+
+  ── Summary #6 ──────────────────────────────
+     Audio:      110812 / 160000 B  (455 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  24 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #7  (q+ENTER = quit): 
+
+Recording #7 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  66%    106872/160000 B
+  [AUDIO ] finished — 109104/160000 B  chunks=448  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 20 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_007_20260521_233547.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_007_20260521_233547.txt  -> 'HR:321\nRR:20'
+
+  ── Summary #7 ──────────────────────────────
+     Audio:      109104 / 160000 B  (448 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  20 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #8  (q+ENTER = quit): 
+
+Recording #8 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  66%    106628/160000 B
+  [AUDIO ] finished — 108860/160000 B  chunks=447  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 21 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_008_20260521_233608.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_008_20260521_233608.txt  -> 'HR:321\nRR:21'
+
+  ── Summary #8 ──────────────────────────────
+     Audio:      108860 / 160000 B  (447 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  21 BrPM
+
+────────────────────────────────────────────────────
+
+[00:03:45.232,025] <inf> AcoustEEEcare: Connected
+[00:03:45.399,993] <inf> AcoustEEEcare: MTU=251 -> NUS chunk=248, payload=244
+[00:04:01.553,863] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:04:01.564,453] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:04:01.564,788] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:04:12.344,421] <inf> tflm_inference: lung: output dequantized = 22.991
+--- 6 messages dropped ---
+[00:04:12.365,631] <inf> AcoustEEEcare: Done. HR=321 RR=23
+[00:04:12.365,692] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:04:12.365,692] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:04:12.365,753] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:04:12.365,753] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:04:12.365,783] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:04:12.365,814] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:04:12.366,394] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:04:12.366,394] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:04:12.367,004] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:04:12.367,065] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:04:12.367,187] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:04:12.367,248] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:04:12.367,462] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:04:12.367,584] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:04:12.367,706] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:04:12.367,767] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:04:12.368,072] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:04:12.368,347] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:04:12.368,438] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:04:12.369,415] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:04:12.369,445] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:04:12.369,476] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:04:12.369,476] <inf> AcoustEEEcare: =========================================================
+[00:05:31.347,045] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:05:31.357,635] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:05:31.357,971] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:05:42.154,998] <inf> AcoustEEEcare: Done. HR=321 RR=23
+--- 7 messages dropped ---
+[00:05:42.155,059] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:05:42.155,059] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:05:42.155,120] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:05:42.155,120] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:05:42.155,151] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:05:42.155,181] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:05:42.155,761] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:05:42.155,761] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:05:42.156,372] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:05:42.156,433] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:05:42.156,555] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:05:42.156,616] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:05:42.156,829] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:05:42.156,951] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:05:42.157,073] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:05:42.157,135] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:05:42.157,440] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:05:42.157,714] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:05:42.157,806] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:05:42.158,782] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:05:42.158,813] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:05:42.158,843] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:05:42.158,874] <inf> AcoustEEEcare: =========================================================
+[00:07:30.254,882] <wrn> AcoustEEEcare: Disconnected (reason=19)
+[00:07:53.197,631] <inf> AcoustEEEcare: Connected
+[00:07:53.363,677] <wrn> AcoustEEEcare: MTU exchange failed (14), using default=244
+[00:07:53.363,739] <wrn> AcoustEEEcare: Disconnected (reason=36)
+[00:07:54.288,665] <inf> AcoustEEEcare: Connected
+[00:07:54.450,653] <inf> AcoustEEEcare: MTU=251 -> NUS chunk=248, payload=244
+[00:08:15.009,613] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:08:15.020,202] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:08:15.020,538] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:08:25.797,698] <inf> tflm_inference: lung: output dequantized = 23.744
+--- 6 messages dropped ---
+[00:08:25.818,878] <inf> AcoustEEEcare: Done. HR=321 RR=24
+[00:08:25.818,939] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:08:25.818,939] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:08:25.819,000] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:08:25.819,000] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:08:25.819,030] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:08:25.819,061] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:08:25.819,641] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:08:25.819,671] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:08:25.820,251] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:08:25.820,312] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:08:25.820,434] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:08:25.820,526] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:08:25.820,709] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:08:25.820,831] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:08:25.820,953] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:08:25.821,014] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:08:25.821,319] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:08:25.821,594] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:08:25.821,685] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:08:25.822,662] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:08:25.822,692] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:08:25.822,723] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:08:25.822,723] <inf> AcoustEEEcare: =========================================================
+[00:08:28.825,683] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:08:28.836,273] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:08:28.836,608] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:08:39.613,372] <inf> tflm_inference: lung: output dequantized = 21.357
+--- 6 messages dropped ---
+[00:08:39.634,552] <inf> AcoustEEEcare: Done. HR=321 RR=21
+[00:08:39.634,613] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:08:39.634,613] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:08:39.634,643] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:08:39.634,674] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:08:39.634,674] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:08:39.634,735] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:08:39.635,314] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:08:39.635,314] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:08:39.635,925] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:08:39.635,986] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:08:39.636,108] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:08:39.636,169] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:08:39.636,352] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:08:39.636,505] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:08:39.636,627] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:08:39.636,688] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:08:39.636,962] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:08:39.637,237] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:08:39.637,359] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:08:39.638,336] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:08:39.638,366] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:08:39.638,366] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:08:39.638,397] <inf> AcoustEEEcare: =========================================================
+[00:08:40.839,630] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:08:40.850,250] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:08:40.850,585] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:08:51.650,085] <inf> AcoustEEEcare: Done. HR=321 RR=23
+--- 7 messages dropped ---
+[00:08:51.650,115] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:08:51.650,146] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:08:51.650,177] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:08:51.650,177] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:08:51.650,207] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:08:51.650,238] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:08:51.650,817] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:08:51.650,848] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:08:51.651,428] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:08:51.651,489] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:08:51.651,611] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:08:51.651,702] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:08:51.651,885] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:08:51.652,008] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:08:51.652,130] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:08:51.652,191] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:08:51.652,496] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:08:51.652,770] <inf> AcoustEEEcare:   logging       unused= 1433 B
+[00:08:51.652,862] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:08:51.653,869] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:08:51.653,869] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:08:51.653,900] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:08:51.653,930] <inf> AcoustEEEcare: =========================================================
+[00:08:52.755,065] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:08:52.765,686] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:08:52.766,021] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:09:03.544,586] <inf> tflm_inference: lung: output dequantized = 22.237
+--- 6 messages dropped ---
+[00:09:03.565,826] <inf> AcoustEEEcare: Done. HR=321 RR=22
+[00:09:03.565,856] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:09:03.565,887] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:09:03.565,917] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:09:03.565,917] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:09:03.565,948] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:09:03.566,009] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:09:03.566,558] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:09:03.566,589] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:09:03.567,169] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:09:03.567,230] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:09:03.567,382] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:09:03.567,443] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:09:03.567,626] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:09:03.567,749] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:09:03.567,871] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:09:03.567,932] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:09:03.568,237] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:09:03.568,511] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:09:03.568,603] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:09:03.569,580] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:09:03.569,732] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:09:03.569,732] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:09:03.569,763] <inf> AcoustEEEcare: =========================================================
+[00:09:04.370,605] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:09:04.381,195] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:09:04.381,561] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:09:14.430,267] <inf> AcoustEEEcare: SAADC stopped (overruns=0, ble_drops=101, sd_drops=0)
+[00:09:17.249,603] <inf> tflm_inference: lung: output dequantized = 22.739
+--- 5 messages dropped ---
+[00:09:17.270,812] <inf> AcoustEEEcare: Done. HR=321 RR=23
+[00:09:17.270,874] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:09:17.270,874] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:09:17.270,904] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:09:17.270,935] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:09:17.270,935] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:09:17.270,996] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:09:17.271,575] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:09:17.271,575] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:09:17.272,186] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:09:17.272,247] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:09:17.272,369] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:09:17.272,430] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:09:17.272,613] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:09:17.272,766] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:09:17.272,888] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:09:17.272,949] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:09:17.273,223] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:09:17.273,498] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:09:17.273,620] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:09:17.274,597] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:09:17.274,597] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:09:17.274,627] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:09:17.274,658] <inf> AcoustEEEcare: =========================================================
+[00:09:42.399,414] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:09:42.410,003] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:09:42.410,339] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:09:52.459,045] <inf> AcoustEEEcare: SAADC stopped (overruns=0, ble_drops=99, sd_drops=0)
+[00:09:54.948,730] <inf> tflm_inference: lung: output dequantized = 23.744
+--- 5 messages dropped ---
+[00:09:54.969,909] <inf> AcoustEEEcare: Done. HR=321 RR=24
+[00:09:54.969,970] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:09:54.969,970] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:09:54.970,001] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:09:54.970,031] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:09:54.970,062] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:09:54.970,092] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:09:54.970,672] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:09:54.970,703] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:09:54.971,282] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:09:54.971,343] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:09:54.971,466] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:09:54.971,527] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:09:54.971,740] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:09:54.971,862] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:09:54.971,984] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:09:54.972,045] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:09:54.972,351] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:09:54.972,595] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:09:54.972,686] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:09:54.973,693] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:09:54.973,693] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:09:54.973,724] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:09:54.973,754] <inf> AcoustEEEcare: =========================================================
+[00:09:59.578,308] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:09:59.588,897] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:09:59.589,233] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:10:09.638,000] <inf> AcoustEEEcare: SAADC stopped (overruns=0, ble_drops=107, sd_drops=0)
+[00:10:12.064,025] <inf> tflm_inference: lung: output dequantized = 19.850
+--- 5 messages dropped ---
+[00:10:12.085,235] <inf> AcoustEEEcare: Done. HR=321 RR=20
+[00:10:12.085,296] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:10:12.085,296] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:10:12.085,327] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:10:12.085,357] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:10:12.085,357] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:10:12.085,418] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:10:12.085,998] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:10:12.086,029] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:10:12.086,608] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:10:12.086,669] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:10:12.086,791] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:10:12.086,853] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:10:12.087,066] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:10:12.087,188] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:10:12.087,310] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:10:12.087,371] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:10:12.087,677] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:10:12.087,921] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:10:12.088,043] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:10:12.089,019] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:10:12.089,050] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:10:12.089,050] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:10:12.089,080] <inf> AcoustEEEcare: =========================================================
+[00:10:19.696,563] <inf> AcoustEEEcare: REC command — starting 10 s @ 8000 Hz
+[00:10:19.707,153] <inf> AcoustEEEcare: Phase 1: SAADC capture — 10 s @ 8000 Hz
+[00:10:19.707,489] <inf> AcoustEEEcare: SAADC streaming started @ 8000 Hz
+[00:10:29.756,256] <inf> AcoustEEEcare: SAADC stopped (overruns=0, ble_drops=102, sd_drops=0)
+[00:10:33.212,066] <inf> tflm_inference: lung: output dequantized = 20.729
+--- 5 messages dropped ---
+[00:10:33.233,306] <inf> AcoustEEEcare: Done. HR=321 RR=21
+[00:10:33.233,337] <inf> AcoustEEEcare: ================ RAM USAGE @ after REC completed ================
+[00:10:33.233,367] <inf> AcoustEEEcare: BSS region:    [0x20000d80 .. 0x20023d04)  143236 B (139 KB)
+[00:10:33.233,367] <inf> AcoustEEEcare: Image region:  [0x20000000 .. 0x20037dae)  228782 B (223 KB)
+[00:10:33.233,398] <inf> AcoustEEEcare: Tensor arena:  declared=73728 B  last_used=21620 B
+[00:10:33.233,428] <inf> AcoustEEEcare: Heap:          free=16388  alloc=0  max_alloc=0
+[00:10:33.233,489] <inf> AcoustEEEcare: BLE TX stack:  792 / 1024 B used (22% headroom)
+[00:10:33.234,039] <inf> AcoustEEEcare: DSP stack:     552 / 4096 B used (86% headroom)
+[00:10:33.234,069] <inf> AcoustEEEcare: All threads (unused stack bytes):
+[00:10:33.234,649] <inf> AcoustEEEcare:   dsp           unused= 3544 B
+[00:10:33.234,710] <inf> AcoustEEEcare:   ble_tx        unused=  232 B
+[00:10:33.234,832] <inf> AcoustEEEcare:   BT CTLR RX    unused=  608 B
+[00:10:33.234,924] <inf> AcoustEEEcare:   BT CTLR RX pri  unused=  192 B
+[00:10:33.235,107] <inf> AcoustEEEcare:   BT RX WQ      unused=  976 B
+[00:10:33.235,229] <inf> AcoustEEEcare:   bt_tx_processor  unused=  640 B
+[00:10:33.235,351] <inf> AcoustEEEcare:   usbd          unused=  528 B
+[00:10:33.235,412] <inf> AcoustEEEcare:   udc_nrfx      unused=  224 B
+[00:10:33.235,717] <inf> AcoustEEEcare:   sysworkq      unused= 1640 B
+[00:10:33.235,961] <inf> AcoustEEEcare:   logging       unused= 1432 B
+[00:10:33.236,083] <inf> AcoustEEEcare:   idle          unused=  320 B
+[00:10:33.237,060] <inf> AcoustEEEcare:   main          unused= 5944 B
+[00:10:33.237,091] <inf> AcoustEEEcare: Heart frames:  665  (expected 665)
+[00:10:33.237,091] <inf> AcoustEEEcare: Lung  frames:  324  (expected 324)
+[00:10:33.237,121] <inf> AcoustEEEcare: =========================================================
+
+PS D:\zephyrdev\AcoustEEEcare> & "C:\Users\mark louie pasturan\AppData\Local\Python\pythoncore-3.14-64\python.exe" d:/zephyrdev/AcoustEEEcare/receiver_v77.py
+Scanning for 'AcoustEEEcare' (timeout=20 s) …
+  Found: AcoustEEEcare [E0:58:73:04:C7:D3]  RSSI=-40
+Connecting to E0:58:73:04:C7:D3 …
+Connected!  MTU = 251
+Subscribed to NUS notifications.
+Firmware stream: audio -> finished -> HR:<n> -> RR:<n>
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #1  (q+ENTER = quit): 
+
+Recording #1 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][████████████████████] 100%    160064/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 24 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_001_20260521_233401.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_001_20260521_233401.txt  -> 'HR:321\nRR:24'
+
+  ── Summary #1 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  24 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #2  (q+ENTER = quit): 
+
+Recording #2 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][███████████████████░]  99%    158844/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 21 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_002_20260521_233414.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_002_20260521_233414.txt  -> 'HR:321\nRR:21'
+
+  ── Summary #2 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  21 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #3  (q+ENTER = quit): 
+
+Recording #3 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][███████████████████░]  99%    158600/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 23 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_003_20260521_233426.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_003_20260521_233426.txt  -> 'HR:321\nRR:23'
+
+  ── Summary #3 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  23 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #4  (q+ENTER = quit): 
+
+Recording #4 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][████████████████████] 100%    160308/160000 B
+  [AUDIO ] finished — 161792/160000 B  chunks=664  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 22 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_004_20260521_233438.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_004_20260521_233438.txt  -> 'HR:321\nRR:22'
+
+  ── Summary #4 ──────────────────────────────
+     Audio:      161792 / 160000 B  (664 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  22 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #5  (q+ENTER = quit): 
+
+Recording #5 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  68%    109800/160000 B
+  [AUDIO ] finished — 110324/160000 B  chunks=453  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 23 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_005_20260521_233452.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_005_20260521_233452.txt  -> 'HR:321\nRR:23'
+
+  ── Summary #5 ──────────────────────────────
+     Audio:      110324 / 160000 B  (453 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  23 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #6  (q+ENTER = quit): 
+
+Recording #6 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  68%    110288/160000 B
+  [AUDIO ] finished — 110812/160000 B  chunks=455  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 24 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_006_20260521_233530.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_006_20260521_233530.txt  -> 'HR:321\nRR:24'
+
+  ── Summary #6 ──────────────────────────────
+     Audio:      110812 / 160000 B  (455 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  24 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #7  (q+ENTER = quit): 
+
+Recording #7 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  66%    106872/160000 B
+  [AUDIO ] finished — 109104/160000 B  chunks=448  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 20 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_007_20260521_233547.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_007_20260521_233547.txt  -> 'HR:321\nRR:20'
+
+  ── Summary #7 ──────────────────────────────
+     Audio:      109104 / 160000 B  (448 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  20 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #8  (q+ENTER = quit): 
+
+Recording #8 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][█████████████░░░░░░░]  66%    106628/160000 B
+  [AUDIO ] finished — 108860/160000 B  chunks=447  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 21 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_008_20260521_233608.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_008_20260521_233608.txt  -> 'HR:321\nRR:21'
+
+  ── Summary #8 ──────────────────────────────
+     Audio:      108860 / 160000 B  (447 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  21 BrPM
+
+────────────────────────────────────────────────────
+Recording #9 — sending REC …ing #9  (q+ENTER = quit): 
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][████████████████░░░░]  83%    133468/160000 B
+  [AUDIO ] finished — 133504/160000 B  chunks=548  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 19 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_009_20260521_234015.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_009_20260521_234015.txt  -> 'HR:321\nRR:19'
+
+  ── Summary #9 ──────────────────────────────
+     Audio:      133504 / 160000 B  (548 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  19 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #10  (q+ENTER = quit): 
+
+Recording #10 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][██████████████████░░]  91%    146644/160000 B
+  [AUDIO ] finished — 149608/160000 B  chunks=614  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 21 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_010_20260521_234044.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_010_20260521_234044.txt  -> 'HR:321\nRR:21'
+
+  ── Summary #10 ──────────────────────────────
+     Audio:      149608 / 160000 B  (614 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  21 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #11  (q+ENTER = quit): 
+
+Recording #11 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][██████████████░░░░░░]  73%    118340/160000 B
+  [AUDIO ] finished — 118864/160000 B  chunks=488  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 23 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_011_20260521_234120.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_011_20260521_234120.txt  -> 'HR:321\nRR:23'
+
+  ── Summary #11 ──────────────────────────────
+     Audio:      118864 / 160000 B  (488 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  23 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #12  (q+ENTER = quit): 
+
+Recording #12 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][██████████████░░░░░░]  72%    115204/160000 B
+  [AUDIO ] finished — 115204/160000 B  chunks=473  gaps=0
+
+  [HR    ] Heart Rate  = 296 BPM
+
+  [RR    ] Resp Rate   = 20 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_012_20260521_234206.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_012_20260521_234206.txt  -> 'HR:296\nRR:20'
+
+  ── Summary #12 ──────────────────────────────
+     Audio:      115204 / 160000 B  (473 chunks, 0 gaps)
+     Heart Rate: 296 BPM
+     Resp Rate:  20 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #13  (q+ENTER = quit): 
+
+Recording #13 — sending REC …
+  Sequence: START -> audio chunks -> finished -> HR -> RR
+  Timeout: 60 s
+
+  [AUDIO ] START — expecting 160000 B (10.0 s @ 8000 Hz)
+  [AUDIO ][██████████████░░░░░░]  70%    112728/160000 B
+  [AUDIO ] finished — 113984/160000 B  chunks=468  gaps=0
+
+  [HR    ] Heart Rate  = 321 BPM
+
+  [RR    ] Resp Rate   = 28 BrPM
+
+  [DONE  ] All streams complete.
+  [SAVE  ] final_device_recording\rec_013_20260521_234302.wav  (156.3 kB, 10.00 s)
+  [SAVE  ] final_device_recording\results_013_20260521_234302.txt  -> 'HR:321\nRR:28'
+
+  ── Summary #13 ──────────────────────────────
+     Audio:      113984 / 160000 B  (468 chunks, 0 gaps)
+     Heart Rate: 321 BPM
+     Resp Rate:  28 BrPM
+
+────────────────────────────────────────────────────
+[Ready] ENTER = start recording #14  (q+ENTER = quit): 
+
+Notes:
+
+Send the first four, what is the sound after the bandpass of heart (10-200 Hz) and lungs (100-1000 Hz). Note that the audio is raw audio file
+
+Questions: 
+
+After bandpass filter, do we need to amplify the audio so that it matches the sound?
+
+What should we do.

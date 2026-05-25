@@ -344,26 +344,51 @@ def save_results(hr, rr, filename: Path) -> None:
 
 async def find_device():
     print(f"Scanning for '{DEVICE_NAME}' (timeout={SCAN_TIMEOUT:.0f} s) …")
-    results = await BleakScanner.discover(timeout=SCAN_TIMEOUT, return_adv=True)
 
-    # Pass 1: exact name match
-    for device, adv in results.values():
-        if device.name == DEVICE_NAME:
-            print(f"  Found: {device.name} [{device.address}]  RSSI={adv.rssi}")
-            return device
+    found_device  = None
+    found_adv     = None
+    stop_event    = asyncio.Event()
 
-    # Pass 2: NUS service UUID (Windows may not resolve name on first scan)
-    for device, adv in results.values():
-        service_uuids = [u.lower() for u in (adv.service_uids or [])]
-        if NUS_SERVICE_UUID in service_uuids:
-            print(f"  Found via NUS UUID: [{device.address}]  "
-                  f"name={device.name!r}  RSSI={adv.rssi}")
+    def detection_callback(device, adv):
+        nonlocal found_device, found_adv
+
+        # Pass 1: exact name match
+        name_match = device.name == DEVICE_NAME
+
+        # Pass 2: NUS service UUID fallback (Windows may not resolve name)
+        service_uuids = [u.lower() for u in (adv.service_uuids or [])]
+        uuid_match = NUS_SERVICE_UUID in service_uuids
+
+        if name_match or uuid_match:
+            found_device = device
+            found_adv    = adv
+            stop_event.set()
+
+    async with BleakScanner(detection_callback=detection_callback) as scanner:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=SCAN_TIMEOUT)
+        except asyncio.TimeoutError:
+            pass  # fall through to error handling below
+
+    if found_device is not None:
+        how = "name" if found_device.name == DEVICE_NAME else "NUS UUID"
+        print(f"  Found ({how}): {found_device.name!r} [{found_device.address}]"
+              f"  RSSI={found_adv.rssi}")
+        if found_device.name != DEVICE_NAME:
             print("  (name not resolved on this scan — connecting anyway)")
-            return device
+        return found_device
 
+    # ── Not found ─────────────────────────────────────────────────────────
     print(f"\nERROR: '{DEVICE_NAME}' not found in scan.")
-    print("Nearby devices:")
-    for device, adv in sorted(results.values(),
+    print("Nearby devices (rescan for list) …")
+    seen = {}
+    def log_callback(device, adv):
+        seen[device.address] = (device, adv)
+
+    async with BleakScanner(detection_callback=log_callback) as _:
+        await asyncio.sleep(3.0)
+
+    for device, adv in sorted(seen.values(),
                                key=lambda x: x[1].rssi or -999,
                                reverse=True):
         print(f"  RSSI={adv.rssi:4d}  {device.address}  name={device.name!r}")
@@ -371,7 +396,6 @@ async def find_device():
     print("  • Power-cycle the MCU and try again")
     print("  • Toggle Bluetooth off/on in Windows Settings")
     return None
-
 
 # ── Async input helper ────────────────────────────────────────────────────────
 

@@ -81,6 +81,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include <arm_math.h>   /* [IMP 3] CMSIS-DSP Q15 biquad filter */
 
@@ -365,7 +366,6 @@ static uint8_t  nack_buf[NACK_WINDOW][251]   __aligned(4);
 static uint16_t nack_buf_seq[NACK_WINDOW];
 static uint16_t nack_buf_len[NACK_WINDOW];
 
-static atomic_t  nack_requested;
 static uint16_t  nack_seq_pending = 0xFFFF;
 static K_MUTEX_DEFINE(nack_mutex);
 #endif /* BLE_AUDIO_LIVE */
@@ -876,9 +876,7 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
             /* [IMP 5] Build chunk: [seq16][len16][crc16][payload] */
             ring_buf_get(&audio_ring, &chunk[CHUNK_HEADER_BYTES], send_bytes);
-            uint16_t crc = crc16_ccitt(0xFFFF,
-                                       &chunk[CHUNK_HEADER_BYTES],
-                                       send_bytes);
+            uint16_t crc = crc16_ccitt(0xFFFF, &chunk[CHUNK_HEADER_BYTES], send_bytes);
             sys_put_le16(tx_seq,     &chunk[0]);
             sys_put_le16(send_bytes, &chunk[2]);
             sys_put_le16(crc,        &chunk[4]);

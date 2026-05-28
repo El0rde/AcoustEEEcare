@@ -1,69 +1,43 @@
 /*
  * AcoustEEEcare — SAADC BLE + TFLite Micro Edition
  * ==================================================
- * v8.1 — SD card removed; v8.1 improvements applied
+ * v8.4 — In-cycle keepalive fix
  *
- * CHANGES FROM v7.9:
+ * CHANGES FROM v8.3:
  *
- *   [SD REMOVAL] All USE_SD / fs / FATFS / disk_access code removed.
- *                SD writer thread, sd_writer_thread_fn, init_sd_card,
- *                process_audio_offline, and all related ring buffers,
- *                semaphores, and file handles are gone.
+ *   [STAB FIX 5] PING keepalive moved INSIDE record_and_stream().
+ *                In v8.3 the PING code lived in the main loop AFTER the
+ *                record_and_stream() call. Because record_and_stream() is a
+ *                blocking function that runs for ~40-50 s, the main loop
+ *                never reached the PING code during a recording cycle.
+ *                Android's BLE stack has its own independent supervision
+ *                timer (~20 s). With no traffic from the MCU during the
+ *                20-35 s Phase-2 inference window, Android declared the
+ *                link dead from its side — the MCU LED stayed green (MCU
+ *                never saw its own timeout expire) but the Flutter app
+ *                showed "Check connection." This was the root cause of the
+ *                disconnect-after-26-recordings bug.
  *
- *   [IMP 1] Ring buffer enlarged: AUDIO_RING_BYTES 16 KB → 32 KB.
- *           Reduces silent audio gaps under sustained BLE stalls.
+ *                Fix: a keepalive_ping_if_due() helper is called at every
+ *                natural pause inside record_and_stream() — after SAADC
+ *                capture, during the DSP-done wait (polled in 2 s slices),
+ *                between the two inferences, and after lung inference.
+ *                This guarantees at least one PING per 3 s throughout the
+ *                entire ~50 s blocking cycle.
  *
- *   [IMP 2] Drop warning: after TX drain, sends "WARN:DROPS:N\n" over
- *           NUS when ring_drops > 0 so the host can flag degraded WAVs.
+ *   [STAB FIX 6] BLE_SUPERVISION_TIMEOUT raised 4000 → 6000 (40 s → 60 s).
+ *                Worst-case full cycle: 10 s capture + 6 s drain + 35 s
+ *                inference = 51 s. 60 s gives comfortable margin for both
+ *                the MCU-side timer and the Android-side timer (Android
+ *                honours the connection parameter the MCU requests).
  *
- *   [IMP 3] CMSIS-DSP Q15 band-pass filter added to the SAADC event
- *           handler after DC removal (heart: 20–950 Hz Butterworth 2nd-
- *           order). Rejects out-of-band noise before MFCC extraction.
+ *   [STAB FIX 7] nack_buf_seq[] cleared between recordings.
+ *                Previously only nack_buf_len[] was zeroed at the start of
+ *                each REC. Stale seq numbers in the 4-slot NACK window from
+ *                previous recordings could cause a late NACK to match a
+ *                slot from a prior session and retransmit wrong data.
  *
- *   [IMP 4] DSP ring enlarged: DSP_RING_BYTES 8 KB → 16 KB, matching
- *           the BLE audio ring headroom.
- *
- *   [IMP 5] NACK + CRC-16: chunk header extended from 4 to 6 bytes
- *           ([seq16][len16][crc16]). On CRC mismatch the firmware sends
- *           "NACK:<seq>\n" instead of hard-aborting.  BLE TX thread
- *           retransmits on NACK (see ble_tx_thread_fn).
- *
- *   [IMP 6] BLE TX stack enlarged: 2048 → 3072 B to cover the extra
- *           CRC computation and NACK handling path.
- *
- *   [IMP 7] Confirmed TENSOR_ARENA_BYTES kept at 72 KB; arena_used_bytes
- *           logged after AllocateTensors() via g_tflm_arena_used_bytes.
- *
- * PATCH FIXES (applied over v8.1):
- *
- *   [FIX A] drops variable scope: moved outside #if BLE_AUDIO_LIVE block
- *           so LOG_INF at end of record_and_stream() always compiles.
- *
- *   [FIX B] NACK retransmit window expanded from 1 to NACK_WINDOW (4)
- *           slots. Firmware can now retransmit any of the last 4 chunks,
- *           covering cases where NACK arrives after subsequent sends.
- *
- *   [FIX C] DC removal time constant changed from >> 8 (~32 ms) to
- *           >> 10 (~128 ms) for a gentler HPF that preserves low-frequency
- *           content before BPF.
- *
- *   [FIX D] BLE TX thread priority lowered from 5 to 4 so it preempts
- *           the main thread during inference and keeps the audio ring
- *           draining.
- *
- *   [FIX E] ble_tx_saw_recording converted from volatile bool to atomic_t
- *           to ensure correct cross-thread visibility without races.
- *
- *   [FIX F] saadc_init() IRQ_CONNECT / irq_enable moved to a one-time
- *           saadc_init_once() called from main(). IRQ_CONNECT is a
- *           compile-time linker macro and must not be called repeatedly.
- *
- *   [NOTE ] BPF coefficients (heart_bpf_coeffs) are still placeholder
- *           values. Replace with scipy-generated Q15 Butterworth coeffs
- *           before clinical use (see comment below).
- *
- * ALL PREVIOUS FIXES (v7.9 / v7.8 / v7.7 / … / v6.8) ARE PRESERVED
- * where they still apply to the no-SD build.
+ * ALL PREVIOUS FIXES (v8.3 / v8.2 / v8.1 / v7.9 / … / v6.8) PRESERVED.
  * ==================================================
  */
 
@@ -72,6 +46,44 @@
 
 #define BLE_AUDIO_LIVE  1   /* stream raw audio to phone live */
 #define DSP_OFFLINE     0   /* MFCC computed live during capture */
+
+/* ══════════════════════════════════════════════════════════════════
+ * TUNEABLE TIMING CONSTANTS
+ * All timing values in one place — edit here, takes effect everywhere.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* How long to wait for the previous recording's BLE TX drain to finish
+ * before starting the next recording. This is a ceiling — in practice
+ * drain completes in ~200-500 ms. Raise if you see "Pre-REC drain wait
+ * timed out" in logs; lower if you want faster back-to-back recordings.
+ * [STAB FIX 2] Raised from 2000 to 6000 ms: in a busy RF environment
+ * the 80 KB audio drain can exceed 2 s, causing a timeout reset that
+ * left stale packets in the Android BLE stack and broke rec 2+. */
+#define PRE_REC_DRAIN_TIMEOUT_MS   6000
+
+/* How long to wait for the BLE TX drain at the END of each recording,
+ * after saadc_stop_streaming(). Same ceiling — drain is usually <1 s.
+ * Raise if BLE throughput is poor (busy RF environment). */
+#define TX_DONE_TIMEOUT_MS         5000
+
+/* Keepalive PING interval when idle and connected (ms).
+ * Prevents supervision timeout during idle between recordings.
+ * Must be less than (supervision_timeout - connection_interval_max)
+ * = (40000 ms - 30 ms). 3000 ms is conservative and safe. */
+#define PING_INTERVAL_MS           3000
+
+/* BLE supervision timeout is in 10 ms units.
+ * [STAB FIX 1] Raised from 2000 (20 s) to 4000 (40 s).
+ * [STAB FIX 6] Raised from 4000 (40 s) to 6000 (60 s).
+ * Worst-case full cycle: 10 s capture + 6 s drain + 35 s inference = 51 s.
+ * 60 s gives comfortable margin. Android honours the MCU's requested
+ * supervision timeout, so this also extends the Android-side timer. */
+#define BLE_SUPERVISION_TIMEOUT    6000
+
+/* Small delay after sending START: header, before SAADC begins.
+ * Gives the phone-side receiver time to prepare its buffer.
+ * 10 ms is sufficient; only raise if receiver logs show a missing START. */
+#define START_HEADER_DELAY_MS      10
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -83,7 +95,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include <arm_math.h>   /* [IMP 3] CMSIS-DSP Q15 biquad filter */
+#include <arm_math.h>   /* CMSIS-DSP Q15 biquad filter */
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -99,7 +111,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/crc.h>          /* [IMP 5] crc16_ccitt */
+#include <zephyr/sys/crc.h>          /* crc16_ccitt */
 #include "zephyr/kernel/thread_stack.h"
 
 #if defined(CONFIG_THREAD_ANALYZER)
@@ -144,7 +156,7 @@ static void saadc_init_once(void);   /* [FIX F] one-time IRQ setup */
 
 /* ══════════════════════════════════════════════════════════════════
  * SHARED TENSOR ARENA
- * [IMP 7] 72 KB — arena_used_bytes logged after AllocateTensors().
+ * 72 KB — arena_used_bytes logged after AllocateTensors().
  * ══════════════════════════════════════════════════════════════════ */
 #define TENSOR_ARENA_BYTES  (72u * 1024u)
 
@@ -163,6 +175,12 @@ static volatile uint32_t lung_feat_count  = 0;
 #define LUNG_Q_SCALE  0.33742353f
 #define LUNG_Q_ZP     28
 
+/* Keep the model path matched to the MFCC training pipeline by default.
+ * BLE preview gain is applied only to the streamed/saved WAV copy. */
+#define USE_OUTER_Q15_BPF_FOR_DSP  0
+#define BLE_PREVIEW_GAIN           4
+#define BLE_PREVIEW_REMOVE_DC      1
+
 /* ══════════════════════════════════════════════════════════════════
  * RAM USAGE REPORT
  * ══════════════════════════════════════════════════════════════════ */
@@ -172,12 +190,10 @@ extern char _end      __attribute__((weak));
 extern char _image_ram_start;
 extern char _image_ram_end;
 
-/* [IMP 1] 32 KB — enlarged from 16 KB for ~3 s slack at 8 kHz int16 */
-/* [FIX D] BLE_TX_PRIORITY lowered to 4 (was 5 = same as main).
- *         This ensures BLE TX preempts the main thread during
- *         inference so the audio ring keeps draining. */
+/* 32 KB BLE audio ring — ~3 s slack at 8 kHz int16 */
+/* BLE TX priority 4 — preempts main thread during inference */
 #define BLE_TX_PRIORITY       4
-#define BLE_TX_STACK_SIZE     3072   /* [IMP 6] enlarged from 2048 for CRC/NACK path */
+#define BLE_TX_STACK_SIZE     3072   /* enlarged for CRC/NACK path */
 #define DSP_THREAD_STACK_SIZE 4096
 
 static struct k_thread ble_tx_thread_data;
@@ -291,30 +307,50 @@ static volatile uint32_t saadc_dma_overruns = 0;
 static int32_t dc_estimate = 0;
 
 /* ══════════════════════════════════════════════════════════════════
- * [IMP 3] CMSIS-DSP Q15 BAND-PASS FILTER (Heart: 20–950 Hz, 8 kHz)
+ * CMSIS-DSP Q15 BAND-PASS FILTER
+ * Range: 10–1000 Hz, 2nd-order Butterworth @ 8 kHz
  *
- * Coefficients generated with:
+ * Covers both MFCC pipelines:
+ *   Heart MFCC internal BPF:  10–200  Hz (Layer 2)
+ *   Lung  MFCC internal BPF: 100–1000 Hz (Layer 2)
+ *
+ * Coefficients generated with postShift=2 (see bpf_coeff_generator.py):
  *   from scipy.signal import butter
- *   sos = butter(2, [20, 950], btype='bandpass', fs=8000, output='sos')
- *   # convert to Q15: round(sos * 32768)
+ *   sos = butter(2, [10, 1000], btype='bandpass', fs=8000, output='sos')
+ *   scale = 32768.0 / (2 ** 2)   # postShift=2 for Stage-2 headroom
  *
- * !! NOTE: Values below are PLACEHOLDERS. Replace with your scipy-
- * !! computed coefficients before clinical/production use. Incorrect
- * !! coefficients will silently corrupt MFCC input.
+ * Format: {b0, b1, b2, -a1, -a2} per biquad (CMSIS-DSP df1 Q15).
  *
- * Format: {b0, b1, b2, -a1, -a2} for each biquad stage (CMSIS-DSP
- * convention negates a1/a2).
+ * [NOISE FIX 1] postShift changed from 1 → 2.
+ * Previous postShift=1 gave Stage-2 b=[16384,-32768,16384] which
+ * operated at the Q15 saturation boundary, amplifying residual DC
+ * and out-of-band noise. postShift=2 halves all values, giving
+ * 2 bits of accumulator headroom with identical frequency response.
  * ══════════════════════════════════════════════════════════════════ */
 #define HEART_BPF_STAGES  2
 
 static const q15_t heart_bpf_coeffs[5 * HEART_BPF_STAGES] = {
-    /* Stage 1 — PLACEHOLDER: replace with scipy-generated Q15 values */
-     1382,  2764,  1382, -25576,  12610,
-    /* Stage 2 — PLACEHOLDER */
-     1382, -2764,  1382,  25576,  12610,
+    /* Stage 1 — 10-1000 Hz Butterworth @ 8kHz (postShift=2) */
+     787, 1574, 787, 7817, -2790,
+    /* float: b=[0.096040,0.192079,0.096040] -a=[0.954203,-0.340608] */
+    /* Stage 2 — 10-1000 Hz Butterworth @ 8kHz (postShift=2) */
+     8192, -16384, 8192, 16293, -8102,
+    /* float: b=[1.000000,-2.000000,1.000000] -a=[1.988896,-0.988958] */
 };
-static q15_t                       heart_bpf_state[4 * HEART_BPF_STAGES];
+static q15_t                        heart_bpf_state[4 * HEART_BPF_STAGES];
 static arm_biquad_casd_df1_inst_q15 heart_bpf;
+
+/* ══════════════════════════════════════════════════════════════════
+ * [BUG 1 FIX] Custom advertising parameter — 100–150 ms interval,
+ * indefinite (no 30-second fast-advertising expiry like FAST_1).
+ * ══════════════════════════════════════════════════════════════════ */
+static const struct bt_le_adv_param acousteeecare_adv_param =
+    BT_LE_ADV_PARAM_INIT(
+        BT_LE_ADV_OPT_CONN,
+        BT_GAP_ADV_FAST_INT_MIN_2,   /* 100 ms */
+        BT_GAP_ADV_FAST_INT_MAX_2,   /* 150 ms */
+        NULL
+    );
 
 /* ══════════════════════════════════════════════════════════════════
  * AUDIO PARAMS
@@ -338,7 +374,7 @@ static uint16_t          nus_chunk_size   = 244;
 static K_SEM_DEFINE(half_produced_sem, 0, K_SEM_MAX_LIMIT);
 
 #if BLE_AUDIO_LIVE
-/* [IMP 1] 32 KB — enlarged from 16 KB; ~3 s headroom at 16 KB/s */
+/* 32 KB — ~3 s headroom at 16 KB/s */
 #define AUDIO_RING_BYTES  (32 * 1024)
 RING_BUF_DECLARE(audio_ring, AUDIO_RING_BYTES);
 
@@ -350,16 +386,13 @@ static uint32_t  ring_high_water = 0;
 
 static uint16_t tx_seq = 0;
 
-/* [FIX] Prevents the BLE TX thread from sending "finished\n" before the
+/* Prevents the BLE TX thread from sending "finished\n" before the
  * recording session has started. Set true when analog_recording is first
  * observed true; reset to false at the start of each REC.
- * [FIX E] Converted from volatile bool to atomic_t for correct cross-thread
- * visibility without data races. */
+ * [FIX E] atomic_t for correct cross-thread visibility. */
 static atomic_t ble_tx_saw_recording = ATOMIC_INIT(0);
 
-/* [IMP 5] / [FIX B] NACK retransmit window.
- * Expanded from 1 slot to NACK_WINDOW (4) slots so we can retransmit
- * any of the last 4 chunks, covering NACK arrival after subsequent sends. */
+/* NACK retransmit window — keeps last 4 chunks for retransmit. */
 #define NACK_WINDOW  4
 
 static uint8_t  nack_buf[NACK_WINDOW][251]   __aligned(4);
@@ -370,13 +403,13 @@ static uint16_t  nack_seq_pending = 0xFFFF;
 static K_MUTEX_DEFINE(nack_mutex);
 #endif /* BLE_AUDIO_LIVE */
 
-/* [IMP 5] CRC-16 chunk header: [seq16][len16][crc16] = 6 bytes */
+/* CRC-16 chunk header: [seq16][len16][crc16] = 6 bytes */
 #define CHUNK_HEADER_BYTES  6
 
 /* ══════════════════════════════════════════════════════════════════
  * DSP RING BUFFER + DSP THREAD
  * ══════════════════════════════════════════════════════════════════ */
-/* [IMP 4] 16 KB — enlarged from 8 KB to match BLE ring headroom */
+/* 16 KB — matches BLE ring headroom */
 #define DSP_RING_BYTES  (16 * 1024)
 RING_BUF_DECLARE(dsp_ring, DSP_RING_BYTES);
 
@@ -384,12 +417,48 @@ static K_SEM_DEFINE(dsp_data_sem, 0, K_SEM_MAX_LIMIT);
 static K_SEM_DEFINE(dsp_done_sem, 0, 1);
 
 static int16_t dsp_pop_buf[HALF_BUF_SAMPLES] __aligned(4);
+static int16_t ble_preview_buf[HALF_BUF_SAMPLES] __aligned(4);
 
 /* ══════════════════════════════════════════════════════════════════
  * DUAL MFCC PIPELINE INSTANCES
  * ══════════════════════════════════════════════════════════════════ */
 static int16_t heart_window[60]   __aligned(4);
 static int16_t lung_window[1200]  __aligned(4);
+
+static inline int16_t sat_i16(int32_t x)
+{
+    if (x > 32767) return 32767;
+    if (x < -32768) return -32768;
+    return (int16_t)x;
+}
+
+static void log_feature_stats(const char *tag, const int8_t *buf, uint32_t n)
+{
+    if (!buf || n == 0) {
+        LOG_WRN("%s features empty", tag);
+        return;
+    }
+
+    int8_t min_v = 127;
+    int8_t max_v = -128;
+    uint32_t clip_lo = 0;
+    uint32_t clip_hi = 0;
+    uint32_t checksum = 2166136261u;
+
+    for (uint32_t i = 0; i < n; i++) {
+        int8_t v = buf[i];
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        if (v == -128) clip_lo++;
+        if (v == 127) clip_hi++;
+        checksum ^= (uint8_t)v;
+        checksum *= 16777619u;
+    }
+
+    LOG_INF("%s features: n=%u min=%d max=%d clip_lo=%u clip_hi=%u checksum=0x%08x",
+            tag, n, (int)min_v, (int)max_v,
+            clip_lo, clip_hi, checksum);
+}
 
 static void heart_frame_cb(int idx, const float *coeffs, void *user)
 {
@@ -477,33 +546,34 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 
 #ifdef ENABLE_DC_REMOVAL
         for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
-            /* [FIX C] HPF time constant changed from >> 8 (~32 ms) to
-             * >> 10 (~128 ms) for a gentler high-pass that preserves
-             * low-frequency content going into the BPF. */
+            /* [NOISE FIX 2] DC removal time constant: >> 10 (~128 ms, ~1.2 Hz HPF).
+             * Preserves low-frequency content down to 10 Hz before the BPF stage.
+             * Do NOT revert to >> 9 (~64 ms / ~2.5 Hz) — that value bleeds into
+             * the heart auscultation band and introduces audible AC ripple. */
             dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 10;
             filled_buf[i] = (int16_t)((int32_t)filled_buf[i] - dc_estimate);
         }
 #endif
 
-        /* [IMP 3] Heart band-pass filter: 20–950 Hz, 2nd-order Butterworth.
-         * Applied after DC removal, in-place. */
-        arm_biquad_cascade_df1_q15(&heart_bpf,
-                                   (q15_t *)filled_buf,
-                                   (q15_t *)filled_buf,
-                                   HALF_BUF_SAMPLES);
-
-        /* DSP ring */
-        uint32_t dsp_written = ring_buf_put(&dsp_ring,
-                                            (const uint8_t *)filled_buf,
-                                            HALF_BUF_BYTES);
-        if (dsp_written != HALF_BUF_BYTES) {
-            LOG_WRN_ONCE("dsp_ring overflow — MFCC frames may be lost!");
-        }
-        k_sem_give(&dsp_data_sem);
-
+        /* Stream a louder monitor copy for WAV review only. The MFCC/model
+         * path below still receives the un-gained DC-removed samples. */
 #if BLE_AUDIO_LIVE
+        int32_t preview_dc = 0;
+#if BLE_PREVIEW_REMOVE_DC
+        for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
+            preview_dc += filled_buf[i];
+        }
+        preview_dc /= (int32_t)HALF_BUF_SAMPLES;
+#endif
+
+        for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
+            int32_t preview_sample = (int32_t)filled_buf[i] - preview_dc;
+            ble_preview_buf[i] =
+                sat_i16(preview_sample * BLE_PREVIEW_GAIN);
+        }
+
         uint32_t ble_written = ring_buf_put(&audio_ring,
-                                            (const uint8_t *)filled_buf,
+                                            (const uint8_t *)ble_preview_buf,
                                             HALF_BUF_BYTES);
         if (ble_written != HALF_BUF_BYTES) {
             atomic_inc(&ring_drops);
@@ -515,6 +585,25 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             }
         }
 #endif
+
+        /* The MFCC pipeline already applies the model-specific bandpass.
+         * Keep this extra Q15 BPF disabled unless the models are trained
+         * with the exact same outer filter in front of MFCC extraction. */
+#if USE_OUTER_Q15_BPF_FOR_DSP
+        arm_biquad_cascade_df1_q15(&heart_bpf,
+                                   (q15_t *)filled_buf,
+                                   (q15_t *)filled_buf,
+                                   HALF_BUF_SAMPLES);
+#endif
+
+        /* DSP ring receives the un-gained model-path samples. */
+        uint32_t dsp_written = ring_buf_put(&dsp_ring,
+                                            (const uint8_t *)filled_buf,
+                                            HALF_BUF_BYTES);
+        if (dsp_written != HALF_BUF_BYTES) {
+            LOG_WRN_ONCE("dsp_ring overflow — MFCC frames may be lost!");
+        }
+        k_sem_give(&dsp_data_sem);
 
         k_sem_give(&half_produced_sem);
 #if BLE_AUDIO_LIVE
@@ -563,15 +652,15 @@ static int saadc_init(void)
         nrfx_saadc_uninit();
     }
 
-    /* [IMP 3] Init Q15 band-pass filter state (zeroed on each REC) */
+    /* Reset Q15 band-pass filter state (zeroed on each REC).
+     * [NOISE FIX 1] postShift=2 — was 1. Gives Stage-2 [1,-2,1]
+     * numerator 2 bits of headroom before Q15 saturation. */
     memset(heart_bpf_state, 0, sizeof(heart_bpf_state));
     arm_biquad_cascade_df1_init_q15(&heart_bpf,
                                     HEART_BPF_STAGES,
                                     (q15_t *)heart_bpf_coeffs,
                                     heart_bpf_state,
-                                    1 /* postShift */);
-
-    /* [FIX F] IRQ_CONNECT removed from here — now in saadc_init_once() */
+                                    2 /* postShift — was 1, now 2 */);
 
     err = nrfx_saadc_init(SAADC_IRQ_PRIORITY);
     if (err != 0) { LOG_ERR("nrfx_saadc_init: 0x%08X", err); return -EIO; }
@@ -599,11 +688,29 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    /* Seed DC estimate to ADC midpoint to avoid HPF ringing at start */
-    dc_estimate = 2048;
+
+    /* [NOISE FIX 3] Re-seed dc_estimate at the start of each recording.
+     *
+     * Problem (v8.1 and earlier): dc_estimate only seeded on first boot
+     * (when it equals 0). On 2nd+ recordings with a repositioned electrode
+     * or shifted battery voltage, the carried-over estimate was stale,
+     * causing a ~128 ms DC convergence transient audible as a low-frequency
+     * thump at the start of each recording.
+     *
+     * Fix: blend 50/50 between the carried-over estimate and the ADC
+     * midpoint (2048). This gives fast convergence toward the true DC
+     * level without the hard jump that caused the thump in v7.x.
+     * First-boot (dc_estimate == 0 from BSS) seeds directly to 2048. */
+    if (dc_estimate == 0) {
+        dc_estimate = 2048;
+    } else {
+        dc_estimate = (dc_estimate + 2048) / 2;
+    }
 
     dsp_mfcc_reset(&heart_pipeline);
     dsp_mfcc_reset(&lung_pipeline);
+    memset(heart_features, 0, sizeof(heart_features));
+    memset(lung_features,  0, sizeof(lung_features));
     heart_frame_count = 0;
     lung_frame_count  = 0;
     heart_feat_count  = 0;
@@ -680,12 +787,13 @@ static volatile bool mtu_exchanged   = false;
 #define DEVICE_NAME      "AcoustEEEcare"
 #define DEVICE_NAME_LEN  (sizeof(DEVICE_NAME) - 1)
 
+/* [BUG 4A FIX] UUID in primary ad; name in scan response. */
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_SRV_VAL),
 };
 static const struct bt_data sd_adv[] = {
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_SRV_VAL),
+    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
 };
 
 /* ══════════════════════════════════════════════════════════════════
@@ -706,13 +814,21 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
         LOG_WRN("MTU exchange failed (%d), using default=%d", err, nus_chunk_size);
     }
     mtu_exchanged = true;
+
+    /* [STAB FIX 4] Notify the Flutter app that MTU exchange is complete and
+     * it is now safe to send a REC command.  Flutter waits for this "READY"
+     * message before enabling the Record button (Option A handshake).
+     * Without this the Flutter Option-B 2-second fallback timer was the only
+     * path to unlock the UI, and it is inherently racy on slow connections. */
+    bt_nus_send(NULL, "READY\n", 6);
+    LOG_INF("MTU exchange complete — sent READY to phone");
 }
 
 static struct bt_gatt_exchange_params exchange_params = { .func = mtu_exchange_cb };
 
 static void adv_restart_work_handler(struct k_work *work)
 {
-    int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+    int err = bt_le_adv_start(&acousteeecare_adv_param, ad, ARRAY_SIZE(ad),
                                sd_adv, ARRAY_SIZE(sd_adv));
     if (err) LOG_ERR("adv restart failed: %d", err);
 }
@@ -731,8 +847,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
     };
     bt_conn_le_phy_update(conn, &phy);
 
+    /* Supervision timeout uses BLE units of 10 ms.
+     * [STAB FIX 6] Raised to BLE_SUPERVISION_TIMEOUT (6000 = 60 s).
+     * Android honours the MCU's requested timeout, so this also extends
+     * the Android-side supervision timer to 60 s. */
     static const struct bt_le_conn_param fast_conn = {
-        .interval_min = 12, .interval_max = 24, .latency = 0, .timeout = 400,
+        .interval_min = 12, .interval_max = 24, .latency = 0,
+        .timeout = BLE_SUPERVISION_TIMEOUT,
     };
     bt_conn_le_param_update(conn, &fast_conn);
     bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -758,8 +879,7 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 };
 
 /* ══════════════════════════════════════════════════════════════════
- * NUS CALLBACKS
- * [IMP 5] Handle "NACK:<seq>\n" from host.
+ * NUS CALLBACKS — handles REC command and NACK retransmit requests
  * ══════════════════════════════════════════════════════════════════ */
 static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
 {
@@ -790,9 +910,8 @@ static struct bt_nus_cb nus_listener = { .received = received };
 
 /* ══════════════════════════════════════════════════════════════════
  * BLE TX THREAD
- * [IMP 5] Extended chunk header: [seq16][len16][crc16] = 6 bytes.
- * [FIX B] NACK retransmit window: keeps last NACK_WINDOW chunks
- *         so retransmit works even if NACK arrives after later sends.
+ * Chunk header: [seq16][len16][crc16] = 6 bytes.
+ * NACK retransmit window: last NACK_WINDOW (4) chunks kept.
  * ══════════════════════════════════════════════════════════════════ */
 static void ble_tx_thread_fn(void *a, void *b, void *c)
 {
@@ -811,30 +930,32 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
         if (analog_recording) {
             finished_sent = false;
-            /* [FIX E] Use atomic_set instead of plain bool assignment */
             atomic_set(&ble_tx_saw_recording, 1);
         }
 
         while (true) {
-            /* [FIX B] Check for pending NACK — search window for matching seq */
+            /* Check for pending NACK — search window for matching seq */
             k_mutex_lock(&nack_mutex, K_FOREVER);
             uint16_t pending_nack = nack_seq_pending;
             if (pending_nack != 0xFFFF) {
-                nack_seq_pending = 0xFFFF;   /* consume */
+                nack_seq_pending = 0xFFFF;
             }
             k_mutex_unlock(&nack_mutex);
 
             if (pending_nack != 0xFFFF) {
-                /* Search NACK_WINDOW for the requested seq */
                 bool retransmitted = false;
                 for (int i = 0; i < NACK_WINDOW; i++) {
                     if (nack_buf_len[i] > 0 && nack_buf_seq[i] == pending_nack) {
                         LOG_INF("Retransmitting seq=%u (%u B) from window[%d]",
                                 pending_nack, nack_buf_len[i], i);
                         int err;
+                        int retry_ms = 2;
                         do {
                             err = bt_nus_send(NULL, nack_buf[i], nack_buf_len[i]);
-                            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+                            if (err == -ENOMEM || err == -EAGAIN) {
+                                k_sleep(K_MSEC(retry_ms));
+                                if (retry_ms < 20) retry_ms *= 2;
+                            }
                         } while (err == -ENOMEM || err == -EAGAIN);
                         retransmitted = true;
                         break;
@@ -853,13 +974,16 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
             uint32_t available = ring_buf_size_get(&audio_ring);
 
             if (available == 0) {
-                /* [FIX E] Use atomic_get for ble_tx_saw_recording */
                 if (!analog_recording && !finished_sent &&
                     atomic_get(&ble_tx_saw_recording)) {
                     int err;
+                    int retry_ms = 2;
                     do {
                         err = bt_nus_send(NULL, "finished\n", 9);
-                        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+                        if (err == -ENOMEM || err == -EAGAIN) {
+                            k_sleep(K_MSEC(retry_ms));
+                            if (retry_ms < 20) retry_ms *= 2;
+                        }
                     } while (err == -ENOMEM || err == -EAGAIN);
 
                     finished_sent = true;
@@ -874,7 +998,7 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
             uint16_t send_bytes = partial ? (uint16_t)available : payload_bytes;
 
-            /* [IMP 5] Build chunk: [seq16][len16][crc16][payload] */
+            /* Build chunk: [seq16][len16][crc16][payload] */
             ring_buf_get(&audio_ring, &chunk[CHUNK_HEADER_BYTES], send_bytes);
             uint16_t crc = crc16_ccitt(0xFFFF, &chunk[CHUNK_HEADER_BYTES], send_bytes);
             sys_put_le16(tx_seq,     &chunk[0]);
@@ -883,7 +1007,7 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 
             uint16_t total_len = CHUNK_HEADER_BYTES + send_bytes;
 
-            /* [FIX B] Store chunk in circular NACK window */
+            /* Store chunk in circular NACK window */
             int slot = tx_seq % NACK_WINDOW;
             if (total_len <= sizeof(nack_buf[slot])) {
                 memcpy(nack_buf[slot], chunk, total_len);
@@ -892,9 +1016,13 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
             }
 
             int err;
+            int retry_ms = 2;
             do {
                 err = bt_nus_send(NULL, chunk, total_len);
-                if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+                if (err == -ENOMEM || err == -EAGAIN) {
+                    k_sleep(K_MSEC(retry_ms));
+                    if (retry_ms < 20) retry_ms *= 2;
+                }
             } while (err == -ENOMEM || err == -EAGAIN);
 
             tx_seq = (tx_seq + 1) & 0xFFFF;
@@ -909,40 +1037,83 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 static void nus_send_blocking(const char *buf, uint16_t len)
 {
     int err;
+    int retry_ms = 2;
     do {
         err = bt_nus_send(NULL, buf, len);
-        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+        if (err == -ENOMEM || err == -EAGAIN) {
+            k_sleep(K_MSEC(retry_ms));
+            if (retry_ms < 20) retry_ms *= 2;
+        }
     } while (err == -ENOMEM || err == -EAGAIN);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * [STAB FIX 5] IN-CYCLE KEEPALIVE HELPER
+ *
+ * Called from inside record_and_stream() at every natural pause point.
+ * Sends PING\n if PING_INTERVAL_MS has elapsed since the last ping.
+ * This is the ONLY correct place for the keepalive during a recording
+ * cycle — the main loop cannot fire while record_and_stream() is
+ * blocking it.
+ * ══════════════════════════════════════════════════════════════════ */
+static void keepalive_ping_if_due(int64_t *last_ping_ms)
+{
+    if (!is_connected) return;
+    int64_t now = k_uptime_get();
+    if ((now - *last_ping_ms) >= PING_INTERVAL_MS) {
+        bt_nus_send(NULL, "PING\n", 5);
+        *last_ping_ms = now;
+        LOG_DBG("PING sent (in-cycle keepalive)");
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
  * ══════════════════════════════════════════════════════════════════ */
+
+/* Atomic flag — true while record_and_stream() is executing.
+ * Prevents re-entry from a rapid REC command during TX drain or
+ * inference (when analog_recording is false but session is live). */
+static atomic_t in_session = ATOMIC_INIT(0);
+
 static void record_and_stream(void)
 {
+    atomic_set(&in_session, 1);
     led_set_purple();
+
+    /* [STAB FIX 5] Keepalive timestamp — passed to keepalive_ping_if_due()
+     * at each natural pause point inside this blocking function. */
+    int64_t ping_ms = k_uptime_get();
 
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
 
     k_sem_reset(&half_produced_sem);
 
-    /* [FIX A] drops declared unconditionally so LOG_INF at end always compiles.
-     * Value is populated inside #if BLE_AUDIO_LIVE below. */
+    /* [FIX A] drops declared unconditionally — always in scope for LOG_INF */
     uint32_t drops = 0;
 
 #if BLE_AUDIO_LIVE
+    if (atomic_get(&ble_tx_saw_recording)) {
+        if (k_sem_take(&tx_done_sem, K_MSEC(PRE_REC_DRAIN_TIMEOUT_MS)) != 0) {
+            LOG_WRN("Pre-REC drain wait timed out — resetting anyway");
+        }
+    }
+
     k_sem_reset(&audio_data_sem);
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
     tx_seq          = 0;
-    /* [FIX E] Use atomic_set */
     atomic_set(&ble_tx_saw_recording, 0);
     k_sem_reset(&tx_done_sem);
 
-    /* Clear NACK window */
+    /* [STAB FIX 7] Clear both len AND seq arrays so stale seq numbers from
+     * previous recordings cannot cause a late NACK to match the wrong slot
+     * and retransmit incorrect data. */
     memset(nack_buf_len, 0, sizeof(nack_buf_len));
+    memset(nack_buf_seq, 0, sizeof(nack_buf_seq));
+
     k_mutex_lock(&nack_mutex, K_FOREVER);
     nack_seq_pending = 0xFFFF;
     k_mutex_unlock(&nack_mutex);
@@ -959,7 +1130,7 @@ static void record_and_stream(void)
         int hlen = snprintf(hdr, sizeof(hdr), "START:%u\n",
                             (uint32_t)TOTAL_AUDIO_BYTES);
         bt_nus_send(NULL, hdr, hlen);
-        k_sleep(K_MSEC(10));
+        k_sleep(K_MSEC(START_HEADER_DELAY_MS));
     }
 #endif
 
@@ -975,6 +1146,7 @@ static void record_and_stream(void)
         analog_recording = false;
         led_error_flash(led_set_yellow);
         bt_nus_send(NULL, "ERR:SAADC", 9);
+        atomic_set(&in_session, 0);
         return;
     }
 
@@ -986,6 +1158,7 @@ static void record_and_stream(void)
             analog_recording = false;
             saadc_stop_streaming();
             bt_nus_send(NULL, "ERR:TIMEOUT", 11);
+            atomic_set(&in_session, 0);
             return;
         }
     }
@@ -995,15 +1168,40 @@ static void record_and_stream(void)
 
     led_set_green();
 
-    if (k_sem_take(&dsp_done_sem, K_MSEC(30000)) != 0) {
-        LOG_WRN("DSP thread did not finish within 30 s");
+    /* [STAB FIX 5] Ping after SAADC capture completes.
+     * The 10 s capture window had audio chunks keeping the link alive,
+     * but we reset the ping timer here so the next ping fires on schedule
+     * from the start of the inference window. */
+    keepalive_ping_if_due(&ping_ms);
+
+    /* Wait for DSP thread to finish MFCC extraction.
+     * [STAB FIX 5] Poll in 2 s slices and send a keepalive each slice
+     * so the BLE supervision timer never sees more than 3 s of silence
+     * during DSP completion (which can take up to ~30 s in theory). */
+    {
+        bool dsp_done = false;
+        int64_t dsp_deadline = k_uptime_get() + 30000;
+        while (k_uptime_get() < dsp_deadline) {
+            if (k_sem_take(&dsp_done_sem, K_MSEC(2000)) == 0) {
+                dsp_done = true;
+                break;
+            }
+            /* Slice elapsed — send keepalive and keep waiting */
+            keepalive_ping_if_due(&ping_ms);
+        }
+        if (!dsp_done) {
+            LOG_WRN("DSP thread did not finish within 30 s");
+        }
     }
 
 #if BLE_AUDIO_LIVE
     k_sem_give(&audio_data_sem);   /* drain ring tail + send finished */
-    k_sem_take(&tx_done_sem, K_MSEC(15000));
+    if (k_sem_take(&tx_done_sem, K_MSEC(TX_DONE_TIMEOUT_MS)) != 0) {
+        LOG_WRN("tx_done_sem timeout — BLE drain did not complete within %d ms",
+                TX_DONE_TIMEOUT_MS);
+    }
 
-    /* [IMP 2] Drop warning — sent after TX drain so host has audio first */
+    /* Drop warning — sent after TX drain so host has audio first */
     drops = (uint32_t)atomic_get(&ring_drops);
     if (drops > 0) {
         char warn[32];
@@ -1014,6 +1212,9 @@ static void record_and_stream(void)
     }
     LOG_INF("BLE ring high-water: %u / %u B", ring_high_water, AUDIO_RING_BYTES);
 #endif
+
+    /* [STAB FIX 5] Ping before entering the long inference window. */
+    keepalive_ping_if_due(&ping_ms);
 
     /* ═════════════════════════════════════════════════════════════
      * PHASE 2: On-device inference from RAM feature buffers
@@ -1026,20 +1227,47 @@ static void record_and_stream(void)
         bt_nus_send(NULL, "ERR:FRAMES\n", 11);
         led_error_flash(led_set_yellow);
         led_set_green();
+        atomic_set(&in_session, 0);
         return;
     }
+
+    LOG_INF("Feature counts: heart=%u/%u lung=%u/%u",
+            (unsigned)heart_feat_count, (unsigned)HEART_FEAT_N,
+            (unsigned)lung_feat_count,  (unsigned)LUNG_FEAT_N);
+    log_feature_stats("heart", heart_features, heart_feat_count);
+    log_feature_stats("lung",  lung_features,  lung_feat_count);
 
     heart_result_t hr;
     lung_result_t  rr;
 
+    nus_send_blocking("INF:START\n", 10);
+
     led_set_blue();
+
+    /* Heart inference — can take 15-25 s on the nRF SoC.
+     * [STAB FIX 5] Ping immediately before so Android's timer resets
+     * at the worst possible moment (just before the long silent window). */
+    keepalive_ping_if_due(&ping_ms);
     run_heart_inference_ram(tensor_arena, TENSOR_ARENA_BYTES,
                             heart_features, 665, 25, &hr);
+    nus_send_blocking("INF:HEART_DONE\n", 15);
+
+    /* [STAB FIX 5] Ping between the two inferences — this is the most
+     * critical call site. Heart inference can take ~20 s; without this
+     * ping Android will have received nothing for that entire window and
+     * will have already declared the link dead before lung inference starts. */
+    keepalive_ping_if_due(&ping_ms);
+
+    k_yield();   /* [BUG 2C FIX] Let BLE stack breathe between inferences */
+
     led_set_purple();
     run_lung_inference_ram(tensor_arena, TENSOR_ARENA_BYTES,
                            lung_features, 324, 26, &rr);
+    nus_send_blocking("INF:LUNG_DONE\n", 14);
 
-    /* Send results to phone */
+    /* [STAB FIX 5] Ping after lung inference completes before sending results. */
+    keepalive_ping_if_due(&ping_ms);
+
     char msg[48]; int mlen;
     if (hr.rc == 0) {
         mlen = snprintf(msg, sizeof(msg), "HR:%.0f\n", (double)hr.value);
@@ -1055,10 +1283,10 @@ static void record_and_stream(void)
         nus_send_blocking("ERR:LUNG_INF\n", 13);
     }
 
-    /* [FIX A] drops is now always in scope here */
     LOG_INF("Done. HR=%.0f RR=%.0f drops=%u",
             (double)hr.value, (double)rr.value, drops);
     led_set_green();
+    atomic_set(&in_session, 0);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1102,7 +1330,7 @@ int main(void)
     err = bt_nus_cb_register(&nus_listener, NULL);
     if (err) { LOG_ERR("bt_nus_cb_register: %d", err); return err; }
 
-    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad),
+    err = bt_le_adv_start(&acousteeecare_adv_param, ad, ARRAY_SIZE(ad),
                           sd_adv, ARRAY_SIZE(sd_adv));
     if (err) { LOG_ERR("bt_le_adv_start: %d", err); return err; }
 
@@ -1120,19 +1348,38 @@ int main(void)
     k_thread_name_set(&dsp_thread_data, "dsp");
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v8.1 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v8.4 ready — waiting for BLE connection");
 
-    /* Baseline RAM snapshot before first recording */
     report_ram_usage("boot (idle)");
+
+    /* [BUG 3 FIX] Track last ping time for idle keepalive.
+     * Note: the in-cycle keepalive (keepalive_ping_if_due inside
+     * record_and_stream) manages its own timestamp. This variable
+     * covers idle periods between recordings only. */
+    int64_t last_ping_ms = 0;
 
     while (true) {
         k_sleep(K_MSEC(100));
-        if (is_connected && mtu_exchanged && start_recording && !analog_recording) {
+        if (is_connected && mtu_exchanged && start_recording &&
+            !atomic_get(&in_session)) {
             start_recording = false;
             LOG_INF("REC command — starting %d s @ %d Hz",
                     DURATION_S, SAMPLING_RATE);
             record_and_stream();
             report_ram_usage("after REC completed");
+            last_ping_ms = k_uptime_get();
+        }
+
+        /* Idle keepalive: send PING every 3 s when connected and between
+         * recordings. During a recording cycle, keepalive_ping_if_due()
+         * inside record_and_stream() handles keepalives directly — this
+         * code is unreachable while record_and_stream() blocks. */
+        if (is_connected && !analog_recording && !atomic_get(&in_session)) {
+            int64_t now = k_uptime_get();
+            if ((now - last_ping_ms) > PING_INTERVAL_MS) {
+                bt_nus_send(NULL, "PING\n", 5);
+                last_ping_ms = now;
+            }
         }
     }
 

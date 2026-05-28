@@ -217,6 +217,9 @@ def _handle_text(data: bytearray):
         rec.hr_done    = True
         rec.rr_done    = True
         print(f"\n  [ERROR ] Firmware: {text}")
+    
+    elif text == "PING":
+        pass   # firmware keepalive — silently discard
 
     else:
         print(f"\n  [MSG   ] {text!r}")

@@ -58,9 +58,8 @@
  *           saadc_init_once() called from main(). IRQ_CONNECT is a
  *           compile-time linker macro and must not be called repeatedly.
  *
- *   [NOTE ] BPF coefficients (heart_bpf_coeffs) are still placeholder
- *           values. Replace with scipy-generated Q15 Butterworth coeffs
- *           before clinical use (see comment below).
+ *   [R2+R5] Capture-path Q15 BPF (heart_bpf_coeffs) removed; band
+ *           selection now done per-pipeline in dsp_mfcc.c.
  *
  * ALL PREVIOUS FIXES (v7.9 / v7.8 / v7.7 / … / v6.8) ARE PRESERVED
  * where they still apply to the no-SD build.
@@ -83,7 +82,7 @@
 #include <math.h>
 #include <stdlib.h>
 
-#include <arm_math.h>   /* [IMP 3] CMSIS-DSP Q15 biquad filter */
+/* arm_math.h removed: Q15 biquad filter no longer used (R2+R5 fix). */
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -276,7 +275,14 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
         .gain       = NRF_SAADC_GAIN1_4,
         .reference  = NRF_SAADC_REFERENCE_VDD4,
-        .acq_time   = NRF_SAADC_ACQTIME_10US,
+        /* [FIX 1] Increased acquisition time from 10 µs to 40 µs.
+         * The bias source impedance is 10k||10k = 5 kΩ. Nordic's datasheet
+         * requires ~40 µs acquisition for a 5 kΩ source to let the sampling
+         * capacitor fully settle. At 10 µs the cap was starved, reading
+         * ~813 codes (0.65 V) instead of the true ~2048 codes (1.65 V).
+         * At 40 µs: 40 µs acq + conversion overhead << 125 µs period, so
+         * 8 kHz output rate is preserved with margin. */
+        .acq_time   = NRF_SAADC_ACQTIME_40US,
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
         .burst      = NRF_SAADC_BURST_DISABLED,
     },
@@ -289,32 +295,23 @@ static volatile uint32_t saadc_dma_overruns = 0;
 
 #define ENABLE_DC_REMOVAL
 static int32_t dc_estimate = 0;
+/* [FIX 3] Flag: has dc_estimate been seeded from the first real sample?
+ * Set false at start of each recording, true on first EVT_DONE. */
+static bool dc_seeded = false;
 
-/* ══════════════════════════════════════════════════════════════════
- * [IMP 3] CMSIS-DSP Q15 BAND-PASS FILTER (Heart: 20–950 Hz, 8 kHz)
+/* [R2+R5 FIX] The capture-path Q15 band-pass filter (was 20–950 Hz, 8 kHz)
+ * and its declarations have been removed.
  *
- * Coefficients generated with:
- *   from scipy.signal import butter
- *   sos = butter(2, [20, 950], btype='bandpass', fs=8000, output='sos')
- *   # convert to Q15: round(sos * 32768)
+ * Reason (R5): 20–950 Hz matched neither the heart (10–200 Hz) nor the
+ * lung (100–1000 Hz) training band, distorting the signal before the
+ * correct per-pipeline float band-passes in dsp_mfcc.c could apply.
  *
- * !! NOTE: Values below are PLACEHOLDERS. Replace with your scipy-
- * !! computed coefficients before clinical/production use. Incorrect
- * !! coefficients will silently corrupt MFCC input.
+ * Reason (R2): Running arm_biquad_cascade_df1_q15 inside the SAADC ISR
+ * delayed BLE link-layer interrupts, contributing to disconnects.
+ * DC removal was also moved to the DSP worker thread (see below).
  *
- * Format: {b0, b1, b2, -a1, -a2} for each biquad stage (CMSIS-DSP
- * convention negates a1/a2).
- * ══════════════════════════════════════════════════════════════════ */
-#define HEART_BPF_STAGES  2
-
-static const q15_t heart_bpf_coeffs[5 * HEART_BPF_STAGES] = {
-    /* Stage 1 — PLACEHOLDER: replace with scipy-generated Q15 values */
-     1382,  2764,  1382, -25576,  12610,
-    /* Stage 2 — PLACEHOLDER */
-     1382, -2764,  1382,  25576,  12610,
-};
-static q15_t                       heart_bpf_state[4 * HEART_BPF_STAGES];
-static arm_biquad_casd_df1_inst_q15 heart_bpf;
+ * Band selection is now handled entirely by the per-pipeline float
+ * bp_coeffs in dsp_mfcc.c (heart: 10–200 Hz, lung: 100–1000 Hz). */
 
 /* ══════════════════════════════════════════════════════════════════
  * AUDIO PARAMS
@@ -452,6 +449,16 @@ static void dsp_thread_fn(void *a, void *b, void *c)
                                         HALF_BUF_BYTES);
             if (got != HALF_BUF_BYTES) continue;
 
+            /* [R2 FIX] DC removal moved here from the SAADC ISR so the ISR
+             * stays minimal and BLE link-layer interrupts are not delayed.
+             * Time constant >> 10 (~128 ms at 8 kHz) — same as before. */
+#ifdef ENABLE_DC_REMOVAL
+            for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
+                dc_estimate += ((int32_t)dsp_pop_buf[i] - dc_estimate) >> 10;
+                dsp_pop_buf[i] = (int16_t)((int32_t)dsp_pop_buf[i] - dc_estimate);
+            }
+#endif
+
             dsp_mfcc_feed_chunk(&heart_pipeline, dsp_pop_buf, HALF_BUF_SAMPLES);
             dsp_mfcc_feed_chunk(&lung_pipeline,  dsp_pop_buf, HALF_BUF_SAMPLES);
         }
@@ -475,39 +482,29 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
     case NRFX_SAADC_EVT_DONE: {
         int16_t *filled_buf = p_event->data.done.p_buffer;
 
-#ifdef ENABLE_DC_REMOVAL
-        for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
-            /* [FIX C] HPF time constant changed from >> 8 (~32 ms) to
-             * >> 10 (~128 ms) for a gentler high-pass that preserves
-             * low-frequency content going into the BPF. */
-            dc_estimate += ((int32_t)filled_buf[i] - dc_estimate) >> 10;
-            filled_buf[i] = (int16_t)((int32_t)filled_buf[i] - dc_estimate);
+        /* [FIX 3] Seed dc_estimate from the first real sample on each
+         * recording. dc_estimate is set to 0 as a sentinel in
+         * saadc_start_streaming(); here, on the very first EVT_DONE, we
+         * capture the raw ADC value (true DC ~2048 after Fix 1) so the
+         * IIR starts without a large initial error and the first MFCC
+         * frames are clean. The sentinel 0 is safe because a true DC of
+         * 0 would only arise with the chip powered off. */
+        if (!dc_seeded) {
+            dc_estimate = (int32_t)filled_buf[0];
+            dc_seeded   = true;
         }
-#endif
-
-        /* [IMP 3] Heart band-pass filter: 20–950 Hz, 2nd-order Butterworth.
-         * Applied after DC removal, in-place. */
-        arm_biquad_cascade_df1_q15(&heart_bpf,
-                                   (q15_t *)filled_buf,
-                                   (q15_t *)filled_buf,
-                                   HALF_BUF_SAMPLES);
-
-        /* DSP ring */
-        uint32_t dsp_written = ring_buf_put(&dsp_ring,
-                                            (const uint8_t *)filled_buf,
-                                            HALF_BUF_BYTES);
-        if (dsp_written != HALF_BUF_BYTES) {
-            LOG_WRN_ONCE("dsp_ring overflow — MFCC frames may be lost!");
-        }
-        k_sem_give(&dsp_data_sem);
+        /* Reset seed flag when streaming stops so next recording re-seeds */
 
 #if BLE_AUDIO_LIVE
+        /* Stream the captured SAADC samples before DSP mutates the buffer.
+         * ring_buf_put() copies the bytes, so the in-place filtering below
+         * still feeds the MFCC pipelines without altering the BLE copy. */
         uint32_t ble_written = ring_buf_put(&audio_ring,
                                             (const uint8_t *)filled_buf,
                                             HALF_BUF_BYTES);
         if (ble_written != HALF_BUF_BYTES) {
             atomic_inc(&ring_drops);
-            LOG_WRN_ONCE("audio_ring overflow — BLE stream will have gaps!");
+            LOG_WRN_ONCE("audio_ring overflow - BLE stream will have gaps!");
         } else {
             uint32_t fill = ring_buf_size_get(&audio_ring);
             if (fill > ring_high_water) {
@@ -515,6 +512,27 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             }
         }
 #endif
+
+        /* [R2 FIX] DC removal and band-pass are now done in the DSP worker
+         * thread (below), NOT here in the ISR.  A long-running ISR delays
+         * BLE link-layer interrupts and is a primary cause of disconnects.
+         * The ISR is now minimal: copy raw DMA buffer → dsp_ring, signal. */
+
+        /* [R5 FIX] The capture-path Q15 band-pass (was 20–950 Hz) has been
+         * removed entirely.  That filter matched neither the heart (10–200 Hz)
+         * nor the lung (100–1000 Hz) training band and distorted the signal
+         * before the correct per-pipeline float band-passes in dsp_mfcc.c
+         * could apply their own bands.  Per-pipeline filtering in dsp_mfcc.c
+         * already handles band selection correctly. */
+
+        /* DSP ring — raw, unfiltered samples */
+        uint32_t dsp_written = ring_buf_put(&dsp_ring,
+                                            (const uint8_t *)filled_buf,
+                                            HALF_BUF_BYTES);
+        if (dsp_written != HALF_BUF_BYTES) {
+            LOG_WRN_ONCE("dsp_ring overflow — MFCC frames may be lost!");
+        }
+        k_sem_give(&dsp_data_sem);
 
         k_sem_give(&half_produced_sem);
 #if BLE_AUDIO_LIVE
@@ -563,13 +581,7 @@ static int saadc_init(void)
         nrfx_saadc_uninit();
     }
 
-    /* [IMP 3] Init Q15 band-pass filter state (zeroed on each REC) */
-    memset(heart_bpf_state, 0, sizeof(heart_bpf_state));
-    arm_biquad_cascade_df1_init_q15(&heart_bpf,
-                                    HEART_BPF_STAGES,
-                                    (q15_t *)heart_bpf_coeffs,
-                                    heart_bpf_state,
-                                    1 /* postShift */);
+    /* [R2+R5 FIX] Q15 BPF init removed: filter was wrong-band and ISR-blocking. */
 
     /* [FIX F] IRQ_CONNECT removed from here — now in saadc_init_once() */
 
@@ -599,8 +611,13 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    /* Seed DC estimate to ADC midpoint to avoid HPF ringing at start */
-    dc_estimate = 2048;
+    /* [FIX 3] Seed DC estimate from the first real ADC sample, not a
+     * hardcoded midpoint. Before Fix 1, the ADC read ~813 (not 2048), so
+     * seeding at 2048 caused a -1383 code transient and ~128 ms of HPF
+     * ringing that corrupted the first several MFCC frames every recording.
+     * dc_estimate is set here to 0 as a sentinel; saadc_event_handler will
+     * overwrite it with ping_pong[0][0] on the very first EVT_DONE. */
+    dc_estimate = 0;  /* overwritten by first sample — see saadc_event_handler */
 
     dsp_mfcc_reset(&heart_pipeline);
     dsp_mfcc_reset(&lung_pipeline);
@@ -624,6 +641,7 @@ static int saadc_start_streaming(void)
 
 static void saadc_stop_streaming(void)
 {
+    dc_seeded = false;   /* [FIX 3] allow next recording to re-seed DC estimate */
     if (saadc_was_initialized) {
         nrfx_saadc_uninit();
         saadc_was_initialized = false;
@@ -732,7 +750,13 @@ static void connected(struct bt_conn *conn, uint8_t err)
     bt_conn_le_phy_update(conn, &phy);
 
     static const struct bt_le_conn_param fast_conn = {
-        .interval_min = 12, .interval_max = 24, .latency = 0, .timeout = 400,
+        /* [FIX 4a] Supervision timeout raised from 400 (4 s) to 1000 (10 s).
+         * During recording, the main thread runs SAADC + DSP + TFLM inference
+         * concurrently with BLE at ~16 KB/s. The old 4 s timeout was tight
+         * enough that a heavy inference phase could starve the link layer and
+         * trigger a central drop. 10 s gives ample slack while staying well
+         * inside the 32 s maximum (timeout units = 10 ms). */
+        .interval_min = 12, .interval_max = 24, .latency = 0, .timeout = 1000,
     };
     bt_conn_le_param_update(conn, &fast_conn);
     bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -741,12 +765,23 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    if (analog_recording) saadc_stop_streaming();
-    analog_recording = false;
-    is_connected     = false;
-    start_recording  = false;
-    mtu_exchanged    = false;
-    nus_chunk_size   = 244;
+    /* [FIX 4c] On disconnect, do NOT abort an in-progress recording.
+     * Previously this called saadc_stop_streaming() and cleared
+     * analog_recording, which discarded all captured audio. Now we let
+     * the SAADC and DSP pipelines run to completion so the recording is
+     * preserved. The BLE TX thread will stall (ring backs up) but the
+     * 32 KB audio ring provides ~2 s of headroom. On reconnect the host
+     * can re-request results or the firmware resumes streaming the ring.
+     * We DO clear start_recording so no new REC is auto-started. */
+    if (analog_recording) {
+        LOG_WRN("Disconnected mid-recording (reason=%d) — preserving capture, "
+                "ring will absorb until reconnect", reason);
+        /* SAADC keeps running; do not call saadc_stop_streaming() here */
+    }
+    is_connected    = false;
+    start_recording = false;
+    mtu_exchanged   = false;
+    nus_chunk_size  = 244;
     led_set_red();
     LOG_WRN("Disconnected (reason=%d)", reason);
     k_work_schedule(&adv_restart_work, K_MSEC(500));

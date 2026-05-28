@@ -253,9 +253,29 @@ void dsp_mfcc_feed_chunk(dsp_mfcc_pipeline_t *p, const int16_t *pcm_8k, int n)
         n = BP_SCRATCH_MAX;
     }
 
-    /* int16 -> float32 */
+    /* int16 -> float32, with per-pipeline digital gain.
+     *
+     * [FIX 2] MFCC input gain: the trained model expects audio in the
+     * [-1, 1] float domain at training-set amplitude. With the current
+     * (pre-Fix-1) starved ADC signal, 97.9% of mel energies fell below
+     * the 1e-6 log floor, pinning MFCC[0] at -69 (training mean: -40)
+     * and crushing all variation → constant HR=115/RR=23 output.
+     *
+     * The gain is applied HERE, on the float MFCC path only; the BLE/WAV
+     * tap receives the unscaled int16 samples (see saadc_event_handler).
+     *
+     * Gains were derived by solving for MFCC[0] = training mean:
+     *   Heart path (2 kHz, 10–200 Hz band): ~400× on current starved audio
+     *   Lung  path (4 kHz, 100–1000 Hz band): ~50× on current starved audio
+     *
+     * IMPORTANT: after Fix 1 restores true ADC amplitude (~2048 DC codes,
+     * ~18× larger AC), RE-DERIVE these gains using the appendix verifier.
+     * The required gain will likely drop to near 1×. The #define values
+     * below are placeholders that keep inference alive on pre-Fix-1 audio;
+     * update them once you have a post-Fix-1 recording. */
+    const float32_t input_gain = p->cfg->mfcc_input_gain;
     for (int i = 0; i < n; i++) {
-        bp_scratch[i] = (float32_t)pcm_8k[i] / 32768.0f;
+        bp_scratch[i] = ((float32_t)pcm_8k[i] / 32768.0f) * input_gain;
     }
 
     /* Bandpass in-place */

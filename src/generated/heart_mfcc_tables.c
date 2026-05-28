@@ -933,9 +933,16 @@ const dsp_mfcc_config_t heart_mfcc_config = {
     .n_mel              = 25,
     .n_mfcc             = 25,
     .f_low_hz           = 10.0f,
-    .f_high_hz          = 1000.0f,
+    .f_high_hz          = 200.0f,   /* [R1 FIX] was 1000.0f — copy-paste from lung config.
+                                     * Heart model trained on 10–200 Hz; heart_bp_coeffs
+                                     * were already generated for 10–200 Hz (see file header).
+                                     * Re-derive mfcc_input_gain after Fix 1 + R3 (see R4). */
     .bp_coeffs          = heart_bp_coeffs,
     .hamming            = heart_hamming,
     .mel_fb             = heart_mel_fb,
     .dct                = heart_dct,
+    /* [FIX 2] MFCC input gain: ~400× derived for pre-Fix-1 starved audio.
+     * RE-DERIVE after Fix 1 restores ADC amplitude (expected ~1–5×).
+     * Use the appendix verifier targeting MFCC[0] ≈ -40.0. */
+    .mfcc_input_gain    = 400.0f,
 };

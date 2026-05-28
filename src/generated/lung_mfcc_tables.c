@@ -3754,4 +3754,8 @@ const dsp_mfcc_config_t lung_mfcc_config = {
     .hamming            = lung_hamming,
     .mel_fb             = lung_mel_fb,
     .dct                = lung_dct,
+    /* [FIX 2] MFCC input gain: ~50× derived for pre-Fix-1 starved audio.
+     * RE-DERIVE after Fix 1 restores ADC amplitude (expected ~1–5×).
+     * Use the appendix verifier targeting MFCC[0] ≈ -19.2. */
+    .mfcc_input_gain    = 50.0f,
 };

@@ -41,6 +41,14 @@ typedef struct dsp_mfcc_config {
     float f_low_hz;
     float f_high_hz;
 
+    /* [FIX 2] Per-pipeline digital gain applied before MFCC (not before BLE tap).
+     * Compensates for low signal amplitude so mel energies stay above the
+     * 1e-6 log floor and MFCC[0] lands near the training mean.
+     * Heart path: ~400× on pre-Fix-1 audio; re-derive after Fix 1 (likely ~1×).
+     * Lung  path: ~50×  on pre-Fix-1 audio; re-derive after Fix 1 (likely ~1×).
+     * Use the appendix verifier in AcoustEEEcare_summary.md to re-derive. */
+    float mfcc_input_gain;
+
     /* Pointers to flash-constant tables */
     const float32_t *bp_coeffs;
     const float32_t *hamming;

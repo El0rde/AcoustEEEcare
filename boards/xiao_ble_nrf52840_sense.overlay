@@ -1,26 +1,24 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * v5.3: Removed &adc { status = "okay" } node.
- * When CONFIG_ADC=n, the Zephyr ADC driver is not compiled and the
- * devicetree node has no driver to bind to.  Enabling it caused a
- * spurious Zephyr DTS warning and is unnecessary — nrfx_saadc accesses
- * the SAADC peripheral directly without the Zephyr ADC subsystem.
+ * AcoustEEEcare v7.2 overlay — Seeed XIAO nRF52840 Sense
+ *
+ * CHANGES FROM v5.3:
+ *   Removed &xiao_spi / sdhc0 / sdmmc-disk block entirely.
+ *   SD card support was dropped in v6.7; keeping the DTS node
+ *   without CONFIG_DISK_DRIVER_SDMMC=y / CONFIG_SPI=y caused
+ *   a DTS binding error at build time ("no driver for compatible
+ *   zephyr,sdmmc-disk found").
+ *
+ * SAADC (AIN0 / P0.02):
+ *   nrfx_saadc accesses the SAADC peripheral directly.
+ *   No DTS node is needed or appropriate when CONFIG_ADC=n.
+ *
+ * LEDs (led0=red, led1=green, led2=blue):
+ *   Aliases are already defined in the upstream board DTS for
+ *   xiao_ble / xiao_ble_sense.  No override needed here.
+ *
+ * This file is intentionally left with no active nodes.
+ * It is kept so west build -b xiao_ble_nrf52840_sense can
+ * reference it via boards/<board>.overlay without errors.
  */
-
-&xiao_spi {
-    status = "okay";
-    cs-gpios = <&xiao_d 1 GPIO_ACTIVE_LOW>;
-
-    sdhc0: sdhc@0 {
-        compatible = "zephyr,sdhc-spi-slot";
-        reg = <0>;
-        status = "okay";
-        spi-max-frequency = <4000000>;
-        mmc {
-            compatible = "zephyr,sdmmc-disk";
-            disk-name = "SD";
-            status = "okay";
-        };
-    };
-};

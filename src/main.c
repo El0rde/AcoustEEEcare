@@ -1,31 +1,38 @@
 /*
  * AcoustEEEcare — SAADC BLE Edition
  * ============================================================
- * v6.7 — BLE-only; SD card support removed. Floating-pin noise fix.
+ * v7.2 — dsp_mfcc multi-instance API + dual heart/lung pipelines.
+ *        Option-B software gain ×4 for 1.65 V DC-bias hardware.
  *
- * CHANGES FROM v6.6:
- *   Removed all SD card code (USE_SD, sd_ring, sd_writer_thread,
- *     fs_mount, ff.h, disk_access, etc.).  BLE-only behaviour matches
- *     the original v6.3 design.
+ * CHANGES FROM v6.7:
+ *   [MFCC] Migrated from single-instance dsp_mfcc API to v7.2
+ *          multi-instance API.  Both heart and lung pipelines are
+ *          initialised, reset, fed, and finished independently.
  *
- *   Fixed floating-input noise on AIN0:
- *     resistor_p changed from NRF_SAADC_RESISTOR_DISABLED to
- *     NRF_SAADC_RESISTOR_PULLDOWN.  The nRF52840 SAADC has ~11 kΩ
- *     internal pull resistors.  When AIN0 is disconnected (floating),
- *     enabling the pulldown ties it to GND, which eliminates the
- *     random noise the floating node picks up.
- *     Re-enable the microphone and this resistor is still fine for
- *     cap-coupled MEMS mics (the bias resistor on the mic board wins).
- *     If you drive the pin from a low-impedance source you can change
- *     back to NRF_SAADC_RESISTOR_DISABLED.
+ *   [MFCC] Separate BLE callbacks on_heart_mfcc_frame /
+ *          on_lung_mfcc_frame replace the old on_mfcc_frame.
+ *          Each sends MFCC_START:<n>:<k>\n header and MFCC_END\n
+ *          trailer to match the host Python v6.7 protocol.
  *
- *   Added NOISE_GATE_THRESHOLD as a second software layer.
- *     Set to 0 to disable (default). Raise to e.g. 10–20 raw ADC
- *     counts if residual noise is still audible on the host side.
+ *   [GAIN] Hardware has 1.65 V DC bias (VDD/2) instead of
+ *          0.825 V (VDD/4).  GAIN1_4 is kept so the ADC full-scale
+ *          (3.3 V) accommodates the bias without clipping.
+ *          Software gain ×4 applied after DC removal compensates
+ *          for the wider full-scale window and restores audible
+ *          amplitude over BLE (Option B — PCB already fabricated).
+ *
+ *   [ADC]  dc_estimate seeded at 1024 in saadc_start_streaming()
+ *          (= 1.65 V / 3.3 V × 2048) so DC removal converges
+ *          instantly rather than ramping from 0.
+ *
+ *   [ADC]  resistor_p changed back to NRF_SAADC_RESISTOR_DISABLED.
+ *          MAX9814 is a low-impedance driver; the internal pull
+ *          is unnecessary and slightly loads the signal.
  *
  * TARGET HARDWARE
  *   Seeed XIAO nRF52840
- *   Analog MEMS microphone on AIN0 (P0.02), cap-coupled (optional)
+ *   ICS40300 → MAX9814 (50 dB, AGC off) → remove 1.23 V offset
+ *   → voltage divider adds 1.65 V DC bias → SAADC AIN0 (P0.02)
  * ============================================================
  */
 
@@ -57,8 +64,31 @@
 #include <nrfx_saadc.h>
 
 #include "dsp_mfcc.h"
+/* CHANGE: added both pipeline config headers (was: not present) */
+#include "heart_mfcc_config.h"
+#include "lung_mfcc_config.h"
 
 LOG_MODULE_REGISTER(AcoustEEEcare);
+
+/* ══════════════════════════════════════════════════════════════════
+ * MFCC PIPELINE MACROS
+ * CHANGE: added — derived from heart/lung config headers.
+ *         Used by BLE callbacks and record_and_stream().
+ * ══════════════════════════════════════════════════════════════════ */
+#define HEART_N_FRAMES  665   /* 1 + (20000 - 60)  / 30  */
+#define HEART_N_MFCC    25
+#define LUNG_N_FRAMES   324   /* 1 + (40000 - 1200) / 120 */
+#define LUNG_N_MFCC     26
+
+/* ══════════════════════════════════════════════════════════════════
+ * MFCC PIPELINE GLOBALS
+ * CHANGE: added — window buffers (caller-allocated, v7.2 requirement)
+ *         and pipeline state structs for heart and lung.
+ * ══════════════════════════════════════════════════════════════════ */
+static int16_t             heart_window[60];    /* frame_samples = 60   */
+static int16_t             lung_window[1200];   /* frame_samples = 1200 */
+static dsp_mfcc_pipeline_t heart_pipe;
+static dsp_mfcc_pipeline_t lung_pipe;
 
 /* ══════════════════════════════════════════════════════════════════
  * SAADC CONFIG
@@ -68,15 +98,17 @@ LOG_MODULE_REGISTER(AcoustEEEcare);
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
     .channel_config = {
-        .resistor_p = NRF_SAADC_RESISTOR_VDD1_2, /* FIX: was DISABLED.
-                                                     * Pulls AIN0 to GND when
-                                                     * nothing drives the pin,
-                                                     * eliminating floating-
-                                                     * input noise.  ~11 kΩ
-                                                     * internal pull. */
+        /* CHANGE: was NRF_SAADC_RESISTOR_VDD1_2.
+         *         MAX9814 is a low-impedance driver — internal pull
+         *         is unnecessary and loads the signal path. */
+        .resistor_p = NRF_SAADC_RESISTOR_DISABLED,
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
-        .gain       = NRF_SAADC_GAIN1_4,                 /* tune — see note */
-        .reference  = NRF_SAADC_REFERENCE_VDD4,      /* 0.6 V, decoupled from VDD */
+        /* KEEP: GAIN1_4 gives FS = VREF/GAIN = 0.825 V / 0.25 = 3.3 V.
+         *       Required to accommodate the 1.65 V DC bias without
+         *       clipping.  Software gain ×4 (below) compensates for
+         *       the wide window. */
+        .gain       = NRF_SAADC_GAIN1_4,
+        .reference  = NRF_SAADC_REFERENCE_VDD4,  /* VREF = VDD/4 = 0.825 V */
         .acq_time   = NRF_SAADC_ACQTIME_10US,
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
         .burst      = NRF_SAADC_BURST_DISABLED,
@@ -89,15 +121,12 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
 static volatile uint32_t saadc_dma_overruns = 0;
 
 /* DC removal: high-pass IIR, alpha = 1/256.
- * Init to 0 — converges within ~256 samples (~32 ms at 8 kHz). */
+ * Seeded at 1024 in saadc_start_streaming() to match the 1.65 V
+ * DC bias (1.65 / 3.3 × 2048 = 1024 at FS = 3.3 V). */
 #define ENABLE_DC_REMOVAL
 static int32_t dc_estimate = 0;
 
-/*
- * Software noise gate — zeroes samples whose magnitude is below this
- * threshold (in raw ADC counts after DC removal).
- * Set to 0 to disable.  Try 10–20 if residual noise still reaches the host.
- */
+/* Software noise gate — set to 0 to disable. */
 #define NOISE_GATE_THRESHOLD  0
 
 /* ══════════════════════════════════════════════════════════════════
@@ -143,11 +172,10 @@ static void ble_tx_thread_fn(void *a, void *b, void *c);
  *
  * On NRFX_SAADC_EVT_DONE (one half-buffer of HALF_BUF_SAMPLES ready):
  *   1. DC removal         — in-place IIR high-pass
- *   2. Noise gate         — optional zero-below-threshold (NOISE_GATE_THRESHOLD)
- *   3. dsp_mfcc_feed_chunk() — on-the-fly bandpass + decimate
- *   4. ring_buf_put()     — push to audio_ring for BLE TX thread
- *
- * No fs_write() here — only ring_buf_put() and k_sem_give().
+ *   2. Software gain ×4   — compensates for 1.65 V bias / 3.3 V FS
+ *   3. Noise gate         — optional (NOISE_GATE_THRESHOLD)
+ *   4. dsp_mfcc_feed_chunk() — both heart and lung pipelines
+ *   5. ring_buf_put()     — push to audio_ring for BLE TX thread
  * ══════════════════════════════════════════════════════════════════ */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
@@ -169,7 +197,30 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
-        /* ── Step 2: Software noise gate ── */
+        /* ── Step 2: Software gain ×4 (Option B) ──────────────────
+         * CHANGE: added this block (was: not present).
+         *
+         * With 1.65 V DC bias and GAIN1_4, the SAADC full-scale is
+         * 3.3 V.  A 200 mVpp auscultation signal only produces ~248
+         * ADC counts pp.  Multiplying by 4 restores the amplitude
+         * to ~992 counts pp — equivalent to the 0.825 V / GAIN1
+         * design in the TODO.md, without changing the PCB.
+         *
+         * This is applied AFTER DC removal, so the DC offset is
+         * already stripped and we are only scaling the AC component.
+         *
+         * Note: this does NOT improve SNR (quantization noise scales
+         * equally).  For production, change the voltage divider to
+         * 0.825 V and switch to GAIN1.
+         * ─────────────────────────────────────────────────────── */
+        for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
+            int32_t scaled = (int32_t)filled_buf[i] * 4;
+            if (scaled >  32767) scaled =  32767;
+            if (scaled < -32768) scaled = -32768;
+            filled_buf[i] = (int16_t)scaled;
+        }
+
+        /* ── Step 3: Software noise gate ── */
 #if NOISE_GATE_THRESHOLD > 0
         for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
             if (filled_buf[i] > -NOISE_GATE_THRESHOLD &&
@@ -179,10 +230,17 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
-        /* ── Step 3: On-the-fly bandpass + decimate ── */
-        dsp_mfcc_feed_chunk(filled_buf, HALF_BUF_SAMPLES);
+        /* ── Step 4: Feed both MFCC pipelines ─────────────────────
+         * CHANGE: was a single dsp_mfcc_feed_chunk(filled_buf, N).
+         *         v7.2 API requires a pipeline pointer as first arg.
+         *         Both pipelines receive the same DC-removed,
+         *         gain-scaled 8 kHz buffer; each applies its own
+         *         bandpass + decimation internally.
+         * ─────────────────────────────────────────────────────── */
+        dsp_mfcc_feed_chunk(&heart_pipe, filled_buf, HALF_BUF_SAMPLES);
+        dsp_mfcc_feed_chunk(&lung_pipe,  filled_buf, HALF_BUF_SAMPLES);
 
-        /* ── Step 4: Push to BLE audio ring ── */
+        /* ── Step 5: Push to BLE audio ring ── */
         uint32_t ble_written = ring_buf_put(&audio_ring,
                                             (const uint8_t *)filled_buf,
                                             HALF_BUF_BYTES);
@@ -240,9 +298,18 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    dc_estimate        = 0;
 
-    dsp_mfcc_reset();
+    /* CHANGE: was dc_estimate = 0.
+     *         Seed at ADC midpoint for 1.65 V bias with GAIN1_4 / FS 3.3 V:
+     *         1.65 V / 3.3 V × 2048 = 1024.
+     *         Prevents a ~256-sample (32 ms) ramp from 0 to the real DC
+     *         level that would corrupt the first MFCC frames. */
+    dc_estimate = 1024;
+
+    /* CHANGE: was dsp_mfcc_reset() — single instance, no pointer.
+     *         v7.2 requires a pipeline pointer for each pipeline. */
+    dsp_mfcc_reset(&heart_pipe);
+    dsp_mfcc_reset(&lung_pipe);
 
     if (saadc_init() != 0) return -EIO;
     next_dma_buf = 1;
@@ -451,32 +518,74 @@ static void ble_tx_thread_fn(void *a, void *b, void *c)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * MFCC FRAME CALLBACK
+ * MFCC FRAME CALLBACKS
+ *
+ * CHANGE: removed old on_mfcc_frame() and s_mfcc_n_frames_total.
+ *         Replaced with two typed callbacks that match the v7.2
+ *         signature: (int frame_idx, const float *coeffs, void *user).
+ *
+ *         Protocol per host Python v6.7:
+ *           "MFCC_START:<n_frames>:<n_mfcc>\n"  ← sent once at frame 0
+ *           [binary frame packets]
+ *           "MFCC_END\n"                         ← sent by record_and_stream()
+ *
+ *         Frame packet layout:
+ *           Bytes [0-1] : uint16 LE  frame index
+ *           Bytes [2-3] : uint16 LE  payload bytes (n_mfcc × 4)
+ *           Bytes [4…]  : float32 × n_mfcc (LE, IEEE 754)
  * ══════════════════════════════════════════════════════════════════ */
-static int s_mfcc_n_frames_total = MFCC_N_FRAMES;
-
-static void on_mfcc_frame(int frame_idx, const float *coeffs)
+static void on_heart_mfcc_frame(int frame_idx, const float *coeffs, void *user)
 {
+    ARG_UNUSED(user);
     int err;
 
     if (frame_idx == 0) {
         char hdr[48];
         int hdr_len = snprintf(hdr, sizeof(hdr),
-                               "MFCC_START:%d:%d\n",
-                               s_mfcc_n_frames_total, MFCC_N_MFCC);
+                               "MFCC_START:%d:%d\n", HEART_N_FRAMES, HEART_N_MFCC);
         do {
             err = bt_nus_send(NULL, hdr, hdr_len);
             if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
         } while (err == -ENOMEM || err == -EAGAIN);
-
         k_sleep(K_MSEC(20));
     }
 
-    uint8_t  pkt[CHUNK_HEADER_BYTES + MFCC_N_MFCC * sizeof(float)];
-    uint16_t payload = MFCC_N_MFCC * sizeof(float);
+    uint8_t  pkt[4 + HEART_N_MFCC * sizeof(float)];
+    uint16_t payload = HEART_N_MFCC * sizeof(float);
+    pkt[0] = (uint8_t)(frame_idx & 0xFF);
+    pkt[1] = (uint8_t)((frame_idx >> 8) & 0xFF);
+    pkt[2] = (uint8_t)(payload & 0xFF);
+    pkt[3] = (uint8_t)((payload >> 8) & 0xFF);
+    memcpy(&pkt[4], coeffs, payload);
 
-    sys_put_le16((uint16_t)frame_idx, &pkt[0]);
-    sys_put_le16(payload,              &pkt[2]);
+    do {
+        err = bt_nus_send(NULL, pkt, sizeof(pkt));
+        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(2));
+    } while (err == -ENOMEM || err == -EAGAIN);
+}
+
+static void on_lung_mfcc_frame(int frame_idx, const float *coeffs, void *user)
+{
+    ARG_UNUSED(user);
+    int err;
+
+    if (frame_idx == 0) {
+        char hdr[48];
+        int hdr_len = snprintf(hdr, sizeof(hdr),
+                               "MFCC_START:%d:%d\n", LUNG_N_FRAMES, LUNG_N_MFCC);
+        do {
+            err = bt_nus_send(NULL, hdr, hdr_len);
+            if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
+        } while (err == -ENOMEM || err == -EAGAIN);
+        k_sleep(K_MSEC(20));
+    }
+
+    uint8_t  pkt[4 + LUNG_N_MFCC * sizeof(float)];
+    uint16_t payload = LUNG_N_MFCC * sizeof(float);
+    pkt[0] = (uint8_t)(frame_idx & 0xFF);
+    pkt[1] = (uint8_t)((frame_idx >> 8) & 0xFF);
+    pkt[2] = (uint8_t)(payload & 0xFF);
+    pkt[3] = (uint8_t)((payload >> 8) & 0xFF);
     memcpy(&pkt[4], coeffs, payload);
 
     do {
@@ -489,11 +598,12 @@ static void on_mfcc_frame(int frame_idx, const float *coeffs)
  * RECORD AND STREAM
  *
  *   1. Send START header over NUS so the host can pre-allocate.
- *   2. Start SAADC — ISR fills audio_ring.
+ *   2. Start SAADC — ISR fills audio_ring and feeds both pipelines.
  *   3. BLE TX thread streams audio live over NUS.
  *   4. After total_halves: stop SAADC, set analog_recording=false.
  *   5. Wait for BLE TX thread to drain ring and send "finished\n".
- *   6. Run MFCC and stream coefficients over NUS.
+ *   6. Run heart MFCC → stream coefficients over NUS.
+ *   7. Run lung  MFCC → stream coefficients over NUS.
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
@@ -550,28 +660,55 @@ static void record_and_stream(void)
 
     LOG_INF("BLE audio stream complete — starting MFCC");
     LOG_INF("audio_ring high water = %u / %u", ring_high_water, AUDIO_RING_BYTES);
+
+    /* ── Heart MFCC stream ─────────────────────────────────────────
+     * CHANGE: was a single dsp_mfcc_finish(on_mfcc_frame) block.
+     *         Now two separate blocks: heart first, then lung.
+     *         dsp_mfcc_finish() v7.2 takes only a pipeline pointer;
+     *         the callback is registered beforehand via
+     *         dsp_mfcc_set_callback().
+     * ─────────────────────────────────────────────────────────── */
     led_set_purple();
+    LOG_INF("Heart MFCC: %d frames x %d coeffs", HEART_N_FRAMES, HEART_N_MFCC);
 
-    /* ── MFCC stream ── */
-    s_mfcc_n_frames_total = MFCC_N_FRAMES;
-    int n_frames = dsp_mfcc_finish(on_mfcc_frame);
+    dsp_mfcc_set_callback(&heart_pipe, on_heart_mfcc_frame, NULL);
+    int heart_frames = dsp_mfcc_finish(&heart_pipe);
+    if (heart_frames <= 0) {
+        LOG_ERR("heart dsp_mfcc_finish: %d", heart_frames);
+        bt_nus_send(NULL, "ERR:HEART_DSP", 13);
+        led_error_flash(led_set_yellow);
+        led_set_green();
+        return;
+    }
 
-    if (n_frames <= 0) {
-        LOG_ERR("dsp_mfcc_finish failed: %d", n_frames);
-        bt_nus_send(NULL, "ERR:DSP", 7);
+    int err;
+    k_sleep(K_MSEC(20));
+    do {
+        err = bt_nus_send(NULL, "MFCC_END\n", 9);
+        if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
+    } while (err == -ENOMEM || err == -EAGAIN);
+    LOG_INF("Heart MFCC done: %d frames", heart_frames);
+
+    /* ── Lung MFCC stream ──────────────────────────────────────── */
+    LOG_INF("Lung MFCC: %d frames x %d coeffs", LUNG_N_FRAMES, LUNG_N_MFCC);
+
+    dsp_mfcc_set_callback(&lung_pipe, on_lung_mfcc_frame, NULL);
+    int lung_frames = dsp_mfcc_finish(&lung_pipe);
+    if (lung_frames <= 0) {
+        LOG_ERR("lung dsp_mfcc_finish: %d", lung_frames);
+        bt_nus_send(NULL, "ERR:LUNG_DSP", 12);
         led_error_flash(led_set_yellow);
         led_set_green();
         return;
     }
 
     k_sleep(K_MSEC(20));
-    int err;
     do {
         err = bt_nus_send(NULL, "MFCC_END\n", 9);
         if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(5));
     } while (err == -ENOMEM || err == -EAGAIN);
+    LOG_INF("Lung MFCC done: %d frames", lung_frames);
 
-    LOG_INF("MFCC stream complete: %d frames x %d coeffs", n_frames, MFCC_N_MFCC);
     led_set_green();
     LOG_INF("record_and_stream() complete.");
 }
@@ -590,8 +727,22 @@ int main(void)
 
     k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
 
-    if (dsp_mfcc_init() != 0) {
-        LOG_ERR("dsp_mfcc_init failed");
+    /* CHANGE: was dsp_mfcc_init() — single instance, no arguments.
+     *         v7.2 requires:
+     *           (a) window buffer assigned to p->window BEFORE init
+     *           (b) pipeline pointer and config pointer passed in
+     *           (c) return value checked — init can fail if config
+     *               dimensions exceed the compiled scratch limits. */
+    heart_pipe.window = heart_window;
+    if (dsp_mfcc_init(&heart_pipe, &heart_mfcc_config) != 0) {
+        LOG_ERR("heart dsp_mfcc_init failed");
+        led_error_flash(led_set_yellow);
+        return -1;
+    }
+
+    lung_pipe.window = lung_window;
+    if (dsp_mfcc_init(&lung_pipe, &lung_mfcc_config) != 0) {
+        LOG_ERR("lung dsp_mfcc_init failed");
         led_error_flash(led_set_yellow);
         return -1;
     }
@@ -620,7 +771,7 @@ int main(void)
     k_thread_name_set(&ble_tx_thread_data, "ble_tx");
 
     led_set_red();
-    LOG_INF("AcoustEEEcare v6.7 ready — waiting for BLE connection");
+    LOG_INF("AcoustEEEcare v7.2 ready — waiting for BLE connection");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -633,17 +784,3 @@ int main(void)
 
     return 0;
 }
-
-/*
- * ════════════════════════════════════════════════════════════════════
- * MEMORY BUDGET (approximate, BLE-only)
- * ════════════════════════════════════════════════════════════════════
- *
- *   Zephyr kernel + BLE stack     ~90 KB
- *   s_decimated[20000] (dsp_mfcc)  40 KB
- *   DSP scratch                     ~7 KB
- *   audio_ring (BLE)                16 KB
- *   ping_pong[2][512]                2 KB
- *   BLE TX thread stack              2 KB
- *   Remaining headroom             ~93 KB   (32 KB freed vs USE_SD build)
- */

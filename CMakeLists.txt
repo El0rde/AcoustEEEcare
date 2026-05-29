@@ -9,6 +9,7 @@ zephyr_include_directories(
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx/drivers/include
     ${ZEPHYR_BASE}/modules/hal/nordic/nrfx/mdk
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # CHANGE v7.2: added src/generated/heart_mfcc_tables.c and

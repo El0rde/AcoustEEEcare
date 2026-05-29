@@ -1,36 +1,25 @@
 #!/usr/bin/env python3
 """
-AcoustEEEcare v6.4 — Host-side BLE receiver
+AcoustEEEcare v6.7 — Host-side BLE receiver
 ============================================================
-Supports both firmware compile modes:
+Matches firmware v6.7 (BLE-only, no SD card, no SEND command).
 
-  USE_SD true  (SD-first, default in v6.4):
-    Device sends: "REC:OK\\n" → MFCC stream → audio stream
-    Commands:     "REC"  — record + MFCC + audio pipeline
-                  "SEND" — retransmit last SD recording (no re-record)
-
-  USE_SD false (BLE-only, v6.3 behaviour):
-    Device sends: "START:<n>\\n" → audio stream → MFCC stream
-    Command:      "REC"  — record + stream pipeline
-
-MFCC wire protocol (both modes):
-    "MFCC_START:<n_frames>:<n_coeffs>\\n"   — header
-    [seq u16 LE][len u16 LE][float32 bytes]  — one packet per frame
-    "MFCC_END\\n"                            — trailer
-
-Audio wire protocol:
-    USE_SD true:  "REC:OK\\n" (end of recording phase)
-                  then MFCC stream (see above)
-                  then "START:<audio_bytes>\\n" → chunks → "finished\\n"
-    USE_SD false: "START:<audio_bytes>\\n" → chunks → "finished\\n"
-                  then MFCC stream (see above)
+Pipeline (single mode):
+    Host sends: "REC"
+    Device sends:
+        "START:<audio_bytes>\\n"  — audio stream header
+        [seq u16 LE][len u16 LE][int16 payload]  — audio chunks
+        "finished\\n"             — audio stream footer
+        "MFCC_START:<n_frames>:<n_coeffs>\\n"  — MFCC header
+        [seq u16 LE][len u16 LE][float32 bytes] — one packet per frame
+        "MFCC_END\\n"             — MFCC footer
 
 Error messages from firmware:
-    "ERR:<CODE>\\n"  — e.g. ERR:NOSD, ERR:CORRUPT, ERR:TIMEOUT
+    "ERR:<CODE>\\n"  — e.g. ERR:SAADC, ERR:TIMEOUT, ERR:DSP
 
 Usage:
     pip install bleak numpy
-    python receiver_v64.py
+    python receiver_v67.py
 """
 
 import asyncio
@@ -51,29 +40,19 @@ NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
 DEVICE_NAME  = "AcoustEEEcare"
 SAMPLE_RATE  = 8000
-OUTPUT_DIR   = Path("recording_29_05_2026_flexpcb_newmain")
+OUTPUT_DIR   = Path("recording_29_05_2026_flex_updated_main")
 SCAN_TIMEOUT = 20.0
 
-# Generous timeout: 10 s record + MFCC stream + audio stream + margin
+# 10 s record + audio stream + MFCC stream + margin
 REC_TIMEOUT  = 120.0
-# Timeout used for SEND command (no recording phase)
-SEND_TIMEOUT = 60.0
 
 
 # ── Packet / data-loss tracker ────────────────────────────────────────────────
 
 class PacketStats:
     """
-    Accumulates per-stream packet and byte counts so we can print a
-    detailed loss report at the end of each session.
-
-    Terminology
-    -----------
-    received   — packets / bytes we actually saw arrive over BLE
-    expected   — what the firmware header said we should see
-    lost_pkts  — gap events we detected (estimated missing packets)
-    lost_bytes — bytes we zero-filled due to those gaps
-    overhead   — 4-byte seq+len header on every chunk (not payload)
+    Accumulates per-stream packet and byte counts for a loss report
+    at the end of each session.
     """
 
     def __init__(self):
@@ -81,26 +60,25 @@ class PacketStats:
 
     def reset(self):
         # ── Audio ──────────────────────────────────────────────────
-        self.audio_pkts_rx    = 0   # packets actually received
-        self.audio_bytes_rx   = 0   # payload bytes actually received
-        self.audio_pkts_exp   = 0   # expected packet count (derived from expected_bytes / chunk_size)
+        self.audio_pkts_rx    = 0
+        self.audio_bytes_rx   = 0
         self.audio_bytes_exp  = 0   # from START:<n>
-        self.audio_pkts_lost  = 0   # gap events (packets)
-        self.audio_bytes_lost = 0   # zero-fill bytes added
-        self.audio_overhead   = 0   # seq+len header bytes (4 per packet)
+        self.audio_pkts_lost  = 0
+        self.audio_bytes_lost = 0
+        self.audio_overhead   = 0   # 4 B per packet (seq u16 + len u16)
 
         # ── MFCC ───────────────────────────────────────────────────
         self.mfcc_pkts_rx     = 0
         self.mfcc_bytes_rx    = 0
         self.mfcc_pkts_exp    = 0   # = n_frames (one packet per frame)
-        self.mfcc_bytes_exp   = 0   # from MFCC_START header
+        self.mfcc_bytes_exp   = 0   # n_frames * n_coeffs * 4
         self.mfcc_pkts_lost   = 0
         self.mfcc_bytes_lost  = 0
         self.mfcc_overhead    = 0
 
         # ── Session-level BLE totals ───────────────────────────────
-        self.total_notifications = 0   # every handle_notification call
-        self.total_raw_bytes     = 0   # sum of len(data) for all notifications
+        self.total_notifications = 0
+        self.total_raw_bytes     = 0
         self.session_start_time  = None
         self.session_end_time    = None
 
@@ -116,37 +94,25 @@ class PacketStats:
             return self.session_end_time - self.session_start_time
         return 0.0
 
-    # ── Derived ───────────────────────────────────────────────────
-
     @property
     def audio_loss_pct(self):
-        if self.audio_pkts_exp == 0:
-            return 0.0
         total = self.audio_pkts_rx + self.audio_pkts_lost
         return self.audio_pkts_lost * 100.0 / max(total, 1)
 
     @property
     def mfcc_loss_pct(self):
-        if self.mfcc_pkts_exp == 0:
-            return 0.0
         total = self.mfcc_pkts_rx + self.mfcc_pkts_lost
         return self.mfcc_pkts_lost * 100.0 / max(total, 1)
 
     @property
     def audio_throughput_kbps(self):
         dur = self.session_duration
-        if dur <= 0:
-            return 0.0
-        return (self.audio_bytes_rx * 8) / dur / 1000.0
+        return (self.audio_bytes_rx * 8) / max(dur, 0.001) / 1000.0
 
     @property
     def mfcc_throughput_kbps(self):
         dur = self.session_duration
-        if dur <= 0:
-            return 0.0
-        return (self.mfcc_bytes_rx * 8) / dur / 1000.0
-
-    # ── Report printer ────────────────────────────────────────────
+        return (self.mfcc_bytes_rx * 8) / max(dur, 0.001) / 1000.0
 
     def print_report(self):
         dur = self.session_duration
@@ -163,7 +129,7 @@ class PacketStats:
 
         # ── Audio stream ──────────────────────────────────────────
         print("  ── Audio stream ──────────────────────────────────")
-        _pct_rx = (self.audio_bytes_rx * 100 // max(self.audio_bytes_exp, 1))
+        _pct_rx = self.audio_bytes_rx * 100 // max(self.audio_bytes_exp, 1)
         print(f"  Packets received      : {self.audio_pkts_rx}")
         print(f"  Packets lost (gaps)   : {self.audio_pkts_lost}"
               f"  ({self.audio_loss_pct:.2f}% loss)")
@@ -179,7 +145,7 @@ class PacketStats:
 
         # ── MFCC stream ───────────────────────────────────────────
         print("  ── MFCC stream ───────────────────────────────────")
-        _mpct_rx = (self.mfcc_bytes_rx * 100 // max(self.mfcc_bytes_exp, 1))
+        _mpct_rx = self.mfcc_bytes_rx * 100 // max(self.mfcc_bytes_exp, 1)
         print(f"  Packets received      : {self.mfcc_pkts_rx}")
         print(f"  Packets lost (gaps)   : {self.mfcc_pkts_lost}"
               f"  ({self.mfcc_loss_pct:.2f}% loss)")
@@ -235,8 +201,6 @@ class State:
         self.reset()
 
     def reset(self):
-        # Session flags
-        self.rec_ok          = False   # "REC:OK" received  (USE_SD true only)
         self.error           = None    # last ERR: string from firmware
 
         # Stream routing
@@ -263,7 +227,6 @@ class State:
         # Progress display throttle
         self.last_progress   = 0.0
 
-        # Reset packet stats for the new session
         pstats.reset()
         pstats.start_session()
 
@@ -279,8 +242,7 @@ def _is_data_chunk(data: bytearray) -> bool:
       bytes[0:2] = seq (u16 LE)
       bytes[2:4] = payload_len (u16 LE)
       len(data)  = 4 + payload_len
-    Only checked while we are in AUDIO or MFCC mode to avoid false
-    positives on short control strings.
+    Only checked while in AUDIO or MFCC mode.
     """
     if state.mode == StreamMode.IDLE or len(data) < 5:
         return False
@@ -289,7 +251,6 @@ def _is_data_chunk(data: bytearray) -> bool:
 
 
 def handle_notification(_sender, data: bytearray):
-    # ── Session-level BLE accounting ──────────────────────────────
     pstats.total_notifications += 1
     pstats.total_raw_bytes     += len(data)
 
@@ -310,25 +271,18 @@ def _handle_text(data: bytearray):
     except Exception:
         return
 
-    # ── USE_SD true: recording phase complete ──
-    if text == "REC:OK":
-        state.rec_ok = True
-        print("\n  [PHASE1] Recording to SD complete — MFCC stream incoming")
-
     # ── Audio stream header ──
-    elif text.startswith("START:"):
+    if text.startswith("START:"):
         try:
             n = int(text.split(":")[1])
-            state.expected_bytes        = n
-            state.audio_samples         = bytearray()
-            state.audio_seq             = 0
-            state.audio_gaps            = 0
-            state.audio_chunks          = 0
-            state.audio_done            = False
-            state.mode                  = StreamMode.AUDIO
-
-            # Packet stats
-            pstats.audio_bytes_exp      = n
+            state.expected_bytes   = n
+            state.audio_samples    = bytearray()
+            state.audio_seq        = 0
+            state.audio_gaps       = 0
+            state.audio_chunks     = 0
+            state.audio_done       = False
+            state.mode             = StreamMode.AUDIO
+            pstats.audio_bytes_exp = n
 
             dur = n / 2 / SAMPLE_RATE
             print(f"\n  [AUDIO ] START — expecting {n} B "
@@ -354,19 +308,17 @@ def _handle_text(data: bytearray):
             parts = text.split(":")
             nf    = int(parts[1])
             nc    = int(parts[2])
-            state.mfcc_n_frames         = nf
-            state.mfcc_n_coeffs         = nc
-            state.mfcc_expected_b       = nf * nc * 4   # float32
-            state.mfcc_bytes            = bytearray()
-            state.mfcc_seq              = 0
-            state.mfcc_gaps             = 0
-            state.mfcc_chunks           = 0
-            state.mfcc_done             = False
-            state.mode                  = StreamMode.MFCC
-
-            # Packet stats — one packet per MFCC frame
-            pstats.mfcc_pkts_exp        = nf
-            pstats.mfcc_bytes_exp       = nf * nc * 4
+            state.mfcc_n_frames    = nf
+            state.mfcc_n_coeffs    = nc
+            state.mfcc_expected_b  = nf * nc * 4   # float32
+            state.mfcc_bytes       = bytearray()
+            state.mfcc_seq         = 0
+            state.mfcc_gaps        = 0
+            state.mfcc_chunks      = 0
+            state.mfcc_done        = False
+            state.mode             = StreamMode.MFCC
+            pstats.mfcc_pkts_exp   = nf
+            pstats.mfcc_bytes_exp  = nf * nc * 4
 
             print(f"\n  [MFCC  ] START — {nf} frames × {nc} coeffs "
                   f"= {state.mfcc_expected_b} B  "
@@ -389,13 +341,12 @@ def _handle_text(data: bytearray):
     # ── Firmware error ──
     elif text.startswith("ERR:"):
         state.error      = text
-        state.audio_done = True   # unblock any wait loop
+        state.audio_done = True   # unblock wait loop
         state.mfcc_done  = True
         state.mode       = StreamMode.IDLE
         print(f"\n  [ERROR ] Firmware reported: {text}")
 
     else:
-        # Unknown / debug string from firmware
         print(f"\n  [FW    ] {text!r}")
 
 
@@ -406,21 +357,19 @@ def _handle_audio_chunk(data: bytearray):
     ln      = struct.unpack_from("<H", data, 2)[0]
     payload = data[4: 4 + ln]
 
-    # ── Packet-stats accounting ────────────────────────────────────
     pstats.audio_pkts_rx  += 1
     pstats.audio_bytes_rx += ln
-    pstats.audio_overhead += 4   # seq u16 + len u16
+    pstats.audio_overhead += 4
 
     if seq != state.audio_seq:
         gap_pkts  = (seq - state.audio_seq) & 0xFFFF
         gap_bytes = gap_pkts * ln
         print(f"\n  [GAP   ] audio seq {state.audio_seq}→{seq} "
               f"({gap_pkts} pkt(s) missing, ~{gap_bytes} B zero-filled)")
-        # Zero-fill the gap so the WAV timestamp stays correct
-        state.audio_samples        += b"\x00\x00" * (gap_bytes // 2)
-        state.audio_gaps           += gap_pkts
-        pstats.audio_pkts_lost     += gap_pkts
-        pstats.audio_bytes_lost    += gap_bytes
+        state.audio_samples    += b"\x00\x00" * (gap_bytes // 2)
+        state.audio_gaps       += gap_pkts
+        pstats.audio_pkts_lost += gap_pkts
+        pstats.audio_bytes_lost += gap_bytes
 
     state.audio_samples += payload
     state.audio_seq      = (seq + 1) & 0xFFFF
@@ -451,20 +400,19 @@ def _handle_mfcc_chunk(data: bytearray):
     ln      = struct.unpack_from("<H", data, 2)[0]
     payload = data[4: 4 + ln]
 
-    # ── Packet-stats accounting ────────────────────────────────────
     pstats.mfcc_pkts_rx  += 1
     pstats.mfcc_bytes_rx += ln
-    pstats.mfcc_overhead += 4   # seq u16 + len u16
+    pstats.mfcc_overhead += 4
 
     if seq != state.mfcc_seq:
         gap_pkts  = (seq - state.mfcc_seq) & 0xFFFF
         gap_bytes = gap_pkts * ln
         print(f"\n  [GAP   ] MFCC seq {state.mfcc_seq}→{seq} "
               f"({gap_pkts} pkt(s) missing, ~{gap_bytes} B zero-filled)")
-        state.mfcc_bytes         += b"\x00" * gap_bytes
-        state.mfcc_gaps          += gap_pkts
-        pstats.mfcc_pkts_lost    += gap_pkts
-        pstats.mfcc_bytes_lost   += gap_bytes
+        state.mfcc_bytes        += b"\x00" * gap_bytes
+        state.mfcc_gaps         += gap_pkts
+        pstats.mfcc_pkts_lost   += gap_pkts
+        pstats.mfcc_bytes_lost  += gap_bytes
 
     state.mfcc_bytes += payload
     state.mfcc_seq    = (seq + 1) & 0xFFFF
@@ -490,7 +438,6 @@ def save_wav(samples: bytearray, filename: Path) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     target = state.expected_bytes
 
-    # Trim or pad to exact expected size
     if len(samples) > target:
         samples = samples[:target]
     elif len(samples) < target:
@@ -540,15 +487,8 @@ def save_mfcc(mfcc_bytes: bytearray, filename: Path) -> None:
 
 # ── Session completion detector ───────────────────────────────────────────────
 
-def _session_complete(use_sd_mode: bool) -> bool:
-    """
-    Return True when a full session has been received.
-
-    USE_SD true  pipeline order: REC:OK → MFCC_END → finished
-    USE_SD false pipeline order: finished → MFCC_END
-
-    Either way we need both audio_done and mfcc_done (or an error).
-    """
+def _session_complete() -> bool:
+    """True when both audio and MFCC streams have finished, or on error."""
     if state.error:
         return True
     return state.audio_done and state.mfcc_done
@@ -556,15 +496,12 @@ def _session_complete(use_sd_mode: bool) -> bool:
 
 # ── Wait loop ─────────────────────────────────────────────────────────────────
 
-async def _wait_for_completion(timeout: float, use_sd_mode: bool) -> bool:
-    """
-    Poll until _session_complete() or timeout.
-    Returns True if completed cleanly, False on timeout.
-    """
+async def _wait_for_completion(timeout: float) -> bool:
+    """Poll until _session_complete() or timeout. Returns True if clean."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         await asyncio.sleep(0.05)
-        if _session_complete(use_sd_mode):
+        if _session_complete():
             return True
     return False
 
@@ -588,7 +525,6 @@ def _save_session(rec_num: int) -> None:
     else:
         print("  [WARN  ] No MFCC data received — .npy not saved.")
 
-    # ── Print full packet / loss report ───────────────────────────
     pstats.print_report()
 
 
@@ -613,7 +549,6 @@ async def run():
         print()
         print("Commands:")
         print("  ENTER      — send REC (record + stream)")
-        print("  s + ENTER  — send SEND (retransmit last SD recording, USE_SD=true only)")
         print("  q + ENTER  — quit")
         print()
 
@@ -625,7 +560,7 @@ async def run():
                     None,
                     lambda: input(
                         f"{sep}\n"
-                        f"[Ready #{rec_num}]  ENTER=REC  s=SEND  q=quit: "
+                        f"[Ready #{rec_num}]  ENTER=REC  q=quit: "
                     )
                 )
 
@@ -634,26 +569,6 @@ async def run():
                 if cmd == "q":
                     print("Quitting.")
                     break
-
-                elif cmd == "s":
-                    # ── SEND command (USE_SD true only) ──
-                    state.reset()
-                    print(f"\nSending SEND command (retransmit from SD)…")
-                    await client.write_gatt_char(
-                        NUS_RX_CHAR_UUID, b"SEND", response=False
-                    )
-                    print(f"  Waiting up to {SEND_TIMEOUT:.0f} s for streams…")
-                    completed = await _wait_for_completion(
-                        SEND_TIMEOUT, use_sd_mode=True
-                    )
-                    if not completed:
-                        print("\n  [WARN  ] Timeout — saving partial data.")
-                    elif state.error:
-                        print(f"\n  [ERROR ] Firmware error: {state.error}")
-                    else:
-                        print(f"\n  [DONE  ] SEND complete.")
-                    _save_session(rec_num)
-                    rec_num += 1
 
                 else:
                     # ── REC command ──
@@ -664,16 +579,10 @@ async def run():
                     )
                     print(
                         f"  Waiting up to {REC_TIMEOUT:.0f} s "
-                        f"(10 s record + MFCC + audio stream)…"
+                        f"(10 s record + audio stream + MFCC stream)…"
                     )
 
-                    # Detect firmware mode from first message:
-                    #   USE_SD true  → first message is "REC:OK"
-                    #   USE_SD false → first message is "START:<n>"
-                    # We wait for either audio_done+mfcc_done or error.
-                    completed = await _wait_for_completion(
-                        REC_TIMEOUT, use_sd_mode=True   # permissive; handles both
-                    )
+                    completed = await _wait_for_completion(REC_TIMEOUT)
                     if not completed:
                         print("\n  [WARN  ] Timeout — saving partial data.")
                     elif state.error:

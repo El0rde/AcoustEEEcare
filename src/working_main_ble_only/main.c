@@ -251,7 +251,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 #endif /* ENABLE_DC_REMOVAL */
 #endif /* DIAGNOSTIC_TONE */
 
-        /* ── Optional Fix #6: Software bandpass (20–1000 Hz biquad) ──────
+        /* ── Optional Fix #6: Software bandpass (10–1000 Hz biquad) ──────
          * Uncomment and implement biquad_apply() with scipy-generated Q15
          * coefficients when moving to chest auscultation recordings.
          * Apply AFTER the DC removal block above.

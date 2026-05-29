@@ -1,43 +1,33 @@
 /*
- * AcoustEEEcare — SAADC BLE + SD Card Edition
+ * AcoustEEEcare — SAADC BLE Edition
  * ============================================================
- * v6.6 — Fixed Zephyr FS API usage (fat_fs type, fs_data pointer)
+ * v6.7 — BLE-only; SD card support removed. Floating-pin noise fix.
  *
- * CHANGES FROM v6.5:
- *   Added #include <ff.h> back under USE_SD (was removed in v6.5).
- *     Zephyr's own shell.c (subsys/fs/shell.c) includes <ff.h> when
- *     CONFIG_FAT_FILESYSTEM_ELM is set.  The FATFS typedef lives in
- *     ff.h — without it the compiler cannot size the fat_fs variable.
- *     Note: ff.h is provided by the fatfs module (west managed); it
- *     is NOT a file you write yourself.
+ * CHANGES FROM v6.6:
+ *   Removed all SD card code (USE_SD, sd_ring, sd_writer_thread,
+ *     fs_mount, ff.h, disk_access, etc.).  BLE-only behaviour matches
+ *     the original v6.3 design.
  *
- *   Removed redundant k_sem_give(&sd_data_sem) from ISR.
- *     The semaphore is given once per recording in record_and_stream()
- *     to wake the SD writer thread.  Giving it on every half-buffer
- *     floods the semaphore counter and masks real backpressure.
+ *   Fixed floating-input noise on AIN0:
+ *     resistor_p changed from NRF_SAADC_RESISTOR_DISABLED to
+ *     NRF_SAADC_RESISTOR_PULLDOWN.  The nRF52840 SAADC has ~11 kΩ
+ *     internal pull resistors.  When AIN0 is disconnected (floating),
+ *     enabling the pulldown ties it to GND, which eliminates the
+ *     random noise the floating node picks up.
+ *     Re-enable the microphone and this resistor is still fine for
+ *     cap-coupled MEMS mics (the bias resistor on the mic board wins).
+ *     If you drive the pin from a low-impedance source you can change
+ *     back to NRF_SAADC_RESISTOR_DISABLED.
  *
- *   Added LOG_WRN_ONCE() for ring drop events so silent data loss is
- *     visible in the log.
- *
- * REMAINING DESIGN (unchanged from v6.5):
- *   - No fs_write() in ISR — only ring_buf_put() + k_sem_give()
- *   - Two ring buffers: audio_ring (16 KB BLE), sd_ring (32 KB SD)
- *   - SD writer thread drains sd_ring in 512-byte aligned sectors
- *   - XOR checksum appended at end of file
- *   - SPI SD at 4 MHz for broad card compatibility
+ *   Added NOISE_GATE_THRESHOLD as a second software layer.
+ *     Set to 0 to disable (default). Raise to e.g. 10–20 raw ADC
+ *     counts if residual noise is still audible on the host side.
  *
  * TARGET HARDWARE
  *   Seeed XIAO nRF52840
- *   Analog MEMS microphone on AIN0 (P0.02), cap-coupled
- *   SD card on SPI2, CS on P0.28 (adjust overlay to your wiring)
- *
- * COMPILE SWITCH
- *   #define USE_SD  true   — record to SD + BLE stream
- *   #define USE_SD  false  — BLE-only (v6.3 behaviour, no SD required)
+ *   Analog MEMS microphone on AIN0 (P0.02), cap-coupled (optional)
  * ============================================================
  */
-
-#define USE_SD  false   /* set false for BLE-only mode */
 
 /* ══════════════════════════════════════════════════════════════════
  * INCLUDES
@@ -45,7 +35,6 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-// #include <math.h>
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -62,26 +51,12 @@
 #include <zephyr/sys/ring_buffer.h>
 #include <zephyr/sys/byteorder.h>
 #include "zephyr/kernel/thread_stack.h"
-// #include "zephyr/sys/time_units.h"
 
 #include <nrfx.h>
 #include <drivers/nrfx_errors.h>
 #include <nrfx_saadc.h>
 
 #include "dsp_mfcc.h"
-
-#if USE_SD
-#include <zephyr/fs/fs.h>
-#include <zephyr/storage/disk_access.h>
-/*
- * ff.h provides the FATFS typedef (the ELM FatFs work-area struct).
- * It is supplied by the fatfs west module when CONFIG_FAT_FILESYSTEM_ELM=y.
- * Zephyr's own subsys/fs/shell.c includes it the same way.
- * Do NOT write your own ff.h — west pulls the real one from
- * https://github.com/zephyrproject-rtos/fatfs
- */
-#include <ff.h>
-#endif
 
 LOG_MODULE_REGISTER(AcoustEEEcare);
 
@@ -93,10 +68,15 @@ LOG_MODULE_REGISTER(AcoustEEEcare);
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
     .channel_config = {
-        .resistor_p = NRF_SAADC_RESISTOR_DISABLED,
+        .resistor_p = NRF_SAADC_RESISTOR_VDD1_2, /* FIX: was DISABLED.
+                                                     * Pulls AIN0 to GND when
+                                                     * nothing drives the pin,
+                                                     * eliminating floating-
+                                                     * input noise.  ~11 kΩ
+                                                     * internal pull. */
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
-        .gain       = NRF_SAADC_GAIN1_4,
-        .reference  = NRF_SAADC_REFERENCE_VDD4,
+        .gain       = NRF_SAADC_GAIN1_4,                 /* tune — see note */
+        .reference  = NRF_SAADC_REFERENCE_VDD4,      /* 0.6 V, decoupled from VDD */
         .acq_time   = NRF_SAADC_ACQTIME_10US,
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
         .burst      = NRF_SAADC_BURST_DISABLED,
@@ -109,11 +89,16 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
 static volatile uint32_t saadc_dma_overruns = 0;
 
 /* DC removal: high-pass IIR, alpha = 1/256.
- * Init to 0 — converges within ~256 samples (~32 ms at 8 kHz).
- * DO NOT init to 2048: that creates a large transient spike at the
- * start of every recording. */
+ * Init to 0 — converges within ~256 samples (~32 ms at 8 kHz). */
 #define ENABLE_DC_REMOVAL
 static int32_t dc_estimate = 0;
+
+/*
+ * Software noise gate — zeroes samples whose magnitude is below this
+ * threshold (in raw ADC counts after DC removal).
+ * Set to 0 to disable.  Try 10–20 if residual noise still reaches the host.
+ */
+#define NOISE_GATE_THRESHOLD  0
 
 /* ══════════════════════════════════════════════════════════════════
  * AUDIO PARAMS
@@ -154,224 +139,15 @@ static struct k_thread ble_tx_thread_data;
 static void ble_tx_thread_fn(void *a, void *b, void *c);
 
 /* ══════════════════════════════════════════════════════════════════
- * SD CARD GLOBALS  (USE_SD true only)
- * ══════════════════════════════════════════════════════════════════ */
-#if USE_SD
-
-#define AUDIO_FILE_PATH      "/SD:/analog.pcm"
-#define SD_CARD_MOUNT_POINT  "/SD:"
-#define CHECKSUM_SIZE        sizeof(uint32_t)
-
-/*
- * SD ring buffer — 32 KB.
- * At 16 000 bytes/s (8 kHz x 2 bytes) this holds 2 s of audio,
- * giving the FAT writer thread ample headroom even on slow cards.
- * The ISR fills it; the SD writer thread drains it.
- * NO fs_write() calls happen in the ISR.
- */
-#define SD_RING_BYTES  (32 * 1024)
-RING_BUF_DECLARE(sd_ring, SD_RING_BYTES);
-
-static atomic_t  sd_ring_drops;
-static uint32_t  sd_ring_high_water = 0;
-
-/*
- * sd_data_sem — given ONCE per recording by record_and_stream() to
- * wake the SD writer thread.  NOT given per half-buffer from the ISR;
- * flooding the semaphore counter served no purpose and masked
- * backpressure.  The writer thread polls ring_buf_size_get() in its
- * own loop.
- */
-static K_SEM_DEFINE(sd_data_sem, 0, K_SEM_MAX_LIMIT);
-/* Semaphore: SD writer thread signals main thread when file is closed */
-static K_SEM_DEFINE(sd_done_sem, 0, 1);
-
-/* SD writer thread */
-#define SD_WRITER_STACK_SIZE  2048
-#define SD_WRITER_PRIORITY    6   /* lower priority than BLE TX (5) */
-static K_THREAD_STACK_DEFINE(sd_writer_stack, SD_WRITER_STACK_SIZE);
-static struct k_thread sd_writer_thread_data;
-static void sd_writer_thread_fn(void *a, void *b, void *c);
-
-/*
- * SD filesystem state.
- *
- * fat_fs  — FATFS work-area struct (typedef from ff.h / ELM FatFs).
- *            This is the actual buffer FatFs uses internally to track
- *            the mounted volume.  Its address goes into mp.fs_data.
- *
- * mp      — Zephyr fs_mount_t descriptor.
- *            .type    = FS_FATFS  → integer enum telling the VFS switch
- *                                   which filesystem ops to call.
- *            .fs_data = &fat_fs   → pointer to the FATFS work area.
- *
- * v6.5 BUG: mp.fs_data was set to &FS_FATFS — the address of an
- * integer constant — not &fat_fs.  This caused fs_mount() to write the
- * FatFs volume state into a random read-only location, producing a
- * hard-fault or silent memory corruption.
- */
-static FATFS            fat_fs;          /* ELM FatFs work area — sized by ff.h */
-static struct fs_mount_t mp = {
-    .type      = FS_FATFS,              /* integer type ID — tells VFS "use FAT" */
-    .mnt_point = SD_CARD_MOUNT_POINT,
-    .fs_data   = &fat_fs,              /* pointer to FATFS work area — FIXED */
-};
-static bool             sd_mounted  = false;
-static struct fs_file_t sd_file;
-static uint32_t         sd_checksum = 0;   /* running XOR */
-
-/* SD writer write buffer — 512 bytes aligns to FAT sector size */
-#define SD_WRITE_BUF_SIZE  512
-static uint8_t sd_write_buf[SD_WRITE_BUF_SIZE];
-
-/* XOR checksum over raw bytes */
-static uint32_t compute_checksum(const uint8_t *data, uint32_t len)
-{
-    uint32_t cs = 0;
-    for (uint32_t i = 0; i < len; i++) cs ^= data[i];
-    return cs;
-}
-
-/* ── SD card init ─────────────────────────────────────────────── */
-static int init_sd_card(void)
-{
-    static const char *disk_pdrv = "SD";
-    uint64_t memory_size_mb;
-    uint32_t block_count, block_size;
-
-    LOG_INF("Initialising SD card...");
-
-    if (disk_access_init(disk_pdrv) != 0) {
-        LOG_ERR("disk_access_init failed");
-        return -1;
-    }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
-        LOG_ERR("Cannot get sector count");
-        return -1;
-    }
-    if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
-        LOG_ERR("Cannot get sector size");
-        return -1;
-    }
-
-    memory_size_mb = (uint64_t)block_count * block_size / (1024 * 1024);
-    LOG_INF("SD card: %u MB", (uint32_t)memory_size_mb);
-
-    /*
-     * mp is fully initialised at declaration (type, mnt_point, fs_data).
-     * Just call fs_mount() — no patching needed here.
-     */
-    if (fs_mount(&mp) != 0) {
-        LOG_ERR("fs_mount failed");
-        return -1;
-    }
-
-    LOG_INF("SD mounted at %s", SD_CARD_MOUNT_POINT);
-    sd_mounted = true;
-    return 0;
-}
-
-/* ── SD writer thread ─────────────────────────────────────────── */
-/*
- * Runs at PRIORITY 6 (below BLE TX at 5).
- * Lifecycle per recording:
- *   1. Waits on sd_data_sem (given once per REC by record_and_stream).
- *   2. Drains sd_ring in SD_WRITE_BUF_SIZE chunks while
- *      analog_recording is true or ring is non-empty.
- *   3. Flushes any partial tail buffer.
- *   4. Appends 4-byte XOR checksum.
- *   5. Closes the file and signals sd_done_sem.
- *   6. Goes back to waiting on sd_data_sem.
- *
- * The file is opened by record_and_stream() before SAADC starts,
- * so the writer thread never needs to open it.
- */
-static void sd_writer_thread_fn(void *a, void *b, void *c)
-{
-    ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-
-    while (true) {
-        /* Wait until a recording starts */
-        k_sem_take(&sd_data_sem, K_FOREVER);
-
-        if (!sd_mounted) {
-            LOG_ERR("SD writer: not mounted, discarding data");
-            /* Drain the ring so it doesn't back up */
-            while (ring_buf_size_get(&sd_ring) > 0) {
-                uint32_t avail = ring_buf_size_get(&sd_ring);
-                uint32_t drain = avail < SD_WRITE_BUF_SIZE ? avail : SD_WRITE_BUF_SIZE;
-                ring_buf_get(&sd_ring, sd_write_buf, drain);
-            }
-            k_sem_give(&sd_done_sem);
-            continue;
-        }
-
-        LOG_INF("SD writer: starting write loop");
-        uint32_t total_written = 0;
-        sd_checksum = 0;
-
-        /* Drain loop: keep going while recording is active OR ring has data */
-        while (analog_recording || ring_buf_size_get(&sd_ring) > 0) {
-            uint32_t avail = ring_buf_size_get(&sd_ring);
-
-            if (avail == 0) {
-                /* Nothing to write yet — yield and retry */
-                k_sleep(K_MSEC(1));
-                continue;
-            }
-
-            /*
-             * Write in SD_WRITE_BUF_SIZE aligned blocks while recording,
-             * but allow partial writes once recording has stopped (tail flush).
-             */
-            bool recording_done = !analog_recording;
-            uint32_t to_write   = avail < SD_WRITE_BUF_SIZE ? avail : SD_WRITE_BUF_SIZE;
-
-            /* During recording: hold partial blocks so we write full sectors */
-            if (!recording_done && to_write < SD_WRITE_BUF_SIZE) {
-                k_sleep(K_MSEC(1));
-                continue;
-            }
-
-            ring_buf_get(&sd_ring, sd_write_buf, to_write);
-            sd_checksum ^= compute_checksum(sd_write_buf, to_write);
-
-            ssize_t written = fs_write(&sd_file, sd_write_buf, to_write);
-            if (written < 0) {
-                LOG_ERR("SD write error: %d at byte %u", (int)written, total_written);
-                /* Continue anyway — partial file is better than crash */
-            } else {
-                total_written += (uint32_t)written;
-            }
-        }
-
-        /* Append XOR checksum */
-        fs_write(&sd_file, &sd_checksum, CHECKSUM_SIZE);
-        fs_close(&sd_file);
-
-        LOG_INF("SD writer: %u audio bytes written, checksum=0x%08X",
-                total_written, sd_checksum);
-        LOG_INF("SD writer: sd_ring high water = %u / %u", sd_ring_high_water, SD_RING_BYTES);
-
-        k_sem_give(&sd_done_sem);
-    }
-}
-
-#endif /* USE_SD */
-
-/* ══════════════════════════════════════════════════════════════════
  * SAADC EVENT HANDLER
  *
  * On NRFX_SAADC_EVT_DONE (one half-buffer of HALF_BUF_SAMPLES ready):
- *   1. DC removal — in-place IIR high-pass on filled_buf
- *   2. dsp_mfcc_feed_chunk() — on-the-fly bandpass + decimate
- *   3a. [USE_SD true]  push to sd_ring (SD writer thread drains it)
- *   3b. push to audio_ring for BLE TX thread (both modes)
+ *   1. DC removal         — in-place IIR high-pass
+ *   2. Noise gate         — optional zero-below-threshold (NOISE_GATE_THRESHOLD)
+ *   3. dsp_mfcc_feed_chunk() — on-the-fly bandpass + decimate
+ *   4. ring_buf_put()     — push to audio_ring for BLE TX thread
  *
- * IMPORTANT:
- *   No fs_write() here. Only ring_buf_put() and k_sem_give().
- *   sd_data_sem is NOT given here — it is given once per recording
- *   by record_and_stream() to avoid flooding the semaphore counter.
+ * No fs_write() here — only ring_buf_put() and k_sem_give().
  * ══════════════════════════════════════════════════════════════════ */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
@@ -393,34 +169,20 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         }
 #endif
 
-        /* ── Step 2: On-the-fly bandpass + decimate ── */
-        dsp_mfcc_feed_chunk(filled_buf, HALF_BUF_SAMPLES);
-
-#if USE_SD
-        /* ── Step 3a: Push to SD ring buffer (ISR-safe, no fs_write) ── */
-        if (analog_recording) {
-            uint32_t sd_written = ring_buf_put(&sd_ring,
-                                               (const uint8_t *)filled_buf,
-                                               HALF_BUF_BYTES);
-            if (sd_written != HALF_BUF_BYTES) {
-                atomic_inc(&sd_ring_drops);
-                LOG_WRN_ONCE("sd_ring overflow — audio will have gaps!");
-            } else {
-                uint32_t fill = ring_buf_size_get(&sd_ring);
-                if (fill > sd_ring_high_water) {
-                    sd_ring_high_water = fill;
-                }
+        /* ── Step 2: Software noise gate ── */
+#if NOISE_GATE_THRESHOLD > 0
+        for (uint32_t i = 0; i < HALF_BUF_SAMPLES; i++) {
+            if (filled_buf[i] > -NOISE_GATE_THRESHOLD &&
+                filled_buf[i] <  NOISE_GATE_THRESHOLD) {
+                filled_buf[i] = 0;
             }
-            /*
-             * Do NOT give sd_data_sem here.
-             * It is given once per recording in record_and_stream()
-             * to wake the SD writer thread.  The writer polls
-             * ring_buf_size_get() internally — no per-chunk signal needed.
-             */
         }
 #endif
 
-        /* ── Step 3b: Push to BLE audio ring (both modes) ── */
+        /* ── Step 3: On-the-fly bandpass + decimate ── */
+        dsp_mfcc_feed_chunk(filled_buf, HALF_BUF_SAMPLES);
+
+        /* ── Step 4: Push to BLE audio ring ── */
         uint32_t ble_written = ring_buf_put(&audio_ring,
                                             (const uint8_t *)filled_buf,
                                             HALF_BUF_BYTES);
@@ -478,7 +240,7 @@ static int saadc_start_streaming(void)
 {
     nrfx_err_t err;
     saadc_dma_overruns = 0;
-    dc_estimate        = 0;   /* Reset to 0, not 2048 — avoids initial spike */
+    dc_estimate        = 0;
 
     dsp_mfcc_reset();
 
@@ -497,15 +259,9 @@ static int saadc_start_streaming(void)
 static void saadc_stop_streaming(void)
 {
     nrfx_saadc_uninit();
-    LOG_INF("SAADC stopped (overruns=%u, ble_drops=%u, sd_drops=%u)",
+    LOG_INF("SAADC stopped (overruns=%u, ble_drops=%u)",
             saadc_dma_overruns,
-            (uint32_t)atomic_get(&ring_drops)
-#if USE_SD
-            , (uint32_t)atomic_get(&sd_ring_drops)
-#else
-            , 0U
-#endif
-    );
+            (uint32_t)atomic_get(&ring_drops));
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -732,24 +488,18 @@ static void on_mfcc_frame(int frame_idx, const float *coeffs)
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM
  *
- * USE_SD true:
- *   1. Open /SD:/analog.pcm
- *   2. Give sd_data_sem ONCE to wake the SD writer thread
- *   3. SAADC runs — ISR fills both sd_ring and audio_ring in parallel
- *   4. BLE TX thread streams audio live over NUS
- *   5. After total_halves: stop SAADC, set analog_recording=false
- *   6. Wait for SD writer thread to flush, append checksum, close file
- *   7. Stream MFCC over NUS
- *
- * USE_SD false:
- *   BLE stream only — no SD involvement.
+ *   1. Send START header over NUS so the host can pre-allocate.
+ *   2. Start SAADC — ISR fills audio_ring.
+ *   3. BLE TX thread streams audio live over NUS.
+ *   4. After total_halves: stop SAADC, set analog_recording=false.
+ *   5. Wait for BLE TX thread to drain ring and send "finished\n".
+ *   6. Run MFCC and stream coefficients over NUS.
  * ══════════════════════════════════════════════════════════════════ */
 static void record_and_stream(void)
 {
     const uint32_t total_halves =
         (TOTAL_AUDIO_SAMPLES + HALF_BUF_SAMPLES - 1) / HALF_BUF_SAMPLES;
 
-    /* ── Reset BLE audio ring ── */
     ring_buf_reset(&audio_ring);
     atomic_set(&ring_drops, 0);
     ring_high_water = 0;
@@ -757,40 +507,7 @@ static void record_and_stream(void)
     k_sem_reset(&half_produced_sem);
     k_sem_reset(&tx_done_sem);
 
-#if USE_SD
-    /* ── Reset SD ring ── */
-    ring_buf_reset(&sd_ring);
-    atomic_set(&sd_ring_drops, 0);
-    sd_ring_high_water = 0;
-    k_sem_reset(&sd_done_sem);
-
-    if (!sd_mounted) {
-        LOG_ERR("SD not mounted — aborting REC");
-        bt_nus_send(NULL, "ERR:NOSD", 8);
-        led_error_flash(led_set_yellow);
-        return;
-    }
-
-    /* Delete old file, open new one */
-    fs_unlink(AUDIO_FILE_PATH);
-    fs_file_t_init(&sd_file);
-    if (fs_open(&sd_file, AUDIO_FILE_PATH,
-                FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC) < 0) {
-        LOG_ERR("Cannot open SD file for recording");
-        bt_nus_send(NULL, "ERR:SD_OPEN", 11);
-        led_error_flash(led_set_yellow);
-        return;
-    }
-
-    /*
-     * Wake the SD writer thread exactly once.
-     * The writer loops internally on ring_buf_size_get() — it does not
-     * need a semaphore signal per half-buffer.
-     */
-    k_sem_give(&sd_data_sem);
-#endif
-
-    /* Send audio length to host so it can pre-allocate */
+    /* Notify host of expected byte count */
     char hdr[32];
     snprintf(hdr, sizeof(hdr), "START:%u\n", (uint32_t)TOTAL_AUDIO_BYTES);
     bt_nus_send(NULL, hdr, strlen(hdr));
@@ -801,18 +518,14 @@ static void record_and_stream(void)
 
     if (saadc_start_streaming() != 0) {
         analog_recording = false;
-#if USE_SD
-        fs_close(&sd_file);
-#endif
         led_error_flash(led_set_yellow);
         bt_nus_send(NULL, "ERR:SAADC", 9);
         return;
     }
 
-    LOG_INF("Recording %d s @ %d Hz (USE_SD=%s)...", DURATION_S, SAMPLING_RATE,
-            USE_SD ? "true" : "false");
+    LOG_INF("Recording %d s @ %d Hz...", DURATION_S, SAMPLING_RATE);
 
-    /* Count half-buffers */
+    /* Count half-buffers produced by the ISR */
     for (uint32_t h = 0; h < total_halves; h++) {
         if (k_sem_take(&half_produced_sem, K_MSEC(200)) != 0) {
             LOG_ERR("SAADC timeout at half-buffer %u/%u", h, total_halves);
@@ -828,30 +541,15 @@ static void record_and_stream(void)
     saadc_stop_streaming();
     analog_recording = false;
 
-    /* Wake BLE TX thread to drain remaining audio_ring and send "finished\n" */
+    /* Wake BLE TX thread to drain the ring and send "finished\n" */
     k_sem_give(&audio_data_sem);
 
-    /* Wait for BLE audio stream to complete */
     if (k_sem_take(&tx_done_sem, K_MSEC(10000)) != 0) {
         LOG_WRN("BLE TX did not finish within 10 s");
     }
 
-#if USE_SD
-    /*
-     * SD writer thread detects analog_recording==false, drains the
-     * remaining sd_ring, flushes the tail, appends checksum, closes
-     * the file, then signals sd_done_sem.
-     */
-    LOG_INF("Waiting for SD writer to flush and close...");
-    if (k_sem_take(&sd_done_sem, K_MSEC(15000)) != 0) {
-        LOG_ERR("SD writer did not finish within 15 s — file may be truncated");
-    } else {
-        LOG_INF("SD file closed: %s (checksum=0x%08X)", AUDIO_FILE_PATH, sd_checksum);
-        bt_nus_send(NULL, "SD:OK\n", 6);
-    }
-#endif
-
     LOG_INF("BLE audio stream complete — starting MFCC");
+    LOG_INF("audio_ring high water = %u / %u", ring_high_water, AUDIO_RING_BYTES);
     led_set_purple();
 
     /* ── MFCC stream ── */
@@ -915,31 +613,14 @@ int main(void)
                           sd_adv, ARRAY_SIZE(sd_adv));
     if (err) { LOG_ERR("bt_le_adv_start: %d", err); return err; }
 
-    /* BLE TX thread */
     k_thread_create(&ble_tx_thread_data, ble_tx_stack,
                     K_THREAD_STACK_SIZEOF(ble_tx_stack),
                     ble_tx_thread_fn, NULL, NULL, NULL,
                     BLE_TX_PRIORITY, 0, K_NO_WAIT);
     k_thread_name_set(&ble_tx_thread_data, "ble_tx");
 
-#if USE_SD
-    /* SD writer thread — starts blocked on sd_data_sem */
-    k_thread_create(&sd_writer_thread_data, sd_writer_stack,
-                    K_THREAD_STACK_SIZEOF(sd_writer_stack),
-                    sd_writer_thread_fn, NULL, NULL, NULL,
-                    SD_WRITER_PRIORITY, 0, K_NO_WAIT);
-    k_thread_name_set(&sd_writer_thread_data, "sd_writer");
-
-    /* SD card init — non-fatal if card absent */
-    if (init_sd_card() != 0) {
-        LOG_ERR("SD card init failed — REC will return ERR:NOSD");
-        led_error_flash(led_set_yellow);
-    }
-#endif
-
     led_set_red();
-    LOG_INF("AcoustEEEcare v6.6 ready (USE_SD=%s) — waiting for BLE connection",
-            USE_SD ? "true" : "false");
+    LOG_INF("AcoustEEEcare v6.7 ready — waiting for BLE connection");
 
     while (true) {
         k_sleep(K_MSEC(100));
@@ -955,51 +636,14 @@ int main(void)
 
 /*
  * ════════════════════════════════════════════════════════════════════
- * REQUIRED prj.conf ADDITIONS for USE_SD true
- * ════════════════════════════════════════════════════════════════════
- *
- * CONFIG_SPI=y
- * CONFIG_DISK_ACCESS=y
- * CONFIG_DISK_DRIVER_SDMMC=y
- * CONFIG_FAT_FILESYSTEM_ELM=y
- * CONFIG_FILE_SYSTEM=y
- * CONFIG_FILE_SYSTEM_MAX_TYPES=2
- * CONFIG_HEAP_MEM_POOL_SIZE=8192
- * CONFIG_MAIN_STACK_SIZE=4096
- *
- * ════════════════════════════════════════════════════════════════════
- * REQUIRED devicetree overlay  (e.g. boards/xiao_ble.overlay)
- * ════════════════════════════════════════════════════════════════════
- *
- * &spi2 {
- *     status = "okay";
- *     cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;   // adjust to your CS pin
- *
- *     sdhc: sdhc@0 {
- *         compatible = "zephyr,sdhc-spi-slot";
- *         reg = <0>;
- *         status = "okay";
- *         spi-max-frequency = <4000000>;          // 4 MHz — safe for all cards
- *         disk {
- *             compatible = "zephyr,sdmmc-disk";
- *             status = "okay";
- *         };
- *     };
- * };
- *
- * ════════════════════════════════════════════════════════════════════
- * MEMORY BUDGET (approximate, USE_SD true)
+ * MEMORY BUDGET (approximate, BLE-only)
  * ════════════════════════════════════════════════════════════════════
  *
  *   Zephyr kernel + BLE stack     ~90 KB
  *   s_decimated[20000] (dsp_mfcc)  40 KB
  *   DSP scratch                     ~7 KB
- *   audio_ring  (BLE)               16 KB
- *   sd_ring     (SD writer)         32 KB
+ *   audio_ring (BLE)                16 KB
  *   ping_pong[2][512]                2 KB
  *   BLE TX thread stack              2 KB
- *   SD writer thread stack           2 KB
- *   sd_write_buf                   512  B
- *   fat_fs (FATFS work area)        ~4 KB  (sized by ELM FatFs internally)
- *   Remaining headroom             ~61 KB
+ *   Remaining headroom             ~93 KB   (32 KB freed vs USE_SD build)
  */

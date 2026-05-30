@@ -27,7 +27,8 @@
  *   number — zero drops — then streams them after "finished".
  *
  * Reliability fixes carried over from v8.0:
- *   FIX A  gain = GAIN2 (audible; GAIN4 measured too quiet).
+ *   FIX A  gain = GAIN1_4 (full-scale ≈ VDD so the 1.65 V bias sits at mid-scale;
+ *          amplifying gains such as GAIN1/GAIN2/GAIN4 saturate the bias).
  *   FIX B  SAADC configured ONCE at boot; start/abort per recording
  *          (never uninit/re-init) → no BLE-starving nrfx churn.
  *          Supervision timeout 2 s.
@@ -82,7 +83,7 @@
 
 LOG_MODULE_REGISTER(AcoustEEEcare);
 
-#define DEBUG_INJECT_BUFFER  1     /* 1 = enable the "TEST" self-test   */
+#define DEBUG_INJECT_BUFFER  0     /* 0 = disabled for production; set to 1 to re-enable self-test */
  
 #if DEBUG_INJECT_BUFFER
 #include "debug_audio.h"           /* const int16_t debug_audio_pcm[80000] @ 8 kHz */
@@ -103,7 +104,7 @@ static int16_t heart_window[60]   __aligned(4);
 static int16_t lung_window[1200]  __aligned(4);
 
 /* ══════════════════════════════════════════════════════════════════
- * SAADC CONFIG  (FIX A: GAIN2)
+ * SAADC CONFIG  (FIX A: GAIN1_4)
  * ══════════════════════════════════════════════════════════════════ */
 #define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz */
 #define SAADC_IRQ_PRIORITY  6
@@ -112,7 +113,7 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
     .channel_config = {
         .resistor_p = NRF_SAADC_RESISTOR_DISABLED,
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
-        .gain       = NRF_SAADC_GAIN1,              /* v8.2: GAIN2 (audible; GAIN4 was too quiet) */
+        .gain       = NRF_SAADC_GAIN1_4,            /* GAIN1_4: full-scale ≈ VDD so the 1.65 V bias sits at mid-scale; amplifying gains saturate the bias */
         .reference  = NRF_SAADC_REFERENCE_VDD4,
         .acq_time   = NRF_SAADC_ACQTIME_10US,
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
@@ -262,7 +263,18 @@ static int saadc_init_once(void)
                                         &adv, saadc_event_handler);
     if (err != 0) { LOG_ERR("advanced_mode_set: 0x%08X", err); return -EIO; }
 
-    LOG_INF("SAADC configured once @ %d Hz (GAIN2)", SAMPLING_RATE);
+    LOG_INF("SAADC configured once @ %d Hz (GAIN1_4)", SAMPLING_RATE);
+
+    /* Offset calibration: run once while SAADC is enabled but not yet
+     * sampling.  Removes temperature/supply-dependent offset drift.
+     * Must be called BEFORE saadc_start(). */
+    err = nrfx_saadc_offset_calibrate(NULL);   /* blocking form */
+    if (err != 0) {
+        LOG_WRN("saadc offset_calibrate: 0x%08X (non-fatal, continuing)", err);
+    } else {
+        LOG_INF("SAADC offset calibration done");
+    }
+
     return 0;
 }
 
@@ -489,20 +501,14 @@ static void send_audio_block(const int16_t *raw, uint32_t n)
         sys_put_le16(send,   &chunk[2]);
         memcpy(&chunk[4], p + offset, send);
  
-        /* BOUNDED retry (~6 ms), then DROP this chunk instead of stalling.
-         * tx_seq is ALWAYS advanced, so a dropped chunk shows up as a seq
-         * gap that the host zero-fills at the correct time position. The
-         * audio timeline stays 10 s-aligned (a brief silence under
-         * congestion) instead of compressing into fast/high-pitched. The
-         * MFCC path is untouched, so inference is unaffected. */
-        int err, tries = 0;
-        do {
-            err = bt_nus_send(NULL, chunk, CHUNK_HEADER_BYTES + send);
-            if (err == -ENOMEM || err == -EAGAIN) {
-                if (++tries > 6) break;     /* give up -> drop, keep timeline */
-                k_sleep(K_MSEC(1));
-            }
-        } while (err == -ENOMEM || err == -EAGAIN);
+        /* NON-BLOCKING send: attempt once; on -ENOMEM/-EAGAIN drop the
+         * chunk immediately and advance tx_seq so the host zero-fills that
+         * position (brief silence, not speed-up).  Never calling k_sleep
+         * here means the SAADC staging ring is always drained at 8 kHz
+         * regardless of BLE congestion, eliminating staging overruns and
+         * the resulting timeline compression. */
+        int err = bt_nus_send(NULL, chunk, CHUNK_HEADER_BYTES + send);
+        (void)err;   /* drop-on-congestion is intentional; seq always advances */
  
         tx_seq  = (tx_seq + 1) & 0xFFFF;    /* advance even on drop */
         offset += send;

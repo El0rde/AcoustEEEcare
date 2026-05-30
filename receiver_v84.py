@@ -58,7 +58,7 @@ NUS_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
 DEVICE_NAME  = "AcoustEEEcare"
 SAMPLE_RATE  = 8000
-OUTPUT_DIR   = Path("recording_v84_oversampled_gain1_10us")
+OUTPUT_DIR   = Path("recording_v84_oversampled_gain1_4_10us_battery")
 SCAN_TIMEOUT = 20.0
 
 # 10 s record + audio drain + ~20-35 s dual inference + margin.

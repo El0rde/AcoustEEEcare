@@ -49,49 +49,37 @@ from scipy.fft import fft, fftfreq
 # ▼▼▼  EDIT THESE SETTINGS  ▼▼▼
 # ══════════════════════════════════════════════════════════════
 
-RECORDINGS_DIR = r"D:\zephyrdev\AcoustEEEcare\recording_v80"
+RECORDINGS_DIR = r"D:\zephyrdev\AcoustEEEcare\recording_v84_oversampled_gain1_10us"
 
-# Set to a filename string to pin a specific file, e.g.:
-# WAV_FILE = "recording_001_20260501_104853.wav"
-# Leave as None to always auto-pick the newest .wav in RECORDINGS_DIR
 WAV_FILE = None
 
 # ── Main bandpass ──────────────────────────────────────────────
-LOWCUT_HZ    = 10     # lower bandpass edge in Hz
-HIGHCUT_HZ   = 200    # upper bandpass edge in Hz
+LOWCUT_HZ    = 10
+HIGHCUT_HZ   = 200
 
-# ── Respiratory bandpass (shown as 3rd column in figures) ──────
-RESP_LOWCUT_HZ  = 100   # lower edge  (100 Hz = start of lung-sound band)
-RESP_HIGHCUT_HZ = 1000  # upper edge  (1000 Hz = covers wheeze/crackle)
+# ── Respiratory bandpass ───────────────────────────────────────
+RESP_LOWCUT_HZ  = 100
+RESP_HIGHCUT_HZ = 1000
 
-FILTER_ORDER  = 4      # Butterworth order (shared by both filters)
-EXPECTED_RATE = 8000   # must match firmware SAMPLING_RATE
+FILTER_ORDER  = 4
+EXPECTED_RATE = 8000
 
-# ── Gain settings — applied to figures AND saved WAV ──────────
-AMPLIFY_GAIN      = 200.0  # linear gain for MAIN (heart) bandpass.
-                            # Applied to figure plots AND the saved WAV.
-                            # Clipping is auto-handled by np.clip.
-
-RESP_AMPLIFY_GAIN = 200.0  # linear gain for RESPIRATORY bandpass.
-                            # Applied to figure plots only
-                            # (resp band is not saved as a separate WAV).
-
-PITCH_SHIFT  = 1.0     # output sample-rate multiplier.  1.0 = normal speed.
-                       # >1.0 makes the WAV play faster AND higher-pitched.
+# ── Gain settings ─────────────────────────────────────────────
+AMPLIFY_GAIN      = 1000.0
+RESP_AMPLIFY_GAIN = 1000.0
+PITCH_SHIFT       = 1.0
 
 # ══════════════════════════════════════════════════════════════
 # ▲▲▲  EDIT THESE SETTINGS  ▲▲▲
 # ══════════════════════════════════════════════════════════════
 
 
-# ── Auto-select latest WAV ─────────────────────────────────────────────────────
 def resolve_wav_path() -> str:
     if WAV_FILE is not None:
         path = os.path.join(RECORDINGS_DIR, WAV_FILE)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"WAV_FILE not found: {path}")
         return path
-
     pattern = os.path.join(RECORDINGS_DIR, "*.wav")
     files   = glob.glob(pattern)
     if not files:
@@ -102,41 +90,26 @@ def resolve_wav_path() -> str:
     return max(files, key=os.path.getmtime)
 
 
-# ── Output paths ───────────────────────────────────────────────────────────────
 def make_output_paths(wav_path: str):
-    """Returns (png_path, heart_wav_path, resp_wav_path)."""
     folder     = os.path.dirname(wav_path)
     out_folder = os.path.join(folder, "analysis_bandpass_gain_for_mfcc")
     os.makedirs(out_folder, exist_ok=True)
     basename   = os.path.splitext(os.path.basename(wav_path))[0]
-
     png_path   = os.path.join(out_folder, f"{basename}_bandpass_analysis.png")
-
-    # Heart / main bandpass WAV  e.g.  …_heart_10-200Hz_x500.wav  (or _pitch4 suffix)
     heart_parts = [f"heart_{LOWCUT_HZ}-{HIGHCUT_HZ}Hz", f"x{AMPLIFY_GAIN:g}"]
     if PITCH_SHIFT != 1.0:
         heart_parts.append(f"pitch{PITCH_SHIFT:g}")
-    heart_wav_path = os.path.join(
-        out_folder, f"{basename}_{'_'.join(heart_parts)}.wav"
-    )
-
-    # Respiratory bandpass WAV  e.g.  …_resp_100-1000Hz_x500.wav
-    resp_parts = [f"resp_{RESP_LOWCUT_HZ}-{RESP_HIGHCUT_HZ}Hz",
-                  f"x{RESP_AMPLIFY_GAIN:g}"]
-    resp_wav_path = os.path.join(
-        out_folder, f"{basename}_{'_'.join(resp_parts)}.wav"
-    )
-
+    heart_wav_path = os.path.join(out_folder, f"{basename}_{'_'.join(heart_parts)}.wav")
+    resp_parts = [f"resp_{RESP_LOWCUT_HZ}-{RESP_HIGHCUT_HZ}Hz", f"x{RESP_AMPLIFY_GAIN:g}"]
+    resp_wav_path = os.path.join(out_folder, f"{basename}_{'_'.join(resp_parts)}.wav")
     return png_path, heart_wav_path, resp_wav_path
 
 
-# ── Audio loading ──────────────────────────────────────────────────────────────
 def load_wav(path: str):
     with wave.open(path, "rb") as wf:
         n_channels  = wf.getnchannels()
         sample_rate = wf.getframerate()
         n_frames    = wf.getnframes()
-        sampwidth   = wf.getsampwidth()
         raw         = wf.readframes(n_frames)
     samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     if n_channels > 1:
@@ -144,36 +117,24 @@ def load_wav(path: str):
     return samples, sample_rate
 
 
-# ── Save WAV ───────────────────────────────────────────────────────────────────
 def save_wav(path: str, samples: np.ndarray, sample_rate: int,
              gain: float = 1.0, pitch_shift: float = 1.0):
-    """
-    Save a float32 array back to a 16-bit signed WAV.
-
-    gain        — linear amplification applied before clipping.
-    pitch_shift — output sample-rate multiplier; changes the rate written
-                  into the WAV header so the player steps through samples
-                  faster (no resampling of audio data).
-    """
+    # Measure clipping BEFORE applying clip, so the warning is accurate
+    clipped = np.sum(np.abs(samples * gain) > 32767)
     pcm = np.clip(samples * gain, -32768, 32767).astype(np.int16)
     output_rate = int(round(sample_rate * pitch_shift))
-
     with wave.open(path, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(output_rate)
         wf.writeframes(pcm.tobytes())
-
-    clipped = np.sum(np.abs(samples * gain) > 32767)
     if clipped > 0:
         pct = 100.0 * clipped / len(samples)
         print(f"  NOTE: {clipped} samples ({pct:.2f}%) clipped after gain x{gain}")
 
 
-# ── Bandpass filter ────────────────────────────────────────────────────────────
 def bandpass_filter(samples: np.ndarray, sample_rate: int,
                     lowcut: float, highcut: float, order: int = 4) -> np.ndarray:
-    """Apply a zero-phase Butterworth bandpass filter."""
     nyq  = sample_rate / 2.0
     low  = max(lowcut  / nyq, 1e-4)
     high = min(highcut / nyq, 1.0 - 1e-4)
@@ -181,7 +142,6 @@ def bandpass_filter(samples: np.ndarray, sample_rate: int,
     return signal.filtfilt(b, a, samples)
 
 
-# ── FFT helper ─────────────────────────────────────────────────────────────────
 def compute_fft(samples: np.ndarray, sample_rate: int):
     N         = min(len(samples), 65536)
     fft_vals  = np.abs(fft(samples[:N])) / N
@@ -190,7 +150,6 @@ def compute_fft(samples: np.ndarray, sample_rate: int):
     return fft_freqs[pos_mask], fft_vals[pos_mask]
 
 
-# ── Gap detection ──────────────────────────────────────────────────────────────
 def detect_gaps(samples: np.ndarray, threshold=50, min_gap_samples=8):
     near_zero = np.abs(samples) < threshold
     gaps, in_gap, gap_start = [], False, 0
@@ -206,7 +165,6 @@ def detect_gaps(samples: np.ndarray, threshold=50, min_gap_samples=8):
     return gaps
 
 
-# ── Axis style helper ──────────────────────────────────────────────────────────
 def style_ax(ax, title, xlabel, ylabel):
     ax.set_facecolor("#1a1a1a")
     ax.set_title(title, fontsize=9, color="#cccccc", pad=6)
@@ -217,7 +175,6 @@ def style_ax(ax, title, xlabel, ylabel):
         spine.set_edgecolor("#333333")
 
 
-# ── Main analysis ──────────────────────────────────────────────────────────────
 def analyze(wav_path: str):
     print(f"\n{'='*62}")
     print(f"  AcoustEEEcare — Bandpass Filter & Diagnostic")
@@ -237,7 +194,6 @@ def analyze(wav_path: str):
           f"(order {FILTER_ORDER}) …")
     filtered_raw  = bandpass_filter(samples, file_rate, LOWCUT_HZ, HIGHCUT_HZ, FILTER_ORDER)
     rms_filt      = np.sqrt(np.mean(filtered_raw**2))
-    # Gain-amplified version used for BOTH the saved WAV and all figure plots
     filtered      = np.clip(filtered_raw * AMPLIFY_GAIN, -32768, 32767)
     rms_filt_gain = np.sqrt(np.mean(filtered**2))
     print(f"  RMS (filtered, pre-gain)       : {rms_filt:.1f}")
@@ -248,10 +204,9 @@ def analyze(wav_path: str):
           f"(order {FILTER_ORDER}) …")
     resp_filtered_raw = bandpass_filter(samples, file_rate,
                                         RESP_LOWCUT_HZ, RESP_HIGHCUT_HZ, FILTER_ORDER)
-    rms_resp          = np.sqrt(np.mean(resp_filtered_raw**2))
-    # Gain-amplified version used for all figure plots
-    resp_filtered     = np.clip(resp_filtered_raw * RESP_AMPLIFY_GAIN, -32768, 32767)
-    rms_resp_gain     = np.sqrt(np.mean(resp_filtered**2))
+    rms_resp      = np.sqrt(np.mean(resp_filtered_raw**2))
+    resp_filtered = np.clip(resp_filtered_raw * RESP_AMPLIFY_GAIN, -32768, 32767)
+    rms_resp_gain = np.sqrt(np.mean(resp_filtered**2))
     print(f"  RMS (resp, pre-gain)           : {rms_resp:.1f}")
     print(f"  RMS (resp, gain x{RESP_AMPLIFY_GAIN:g})      : {rms_resp_gain:.1f}  (clipped at 32767)")
 
@@ -259,19 +214,16 @@ def analyze(wav_path: str):
         print(f"  Pitch shift (main WAV)     : x{PITCH_SHIFT:g}  "
               f"(WAV header rate = {int(round(file_rate * PITCH_SHIFT))} Hz)")
 
-    # ── Save main filtered WAV ─────────────────────────────────────────────────
+    # ── Save WAVs — pass unclipped raw arrays so save_wav can report clipping ─
     png_path, heart_wav_path, resp_wav_path = make_output_paths(wav_path)
-
-    # Both filtered arrays already have gain baked in; pass gain=1.0 to avoid double-amplification
-    save_wav(heart_wav_path, filtered, file_rate,
-             gain=1.0, pitch_shift=PITCH_SHIFT)
+    save_wav(heart_wav_path, filtered_raw, file_rate,
+             gain=AMPLIFY_GAIN, pitch_shift=PITCH_SHIFT)
     print(f"\n  Heart WAV saved to:\n  {heart_wav_path}")
-
-    save_wav(resp_wav_path, resp_filtered, file_rate,
-             gain=1.0, pitch_shift=1.0)   # no pitch shift for respiratory band
+    save_wav(resp_wav_path, resp_filtered_raw, file_rate,
+             gain=RESP_AMPLIFY_GAIN, pitch_shift=1.0)
     print(f"  Respiratory WAV saved to:\n  {resp_wav_path}")
 
-    # ── Gap detection on raw signal ────────────────────────────────────────────
+    # ── Gap detection ──────────────────────────────────────────────────────────
     gaps = detect_gaps(samples)
     print(f"\n  Gaps in raw signal (near-zero runs >= 8 samples): {len(gaps)}")
     for i, (s, e) in enumerate(gaps[:5]):
@@ -280,11 +232,12 @@ def analyze(wav_path: str):
     if len(gaps) > 5:
         print(f"    … and {len(gaps)-5} more")
 
-    # ── Compute FFTs ───────────────────────────────────────────────────────────
-    time_axis      = np.arange(len(samples))       / file_rate
-    time_filt      = np.arange(len(filtered))      / file_rate
-    time_resp      = np.arange(len(resp_filtered)) / file_rate
+    # ── Time axes ─────────────────────────────────────────────────────────────
+    time_axis = np.arange(len(samples))       / file_rate
+    time_filt = np.arange(len(filtered))      / file_rate
+    time_resp = np.arange(len(resp_filtered)) / file_rate
 
+    # ── FFTs ──────────────────────────────────────────────────────────────────
     raw_freqs,  raw_fft  = compute_fft(samples,       file_rate)
     filt_freqs, filt_fft = compute_fft(filtered,      file_rate)
     resp_freqs, resp_fft = compute_fft(resp_filtered,  file_rate)
@@ -297,17 +250,21 @@ def analyze(wav_path: str):
                                           nperseg=nperseg, noverlap=nperseg//2)
     f_p, t_p, Sxx_p = signal.spectrogram(resp_filtered, fs=file_rate,
                                           nperseg=nperseg, noverlap=nperseg//2)
-
     Sxx_r_db = 10 * np.log10(Sxx_r + 1e-10)
     Sxx_f_db = 10 * np.log10(Sxx_f + 1e-10)
     Sxx_p_db = 10 * np.log10(Sxx_p + 1e-10)
 
+    # ── Shared y-axis limits for waveform row ─────────────────────────────────
+    # All three waveform plots share the same y-axis so the gain amplification
+    # is visually apparent: the raw signal sits small, the gain-amplified
+    # filtered signals appear proportionally taller in the same frame.
+    raw_peak  = float(np.max(np.abs(samples)))
+    filt_peak = float(np.max(np.abs(filtered)))
+    resp_peak = float(np.max(np.abs(resp_filtered)))
+    shared_ylim = max(raw_peak, filt_peak, resp_peak) * 1.05
+    shared_ylim = max(shared_ylim, 1.0)   # avoid zero-height axis on silence
+
     # ── Figure layout ──────────────────────────────────────────────────────────
-    # Rows:
-    #   0  – Waveforms       (3 cols: Raw | Main BP | Respiratory BP)
-    #   1  – FFT spectra     (3 cols: Raw | Main BP | Respiratory BP)
-    #   2  – Filter response (1 col spanning all 3: both BP curves overlaid)
-    #   3  – Spectrograms    (3 cols: Raw | Main BP | Respiratory BP)
     fig = plt.figure(figsize=(22, 16))
     fig.patch.set_facecolor("#0f0f0f")
 
@@ -331,30 +288,34 @@ def analyze(wav_path: str):
     gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.52, wspace=0.30,
                            top=0.93, bottom=0.06)
 
-    # ── Row 0: Waveforms ───────────────────────────────────────────────────────
+    # ── Row 0: Waveforms — shared y-axis so gain is visible ───────────────────
     ax_raw = fig.add_subplot(gs[0, 0])
     ax_raw.plot(time_axis, samples, color="#2196F3", linewidth=0.35, alpha=0.85)
     ax_raw.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
     for s, e in gaps:
         ax_raw.axvspan(s / file_rate, e / file_rate, color="red", alpha=0.30)
     ax_raw.set_xlim(0, duration)
-    style_ax(ax_raw, "1  Raw Waveform", "Time (s)", "Amplitude (int16)")
+    ax_raw.set_ylim(-shared_ylim, shared_ylim)
+    style_ax(ax_raw, "1  Raw Waveform  (shared y-axis — gain makes cols 2 & 3 taller)",
+             "Time (s)", "Amplitude (int16)")
 
     ax_flt = fig.add_subplot(gs[0, 1])
     ax_flt.plot(time_filt, filtered, color="#00BCD4", linewidth=0.35, alpha=0.85)
     ax_flt.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
     ax_flt.set_xlim(0, duration)
+    ax_flt.set_ylim(-shared_ylim, shared_ylim)
     style_ax(ax_flt,
              f"2  Main Bandpass  ({LOWCUT_HZ}–{HIGHCUT_HZ} Hz)  ×gain {AMPLIFY_GAIN:g}",
-             "Time (s)", "Amplitude (gain-scaled)")
+             "Time (s)", "Amplitude (gain-scaled, shared y)")
 
     ax_res = fig.add_subplot(gs[0, 2])
     ax_res.plot(time_resp, resp_filtered, color="#FF9800", linewidth=0.35, alpha=0.85)
     ax_res.axhline(0, color="#555555", linewidth=0.5, linestyle="--")
     ax_res.set_xlim(0, duration)
+    ax_res.set_ylim(-shared_ylim, shared_ylim)
     style_ax(ax_res,
              f"3  Respiratory Bandpass  ({RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz)  ×gain {RESP_AMPLIFY_GAIN:g}",
-             "Time (s)", "Amplitude (gain-scaled)")
+             "Time (s)", "Amplitude (gain-scaled, shared y)")
 
     # ── Row 1: FFT spectra ─────────────────────────────────────────────────────
     ax_rfft = fig.add_subplot(gs[1, 0])
@@ -397,40 +358,31 @@ def analyze(wav_path: str):
              f"6  FFT Spectrum — Respiratory ({RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz)",
              "Frequency (Hz)", "Magnitude")
 
-    # ── Row 2: Filter frequency responses (both overlaid, full-width) ──────────
+    # ── Row 2: Filter frequency responses ─────────────────────────────────────
     nyq = file_rate / 2.0
-
     b_main, a_main = signal.butter(FILTER_ORDER,
-                                   [LOWCUT_HZ / nyq, HIGHCUT_HZ / nyq],
-                                   btype="band")
+                                   [LOWCUT_HZ / nyq, HIGHCUT_HZ / nyq], btype="band")
     w_main, h_main = signal.freqz(b_main, a_main, worN=4096, fs=file_rate)
-
     b_resp, a_resp = signal.butter(FILTER_ORDER,
-                                   [RESP_LOWCUT_HZ / nyq, RESP_HIGHCUT_HZ / nyq],
-                                   btype="band")
+                                   [RESP_LOWCUT_HZ / nyq, RESP_HIGHCUT_HZ / nyq], btype="band")
     w_resp, h_resp = signal.freqz(b_resp, a_resp, worN=4096, fs=file_rate)
 
-    ax_resp_curve = fig.add_subplot(gs[2, :])   # spans all 3 columns
+    ax_resp_curve = fig.add_subplot(gs[2, :])
     ax_resp_curve.plot(w_main, 20 * np.log10(np.abs(h_main) + 1e-10),
                        color="#00BCD4", linewidth=1.5,
                        label=f"Main bandpass  {LOWCUT_HZ}–{HIGHCUT_HZ} Hz")
     ax_resp_curve.plot(w_resp, 20 * np.log10(np.abs(h_resp) + 1e-10),
                        color="#FF9800", linewidth=1.5, linestyle="--",
                        label=f"Respiratory bandpass  {RESP_LOWCUT_HZ}–{RESP_HIGHCUT_HZ} Hz")
-
     for freq, col in [(LOWCUT_HZ, "#FF5722"), (HIGHCUT_HZ, "#4CAF50"),
                       (RESP_LOWCUT_HZ, "#FF9800"), (RESP_HIGHCUT_HZ, "#FFEB3B")]:
         ax_resp_curve.axvline(freq, color=col, linewidth=0.9, linestyle=":",
                               alpha=0.7, label=f"{freq} Hz")
-    ax_resp_curve.axhline(-3, color="#888888", linewidth=0.8, linestyle=":",
-                          label="-3 dB")
-
-    # Zoom x-axis to cover both passbands comfortably
+    ax_resp_curve.axhline(-3, color="#888888", linewidth=0.8, linestyle=":", label="-3 dB")
     x_max = min(file_rate / 2, max(HIGHCUT_HZ, RESP_HIGHCUT_HZ) * 1.3)
     ax_resp_curve.set_xlim(0, x_max)
     ax_resp_curve.set_ylim(-80, 5)
-    ax_resp_curve.legend(fontsize=8, facecolor="#222222", labelcolor="white",
-                         ncol=3)
+    ax_resp_curve.legend(fontsize=8, facecolor="#222222", labelcolor="white", ncol=3)
     style_ax(ax_resp_curve,
              f"7  Filter Frequency Responses — Butterworth (order {FILTER_ORDER})  "
              f"|  Main: {LOWCUT_HZ}–{HIGHCUT_HZ} Hz  ·  "
@@ -443,35 +395,27 @@ def analyze(wav_path: str):
     ax_sg_r = fig.add_subplot(gs[3, 0])
     im1 = ax_sg_r.pcolormesh(t_r, f_r, Sxx_r_db, shading="gouraud",
                               cmap="inferno", vmin=vmin)
-    fig.colorbar(im1, ax=ax_sg_r).ax.yaxis.set_tick_params(
-        color="#888888", labelsize=7)
+    fig.colorbar(im1, ax=ax_sg_r).ax.yaxis.set_tick_params(color="#888888", labelsize=7)
     ax_sg_r.set_ylim(0, min(file_rate / 2, 1100))
     style_ax(ax_sg_r, "8  Spectrogram — Raw", "Time (s)", "Frequency (Hz)")
 
     ax_sg_f = fig.add_subplot(gs[3, 1])
     im2 = ax_sg_f.pcolormesh(t_f, f_f, Sxx_f_db, shading="gouraud",
                               cmap="inferno", vmin=vmin)
-    fig.colorbar(im2, ax=ax_sg_f).ax.yaxis.set_tick_params(
-        color="#888888", labelsize=7)
-    ax_sg_f.axhline(LOWCUT_HZ,  color="cyan",    linewidth=0.9,
-                    linestyle="--", alpha=0.8)
-    ax_sg_f.axhline(HIGHCUT_HZ, color="#00FF88", linewidth=0.9,
-                    linestyle="--", alpha=0.8)
+    fig.colorbar(im2, ax=ax_sg_f).ax.yaxis.set_tick_params(color="#888888", labelsize=7)
+    ax_sg_f.axhline(LOWCUT_HZ,  color="cyan",    linewidth=0.9, linestyle="--", alpha=0.8)
+    ax_sg_f.axhline(HIGHCUT_HZ, color="#00FF88", linewidth=0.9, linestyle="--", alpha=0.8)
     ax_sg_f.set_ylim(0, min(file_rate / 2, 1100))
     style_ax(ax_sg_f,
-             f"9  Spectrogram — Main BP  "
-             f"(cyan={LOWCUT_HZ} Hz  green={HIGHCUT_HZ} Hz)",
+             f"9  Spectrogram — Main BP  (cyan={LOWCUT_HZ} Hz  green={HIGHCUT_HZ} Hz)",
              "Time (s)", "Frequency (Hz)")
 
     ax_sg_p = fig.add_subplot(gs[3, 2])
     im3 = ax_sg_p.pcolormesh(t_p, f_p, Sxx_p_db, shading="gouraud",
                               cmap="inferno", vmin=vmin)
-    fig.colorbar(im3, ax=ax_sg_p).ax.yaxis.set_tick_params(
-        color="#888888", labelsize=7)
-    ax_sg_p.axhline(RESP_LOWCUT_HZ,  color="#FF9800", linewidth=0.9,
-                    linestyle="--", alpha=0.8)
-    ax_sg_p.axhline(RESP_HIGHCUT_HZ, color="#FFEB3B", linewidth=0.9,
-                    linestyle="--", alpha=0.8)
+    fig.colorbar(im3, ax=ax_sg_p).ax.yaxis.set_tick_params(color="#888888", labelsize=7)
+    ax_sg_p.axhline(RESP_LOWCUT_HZ,  color="#FF9800", linewidth=0.9, linestyle="--", alpha=0.8)
+    ax_sg_p.axhline(RESP_HIGHCUT_HZ, color="#FFEB3B", linewidth=0.9, linestyle="--", alpha=0.8)
     ax_sg_p.set_ylim(0, min(file_rate / 2, 1100))
     style_ax(ax_sg_p,
              f"10  Spectrogram — Respiratory BP  "
@@ -494,7 +438,6 @@ def analyze(wav_path: str):
     fig.text(0.5, 0.005, summary, ha="center", fontsize=8, color="#aaaaaa",
              bbox=dict(boxstyle="round", facecolor="#1e1e1e", alpha=0.9))
 
-    # ── Save plot ──────────────────────────────────────────────────────────────
     plt.savefig(png_path, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
     print(f"\n  Plot saved to:\n  {png_path}")
@@ -502,7 +445,6 @@ def analyze(wav_path: str):
     plt.show()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     wav_path = resolve_wav_path()
     print(f"\n  Auto-selected WAV: {os.path.basename(wav_path)}")

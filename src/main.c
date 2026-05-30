@@ -1,5 +1,5 @@
 /*
- * AcoustEEEcare — BLE-to-MFCC firmware (v8.1)
+ * AcoustEEEcare — BLE + one-capture DUAL inference (v8.4)
  * ==================================================================
  * SINGLE-THREADED REWRITE of v8.0.
  *
@@ -27,7 +27,7 @@
  *   number — zero drops — then streams them after "finished".
  *
  * Reliability fixes carried over from v8.0:
- *   FIX A  gain = GAIN4 (full-scale ~206 mV) for a quiet MEMS mic.
+ *   FIX A  gain = GAIN2 (audible; GAIN4 measured too quiet).
  *   FIX B  SAADC configured ONCE at boot; start/abort per recording
  *          (never uninit/re-init) → no BLE-starving nrfx churn.
  *          Supervision timeout 2 s.
@@ -38,19 +38,21 @@
  *   The DC-removal IIR is applied ONLY to the copy streamed for
  *   listening, never to the MFCC input.
  *
- * Host protocol (unchanged — receiver_v80.py works as-is):
- *   "START:<bytes>:<ORGAN>\n"
+ * Host protocol (v8.4 — one capture, both results):
+ *   "READY\n"                         (once, after MTU; gate the Record button)
+ *   "START:<bytes>:DUAL\n"
  *   audio packets : [u16 seq LE][u16 len LE][pcm int16 LE ...]
  *   "finished\n"
- *   "MFCC_START:<n_frames>:<n_mfcc>\n"
- *   mfcc packets  : [u16 idx LE][u16 payload_bytes LE][float32 ...]
- *   "MFCC_END\n"
- * ==================================================================
+ *   "INF:START\n" → "HR:<bpm>\n" → "RR:<bpm>\n" → "INF:DONE\n"
+ *   (on error, "ERR:HEART_INF\n" / "ERR:LUNG_INF\n" replaces the value)
+ *   "PING\n" keepalives may arrive any time while connected.
+ * The host builds the .wav from the streamed PCM and shows HR + RR.
  */
 
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -64,6 +66,7 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 
@@ -74,29 +77,33 @@
 #include "dsp_mfcc.h"
 #include "heart_mfcc_config.h"
 #include "lung_mfcc_config.h"
+#include "cnn_norm_stats.h"
+#include "tflm_inference.h"
 
 LOG_MODULE_REGISTER(AcoustEEEcare);
+
+#define DEBUG_INJECT_BUFFER  1     /* 1 = enable the "TEST" self-test   */
+ 
+#if DEBUG_INJECT_BUFFER
+#include "debug_audio.h"           /* const int16_t debug_audio_pcm[80000] @ 8 kHz */
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  * ORGAN SELECTION
  * ══════════════════════════════════════════════════════════════════ */
-typedef enum { ORGAN_HEART = 0, ORGAN_LUNG = 1 } organ_t;
-static organ_t active_organ = ORGAN_HEART;
-
-static dsp_mfcc_pipeline_t s_pipeline;
-
-/* caller-allocated MFCC window; sized for the larger config (lung=1200) */
-#define MAX_WINDOW_SAMPLES  1200
-static int16_t s_window[MAX_WINDOW_SAMPLES];
-
-static inline const dsp_mfcc_config_t *active_config(void)
-{
-    return (active_organ == ORGAN_LUNG) ? &lung_mfcc_config
-                                        : &heart_mfcc_config;
-}
+/* v8.4: TWO persistent pipelines fed from ONE capture.
+ * Each chunk is fed to heart then lung SEQUENTIALLY (never concurrently),
+ * so the shared FFT scratch inside dsp_mfcc.c is safe — each feed_chunk
+ * finishes its transform before the next begins. Each pipeline owns its
+ * own circular window (heart=60, lung=1200). No organ selection: every
+ * recording produces BOTH HR and RR. */
+static dsp_mfcc_pipeline_t heart_pipeline;
+static dsp_mfcc_pipeline_t lung_pipeline;
+static int16_t heart_window[60]   __aligned(4);
+static int16_t lung_window[1200]  __aligned(4);
 
 /* ══════════════════════════════════════════════════════════════════
- * SAADC CONFIG  (FIX A: GAIN4)
+ * SAADC CONFIG  (FIX A: GAIN2)
  * ══════════════════════════════════════════════════════════════════ */
 #define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz */
 #define SAADC_IRQ_PRIORITY  6
@@ -105,11 +112,11 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
     .channel_config = {
         .resistor_p = NRF_SAADC_RESISTOR_DISABLED,
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
-        .gain       = NRF_SAADC_GAIN2,              /* FIX A: was GAIN1_4 */
+        .gain       = NRF_SAADC_GAIN1,              /* v8.2: GAIN2 (audible; GAIN4 was too quiet) */
         .reference  = NRF_SAADC_REFERENCE_VDD4,
         .acq_time   = NRF_SAADC_ACQTIME_10US,
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
-        .burst      = NRF_SAADC_BURST_DISABLED,
+        .burst      = NRF_SAADC_BURST_ENABLED,
     },
     .pin_p         = NRF_SAADC_INPUT_AIN0,
     .pin_n         = NRF_SAADC_INPUT_DISABLED,
@@ -135,13 +142,20 @@ static volatile uint8_t  next_dma_buf     = 1;
 static volatile bool     analog_recording = false;
 static uint16_t          nus_chunk_size   = 244;
 
+/* Max valid BLE supervision timeout is 3200 (32 s). 4000 was invalid
+     * (err -22) so the connection interval was never applied. On-device
+     * inference is <1 s (heart 428 ms + lung 205 ms), so a big timeout is
+     * unnecessary; 600 = 6 s is robust and valid. */
+#define BLE_SUPERVISION_TIMEOUT   600
+#define PING_INTERVAL_MS          250     /* B7: keep link warm; prevent central from relaxing interval */
+
 /* ══════════════════════════════════════════════════════════════════
  * ISR -> MAIN STAGING RING
  *   The ISR copies each completed half-buffer into one of STAGE_SLOTS
  *   staging buffers and gives stage_sem. The MAIN thread drains them.
  *   8 slots = ~512 ms of slack, plenty to cover BLE send + FFT time.
  * ══════════════════════════════════════════════════════════════════ */
-#define STAGE_SLOTS   8
+#define STAGE_SLOTS   16      /* ~1 s of slack (was 8 = 512 ms) */
 static int16_t  stage_buf[STAGE_SLOTS][HALF_BUF_SAMPLES];
 static uint16_t stage_len[STAGE_SLOTS];
 static volatile uint8_t stage_wr;
@@ -154,10 +168,41 @@ static volatile uint32_t stage_overruns;
  *   Every frame is stored by index during capture (no queue, no drops),
  *   then streamed after "finished". Sized for the largest config.
  * ══════════════════════════════════════════════════════════════════ */
-#define MFCC_MAX_FRAMES  665   /* heart = 665, lung = 324 */
-#define MFCC_MAX_COEFFS  26    /* lung = 26, heart = 25 */
-static float        mfcc_store[MFCC_MAX_FRAMES][MFCC_MAX_COEFFS];
-static volatile int mfcc_count;
+/* v8.4: int8 feature stores, one per organ. Frames are normalized
+ * (cnn_norm_stats.h) and quantized to int8 IN the callbacks, so we never
+ * hold a large float matrix — heart 16,625 B + lung 8,424 B ≈ 25 KB total,
+ * which fits comfortably alongside a 72 KB arena. */
+#define HEART_FRAMES  665
+#define HEART_NMFCC   25
+#define LUNG_FRAMES   324
+#define LUNG_NMFCC    26
+#define HEART_FEAT_N  (HEART_FRAMES * HEART_NMFCC)   /* 16625 */
+#define LUNG_FEAT_N   (LUNG_FRAMES  * LUNG_NMFCC)    /*  8424 */
+
+static int8_t  heart_features[HEART_FEAT_N] __aligned(4);
+static int8_t  lung_features [LUNG_FEAT_N]  __aligned(4);
+static volatile uint32_t heart_feat_count;   /* int8 values written */
+static volatile uint32_t lung_feat_count;
+static volatile int      heart_frame_count;  /* frames seen */
+static volatile int      lung_frame_count;
+
+/* Per-organ int8 input quantization params.
+ * Discovered at boot by probing each model's input tensor (tflm_get_input_quant),
+ * so they always match the loaded model — no hardcoded-scale drift. The verified
+ * values are kept only as a fallback if the probe fails. */
+static float   heart_q_scale = 0.39602566f;
+static int32_t heart_q_zp    = 38;
+static float   lung_q_scale  = 0.33742353f;
+static int32_t lung_q_zp     = 28;
+
+/* TFLite Micro shared tensor arena (heart and lung run sequentially on it).
+ * Start at 72 KB (proven on the previous build); each inference logs
+ * "arena used = N" — shrink to N + ~4 KB once measured. Heart is worst case. */
+#define TENSOR_ARENA_BYTES  (72u * 1024u)
+static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
+
+/* Exported high-water for logging; written by tflm_inference.cc. */
+volatile uint32_t g_tflm_arena_used_bytes;
 
 #define CHUNK_HEADER_BYTES 4
 static uint16_t tx_seq = 0;
@@ -207,8 +252,8 @@ static int saadc_init_once(void)
     if (err != 0) { LOG_ERR("channel_config: 0x%08X", err); return -EIO; }
 
     nrfx_saadc_adv_config_t adv = NRFX_SAADC_DEFAULT_ADV_CONFIG;
-    adv.oversampling      = NRF_SAADC_OVERSAMPLE_DISABLED;
-    adv.burst             = NRF_SAADC_BURST_DISABLED;
+    adv.oversampling      = NRF_SAADC_OVERSAMPLE_4X;
+    adv.burst             = NRF_SAADC_BURST_ENABLED;
     adv.internal_timer_cc = SAADC_CC_VALUE;
     adv.start_on_end      = true;
 
@@ -217,7 +262,7 @@ static int saadc_init_once(void)
                                         &adv, saadc_event_handler);
     if (err != 0) { LOG_ERR("advanced_mode_set: 0x%08X", err); return -EIO; }
 
-    LOG_INF("SAADC configured once @ %d Hz (GAIN4)", SAMPLING_RATE);
+    LOG_INF("SAADC configured once @ %d Hz (GAIN2)", SAMPLING_RATE);
     return 0;
 }
 
@@ -254,6 +299,12 @@ static inline void led_white(void) { led_on(&red_led);  led_on(&green_led);  led
 static volatile bool start_recording = false;
 static volatile bool is_connected    = false;
 static volatile bool mtu_exchanged   = false;
+static volatile bool start_test = false;
+
+/* B1: connection handle + current interval for fast-link re-assertion */
+static struct bt_conn   *current_conn;
+static volatile uint16_t cur_interval;
+
 
 #define DEVICE_NAME      "AcoustEEEcare"
 #define DEVICE_NAME_LEN  (sizeof(DEVICE_NAME) - 1)
@@ -277,6 +328,9 @@ static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
         LOG_INF("MTU=%d NUS chunk=%d", mtu, nus_chunk_size);
     }
     mtu_exchanged = true;
+    /* Handshake: the host app waits for READY before enabling Record. */
+    bt_nus_send(NULL, "READY\n", 6);
+    LOG_INF("sent READY");
 }
 static struct bt_gatt_exchange_params exchange_params = { .func = mtu_exchange_cb };
 
@@ -292,6 +346,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
     if (err) { LOG_WRN("conn failed (%u)", err); return; }
     is_connected  = true;
     mtu_exchanged = false;
+    current_conn = bt_conn_ref(conn);   /* B2: keep ref for fast-link re-assertion */
     led_green();
 
     static const struct bt_conn_le_phy_param phy = {
@@ -302,7 +357,8 @@ static void connected(struct bt_conn *conn, uint8_t err)
     bt_conn_le_phy_update(conn, &phy);
 
     static const struct bt_le_conn_param cp = {
-        .interval_min = 12, .interval_max = 24, .latency = 0, .timeout = 200,
+        .interval_min = 12, .interval_max = 24, .latency = 0,
+        .timeout = BLE_SUPERVISION_TIMEOUT,
     };
     bt_conn_le_param_update(conn, &cp);
     bt_gatt_exchange_mtu(conn, &exchange_params);
@@ -311,6 +367,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
+    if (current_conn) { bt_conn_unref(current_conn); current_conn = NULL; }  /* B3 */
     if (analog_recording) saadc_stop();
     analog_recording = false;
     is_connected     = false;
@@ -322,20 +379,36 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
     k_work_schedule(&adv_restart_work, K_MSEC(500));
 }
 
+/* B4: log whenever the central changes the connection interval */
+static void le_param_updated(struct bt_conn *conn, uint16_t interval,
+                              uint16_t latency, uint16_t timeout)
+{
+    ARG_UNUSED(conn); ARG_UNUSED(latency);
+    cur_interval = interval;
+    LOG_INF("conn interval=%u (%u.%02u ms) timeout=%u",
+            interval, (interval*5)/4, ((interval*5)%4)*25, timeout);
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-    .connected = connected, .disconnected = disconnected,
+    .connected        = connected,
+    .disconnected     = disconnected,
+    .le_param_updated = le_param_updated,   /* B4 */
 };
 
 static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
 {
     ARG_UNUSED(conn); ARG_UNUSED(ctx);
+    /* v8.4: every recording produces BOTH HR and RR, so only REC is needed. */
     if (len == 3 && memcmp(data, "REC", 3) == 0) {
         start_recording = true;
-    } else if (len == 5 && memcmp(data, "HEART", 5) == 0) {
-        if (!analog_recording) { active_organ = ORGAN_HEART; LOG_INF("organ=HEART"); }
-    } else if (len == 4 && memcmp(data, "LUNG", 4) == 0) {
-        if (!analog_recording) { active_organ = ORGAN_LUNG;  LOG_INF("organ=LUNG"); }
     }
+
+#if DEBUG_INJECT_BUFFER
+    else if (len == 4 && memcmp(data, "TEST", 4) == 0) {
+        start_test = true;
+    }
+#endif
+
 }
 static struct bt_nus_cb nus_listener = { .received = received };
 
@@ -355,14 +428,40 @@ static void ble_send_blocking(const void *buf, uint16_t len)
  * MFCC FRAME CALLBACK (runs in MAIN thread, inside feed_chunk)
  * Store by index — no queue, no drops.
  * ══════════════════════════════════════════════════════════════════ */
-static void mfcc_frame_cb(int idx, const float *coeffs, void *user)
+/* Both callbacks: per-coefficient z-score normalization (matching CNN
+ * training, heart_cnn/data.py: v = (mfcc - mean[i])/(std[i] + CNN_NORM_EPS)),
+ * then int8 quantization with that organ's input scale/zp, appended into
+ * the organ's int8 feature buffer. Stats from cnn_norm_stats.h. */
+static void heart_frame_cb(int idx, const float *coeffs, void *user)
 {
-    ARG_UNUSED(user);
-    if (idx < 0 || idx >= MFCC_MAX_FRAMES) return;
-    int nc = active_config()->n_mfcc;
-    if (nc > MFCC_MAX_COEFFS) nc = MFCC_MAX_COEFFS;
-    memcpy(mfcc_store[idx], coeffs, nc * sizeof(float));
-    if (idx + 1 > mfcc_count) mfcc_count = idx + 1;
+    ARG_UNUSED(user); ARG_UNUSED(idx);
+    if (heart_frame_count >= HEART_FRAMES) return;
+    heart_frame_count++;
+    const int nc = heart_pipeline.cfg->n_mfcc;
+    for (int c = 0; c < nc; c++) {
+        float v = (coeffs[c] - heart_mfcc_mean[c]) / (heart_mfcc_std[c] + CNN_NORM_EPS);
+        int32_t q = (int32_t)lroundf(v / heart_q_scale) + heart_q_zp;
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        if (heart_feat_count < HEART_FEAT_N)
+            heart_features[heart_feat_count++] = (int8_t)q;
+    }
+}
+
+static void lung_frame_cb(int idx, const float *coeffs, void *user)
+{
+    ARG_UNUSED(user); ARG_UNUSED(idx);
+    if (lung_frame_count >= LUNG_FRAMES) return;
+    lung_frame_count++;
+    const int nc = lung_pipeline.cfg->n_mfcc;
+    for (int c = 0; c < nc; c++) {
+        float v = (coeffs[c] - lung_mfcc_mean[c]) / (lung_mfcc_std[c] + CNN_NORM_EPS);
+        int32_t q = (int32_t)lroundf(v / lung_q_scale) + lung_q_zp;
+        if (q >  127) q =  127;
+        if (q < -128) q = -128;
+        if (lung_feat_count < LUNG_FEAT_N)
+            lung_features[lung_feat_count++] = (int8_t)q;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -377,20 +476,35 @@ static void send_audio_block(const int16_t *raw, uint32_t n)
         dc_estimate += ((int32_t)raw[i] - dc_estimate) >> 8;
         dc_copy[i]   = (int16_t)((int32_t)raw[i] - dc_estimate);
     }
-
-    const uint8_t *p   = (const uint8_t *)dc_copy;
-    uint32_t bytes     = n * sizeof(int16_t);
-    uint32_t offset    = 0;
+ 
+    const uint8_t *p = (const uint8_t *)dc_copy;
+    uint32_t bytes   = n * sizeof(int16_t);
+    uint32_t offset  = 0;
     uint8_t  chunk[251];
-
+ 
     while (bytes > 0) {
         uint16_t payload = nus_chunk_size - CHUNK_HEADER_BYTES;
         uint16_t send    = (bytes < payload) ? (uint16_t)bytes : payload;
         sys_put_le16(tx_seq, &chunk[0]);
         sys_put_le16(send,   &chunk[2]);
         memcpy(&chunk[4], p + offset, send);
-        ble_send_blocking(chunk, CHUNK_HEADER_BYTES + send);
-        tx_seq  = (tx_seq + 1) & 0xFFFF;
+ 
+        /* BOUNDED retry (~6 ms), then DROP this chunk instead of stalling.
+         * tx_seq is ALWAYS advanced, so a dropped chunk shows up as a seq
+         * gap that the host zero-fills at the correct time position. The
+         * audio timeline stays 10 s-aligned (a brief silence under
+         * congestion) instead of compressing into fast/high-pitched. The
+         * MFCC path is untouched, so inference is unaffected. */
+        int err, tries = 0;
+        do {
+            err = bt_nus_send(NULL, chunk, CHUNK_HEADER_BYTES + send);
+            if (err == -ENOMEM || err == -EAGAIN) {
+                if (++tries > 6) break;     /* give up -> drop, keep timeline */
+                k_sleep(K_MSEC(1));
+            }
+        } while (err == -ENOMEM || err == -EAGAIN);
+ 
+        tx_seq  = (tx_seq + 1) & 0xFFFF;    /* advance even on drop */
         offset += send;
         bytes  -= send;
     }
@@ -399,61 +513,160 @@ static void send_audio_block(const int16_t *raw, uint32_t n)
 /* ══════════════════════════════════════════════════════════════════
  * Stream all stored MFCC frames
  * ══════════════════════════════════════════════════════════════════ */
-static void stream_mfcc(int n_frames_expected)
+/* Run on-device inference on the normalized feature store for the active
+ * organ and report the result over BLE.
+ *
+ *   heart -> "INFER:HEART:<HR>\n"   (HR clipped [40,180])
+ *   lung  -> "INFER:LUNG:<RR>\n"    (RR clipped [6,50])
+ *   error -> "INFER:ERR:<rc>\n"
+ *
+ * The normalized features were filled by mfcc_frame_cb during capture.
+ * TFLM quantizes them with the model's own int8 input scale/zp. */
+/* [STAB FIX] True only while the two Invoke() calls run, so the main-loop
+ * keepalive keeps PINGing through the ~20-35 s inference window. */
+static atomic_t in_inference = ATOMIC_INIT(0);
+
+
+/* Run BOTH inferences on the shared arena (heart then lung) and report:
+ *   "INF:START\n" → "HR:<bpm>\n" → "RR:<bpm>\n" → "INF:DONE\n"
+ * Errors send "ERR:HEART_INF\n" / "ERR:LUNG_INF\n" in place of the value. */
+static void run_inference_and_report(void)
 {
-    const dsp_mfcc_config_t *cfg = active_config();
+    if (heart_frame_count < HEART_FRAMES || lung_frame_count < LUNG_FRAMES) {
+        LOG_WRN("frames: heart=%d/%d lung=%d/%d (inference may be degraded)",
+                heart_frame_count, HEART_FRAMES, lung_frame_count, LUNG_FRAMES);
+    }
+    LOG_INF("feat counts: heart=%u/%u lung=%u/%u",
+            (unsigned)heart_feat_count, (unsigned)HEART_FEAT_N,
+            (unsigned)lung_feat_count,  (unsigned)LUNG_FEAT_N);
 
-    char hdr[48];
-    int hl = snprintf(hdr, sizeof(hdr), "MFCC_START:%d:%d\n",
-                      n_frames_expected, cfg->n_mfcc);
-    ble_send_blocking(hdr, hl);
+    heart_result_t hr; lung_result_t rr;
+    char msg[48];
+
+    ble_send_blocking("INF:START\n", 10);
+    atomic_set(&in_inference, 1);
+
+    led_purple();
+    run_heart_inference_ram(tensor_arena, sizeof(tensor_arena),
+                            heart_features, HEART_FRAMES, HEART_NMFCC, &hr);
+
+    k_yield();   /* let the BLE stack breathe between the two Invokes */
+
+    led_cyan();
+    run_lung_inference_ram(tensor_arena, sizeof(tensor_arena),
+                           lung_features, LUNG_FRAMES, LUNG_NMFCC, &rr);
+
+    atomic_set(&in_inference, 0);
+
+    if (hr.rc == 0) {
+        int n = snprintf(msg, sizeof(msg), "HR:%.1f\n", (double)hr.value);
+        ble_send_blocking(msg, n);
+        LOG_INF("HR = %.1f BPM", (double)hr.value);
+    } else {
+        ble_send_blocking("ERR:HEART_INF\n", 14);
+        LOG_ERR("heart inference failed: %d", hr.rc);
+    }
     k_sleep(K_MSEC(20));
-
-    uint16_t payload = cfg->n_mfcc * sizeof(float);
-    uint8_t  pkt[CHUNK_HEADER_BYTES + MFCC_MAX_COEFFS * sizeof(float)];
-
-    int sent = 0;
-    for (int idx = 0; idx < n_frames_expected; idx++) {
-        sys_put_le16((uint16_t)idx, &pkt[0]);
-        sys_put_le16(payload,       &pkt[2]);
-        memcpy(&pkt[4], mfcc_store[idx], payload);
-        ble_send_blocking(pkt, CHUNK_HEADER_BYTES + payload);
-        sent++;
+    if (rr.rc == 0) {
+        int n = snprintf(msg, sizeof(msg), "RR:%.1f\n", (double)rr.value);
+        ble_send_blocking(msg, n);
+        LOG_INF("RR = %.1f BPM", (double)rr.value);
+    } else {
+        ble_send_blocking("ERR:LUNG_INF\n", 13);
+        LOG_ERR("lung inference failed: %d", rr.rc);
     }
 
-    k_sleep(K_MSEC(20));
-    ble_send_blocking("MFCC_END\n", 9);
-    LOG_INF("MFCC stream done: %d/%d frames (stored=%d)",
-            sent, n_frames_expected, mfcc_count);
+    ble_send_blocking("INF:DONE\n", 9);
+    LOG_INF("arena high-water = %u B", (unsigned)g_tflm_arena_used_bytes);
 }
-
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM (everything in the MAIN thread)
  * ══════════════════════════════════════════════════════════════════ */
+
+/* B5: re-request the fast connection interval (12–24 = 15–30 ms).
+ * Called at the start of each recording; the central may have widened
+ * the interval while idle to save power. */
+static void request_fast_link(void)
+{
+    if (!current_conn) return;
+    static const struct bt_le_conn_param fast = {
+        .interval_min = 12, .interval_max = 24, .latency = 0,
+        .timeout = BLE_SUPERVISION_TIMEOUT,
+    };
+    int e = bt_conn_le_param_update(current_conn, &fast);
+    if (e) LOG_WRN("fast-link request: %d", e);
+}
+
+ #if DEBUG_INJECT_BUFFER
+/* Inject a known heartbeat buffer through the SAME pipelines the live
+ * capture uses (no SAADC). Confirms MFCC + normalize + quantize + TFLM
+ * end-to-end on hardware. Expected HR ≈ 85–90 BPM for the bundled clip. */
+static void run_injected_test(void)
+{
+    heart_feat_count = lung_feat_count = 0;
+    heart_frame_count = lung_frame_count = 0;
+    memset(heart_features, 0, sizeof(heart_features));
+    memset(lung_features,  0, sizeof(lung_features));
+    dsp_mfcc_reset(&heart_pipeline);
+    dsp_mfcc_reset(&lung_pipeline);
+    dc_estimate = 2048;
+    tx_seq = 0;
+ 
+    char hdr[40];
+    snprintf(hdr, sizeof(hdr), "START:%u:DEBUG\n", (uint32_t)(DEBUG_AUDIO_LEN * 2));
+    ble_send_blocking(hdr, strlen(hdr));
+    k_sleep(K_MSEC(10));
+    LOG_INF("INJECT TEST: feeding %u known samples (expect HR~85-90)",
+            (unsigned)DEBUG_AUDIO_LEN);
+ 
+    led_cyan();
+    uint32_t done = 0;
+    while (done < DEBUG_AUDIO_LEN) {
+        uint32_t use = (DEBUG_AUDIO_LEN - done < HALF_BUF_SAMPLES)
+                       ? (DEBUG_AUDIO_LEN - done) : HALF_BUF_SAMPLES;
+        int16_t *chunk = (int16_t *)&debug_audio_pcm[done];   /* flash, read-only */
+        dsp_mfcc_feed_chunk(&heart_pipeline, chunk, (int)use);
+        dsp_mfcc_feed_chunk(&lung_pipeline,  chunk, (int)use);
+        send_audio_block(chunk, use);   /* stream so the host can verify the clip */
+        done += use;
+    }
+ 
+    ble_send_blocking("finished\n", 9);
+    LOG_INF("INJECT TEST: frames h=%d l=%d", heart_frame_count, lung_frame_count);
+    run_inference_and_report();
+    led_green();
+}
+#endif
+
+
 static void record_and_stream(void)
 {
-    const dsp_mfcc_config_t *cfg = active_config();
+    /* B6: re-assert fast interval + push a warm-up burst so the link is
+     * fast before audio streaming starts (~400 ms). Must run BEFORE the
+     * resets below so nothing is clobbered. "PING" is ignored by the host. */
+    request_fast_link();
+    for (int i = 0; i < 8; i++) {
+        bt_nus_send(NULL, "PING\n", 5);
+        k_sleep(K_MSEC(50));
+    }
 
-    /* FIX C: reset all per-recording state */
-    dc_estimate    = 2048;
-    tx_seq         = 0;
+    /* Reset all per-recording state (FIX C). */
+    dc_estimate      = 2048;
+    tx_seq           = 0;
     stage_wr = stage_rd = 0;
-    stage_overruns = 0;
-    mfcc_count     = 0;
+    stage_overruns   = 0;
+    heart_feat_count = lung_feat_count = 0;
+    heart_frame_count = lung_frame_count = 0;
+    memset(heart_features, 0, sizeof(heart_features));
+    memset(lung_features,  0, sizeof(lung_features));
     k_sem_reset(&stage_sem);
 
-    if (dsp_mfcc_init(&s_pipeline, cfg) != 0) {
-        LOG_ERR("dsp_mfcc_init failed");
-        ble_send_blocking("ERR:DSP", 7);
-        return;
-    }
-    s_pipeline.window = s_window;
-    dsp_mfcc_reset(&s_pipeline);
-    dsp_mfcc_set_callback(&s_pipeline, mfcc_frame_cb, NULL);
+    /* Reset both persistent pipelines (clears bandpass state, window, phase). */
+    dsp_mfcc_reset(&heart_pipeline);
+    dsp_mfcc_reset(&lung_pipeline);
 
     char hdr[40];
-    snprintf(hdr, sizeof(hdr), "START:%u:%s\n", (uint32_t)TOTAL_AUDIO_BYTES,
-             active_organ == ORGAN_LUNG ? "LUNG" : "HEART");
+    snprintf(hdr, sizeof(hdr), "START:%u:DUAL\n", (uint32_t)TOTAL_AUDIO_BYTES);
     ble_send_blocking(hdr, strlen(hdr));
     k_sleep(K_MSEC(10));
 
@@ -465,13 +678,13 @@ static void record_and_stream(void)
         return;
     }
 
-    LOG_INF("Recording %d s @ %d Hz (organ=%s)", DURATION_S, SAMPLING_RATE,
-            active_organ == ORGAN_LUNG ? "LUNG" : "HEART");
+    LOG_INF("Recording %d s @ %d Hz (heart + lung)", DURATION_S, SAMPLING_RATE);
 
-    /* Drain staged buffers in the main thread until we've handled
-     * exactly TOTAL_AUDIO_SAMPLES samples (sample-accurate: the last
-     * partial chunk sends only its remaining bytes, and feeds the MFCC
-     * pipeline exactly 80 000 samples so it emits exactly n_frames). */
+    /* Drain staged buffers in the main thread until exactly
+     * TOTAL_AUDIO_SAMPLES are handled. Each chunk is fed to BOTH pipelines
+     * sequentially (shared FFT scratch is safe), then the DC-removed copy
+     * is streamed for the host WAV. The last partial chunk feeds only its
+     * remaining samples so each pipeline emits exactly its n_frames. */
     uint32_t samples_done = 0;
     bool     ok = true;
 
@@ -488,10 +701,11 @@ static void record_and_stream(void)
         uint32_t remain = TOTAL_AUDIO_SAMPLES - samples_done;
         uint32_t use    = (avail < remain) ? avail : remain;
 
-        /* MFCC path — RAW samples (matches training) */
-        dsp_mfcc_feed_chunk(&s_pipeline, raw, (int)use);
+        /* MFCC paths — RAW samples (matches training); heart then lung. */
+        dsp_mfcc_feed_chunk(&heart_pipeline, raw, (int)use);
+        dsp_mfcc_feed_chunk(&lung_pipeline,  raw, (int)use);
 
-        /* Listening path — DC-removed audio over BLE */
+        /* Listening path — DC-removed audio over BLE (host builds the WAV). */
         send_audio_block(raw, use);
 
         samples_done += use;
@@ -502,22 +716,20 @@ static void record_and_stream(void)
     analog_recording = false;
 
     ble_send_blocking("finished\n", 9);
-    LOG_INF("Audio done: %u samples, overruns=%u, mfcc_frames=%d",
-            samples_done, stage_overruns, mfcc_count);
+    LOG_INF("Audio done: %u samples, overruns=%u, frames h=%d l=%d",
+            samples_done, stage_overruns, heart_frame_count, lung_frame_count);
 
     if (!ok) {
         led_red();
         return;
     }
 
-    /* MFCC: every frame was stored by index during capture. */
-    led_purple();
-    stream_mfcc(cfg->n_frames_expected);
+    /* One capture → both inferences on the shared arena. */
+    run_inference_and_report();
 
     led_green();
     LOG_INF("record_and_stream complete.");
 }
-
 /* ══════════════════════════════════════════════════════════════════
  * MAIN
  * ══════════════════════════════════════════════════════════════════ */
@@ -542,14 +754,73 @@ int main(void)
                           sd_adv, ARRAY_SIZE(sd_adv));
     if (err) { LOG_ERR("adv_start: %d", err); return err; }
 
-    led_red();
-    LOG_INF("AcoustEEEcare v8.1 ready — BLE-to-MFCC (single-threaded)");
+    /* Build both persistent pipelines once and bind their windows + callbacks. */
+    if (dsp_mfcc_init(&heart_pipeline, &heart_mfcc_config) != 0) {
+        LOG_ERR("heart dsp_mfcc_init failed"); return -1;
+    }
+    heart_pipeline.window = heart_window;
+    dsp_mfcc_set_callback(&heart_pipeline, heart_frame_cb, NULL);
 
+    if (dsp_mfcc_init(&lung_pipeline, &lung_mfcc_config) != 0) {
+        LOG_ERR("lung dsp_mfcc_init failed"); return -1;
+    }
+    lung_pipeline.window = lung_window;
+    dsp_mfcc_set_callback(&lung_pipeline, lung_frame_cb, NULL);
+
+    /* Probe each model's int8 input scale/zp once, so the in-callback
+     * quantization always matches the loaded model (no hardcoded drift).
+     * Verified values remain as the fallback if a probe fails. */
+    {
+        float sc; int32_t zp;
+        if (tflm_get_input_quant(0 /*heart*/, tensor_arena, sizeof(tensor_arena),
+                                 &sc, &zp) == 0) {
+            heart_q_scale = sc; heart_q_zp = zp;
+        } else {
+            LOG_WRN("heart quant probe failed — using fallback %.6f/%d",
+                    (double)heart_q_scale, (int)heart_q_zp);
+        }
+        if (tflm_get_input_quant(1 /*lung*/, tensor_arena, sizeof(tensor_arena),
+                                 &sc, &zp) == 0) {
+            lung_q_scale = sc; lung_q_zp = zp;
+        } else {
+            LOG_WRN("lung quant probe failed — using fallback %.6f/%d",
+                    (double)lung_q_scale, (int)lung_q_zp);
+        }
+        LOG_INF("quant: heart %.6f/%d  lung %.6f/%d",
+                (double)heart_q_scale, (int)heart_q_zp,
+                (double)lung_q_scale,  (int)lung_q_zp);
+    }
+
+    led_red();
+    LOG_INF("AcoustEEEcare v8.4 ready — one-capture dual inference");
+
+    uint32_t last_ping = 0;
     while (true) {
         k_sleep(K_MSEC(100));
+
         if (is_connected && mtu_exchanged && start_recording && !analog_recording) {
             start_recording = false;
             record_and_stream();
+        }
+
+#if DEBUG_INJECT_BUFFER
+        if (is_connected && mtu_exchanged && start_test && !analog_recording) {
+            start_test = false;
+            run_injected_test();
+        }
+#endif
+
+        /* Keepalive: PING every PING_INTERVAL_MS when connected and not
+         * actively capturing. Also fires in the gaps around the two Invokes
+         * (in_inference) to defend the supervision timer. A single blocking
+         * Invoke can't be interrupted to PING, which is why the supervision
+         * timeout is set to cover a full inference. */
+        if (is_connected && (!analog_recording || atomic_get(&in_inference))) {
+            uint32_t now = k_uptime_get_32();
+            if (now - last_ping > PING_INTERVAL_MS) {
+                bt_nus_send(NULL, "PING\n", 5);
+                last_ping = now;
+            }
         }
     }
     return 0;
@@ -565,6 +836,17 @@ int main(void)
  *   Ops: CONV_2D, RESHAPE, PAD, FULLY_CONNECTED.
  *   Quantize:  q = round(mfcc / scale) + zp, clamp [-128,127]
  *   Dequant :  rr = (out - zp) * scale
- *   Input layout frame-major: mfcc_store[idx][coeff] maps directly.
+ *   Input layout frame-major: features[frame*n_mfcc + coeff], int8.
+ *
+ * BOTH HR AND RR FROM ONE CAPTURE — why it is not done here:
+ *   Heart and lung use DIFFERENT MFCC front-ends (heart: /4 -> 2 kHz,
+ *   10-200 Hz bandpass, 665x25; lung: /2 -> 4 kHz, 100-1000 Hz, 324x26),
+ *   and dsp_mfcc.c uses ONE shared FFT scratch, so the two pipelines
+ *   cannot run concurrently. Doing both from a single capture would mean
+ *   buffering all 160 KB of 8 kHz audio and processing it twice; that
+ *   160 KB plus the ~80 KB arena does not fit alongside the BLE stack on
+ *   the nRF52840 (256 KB). The previous SD-card build (v7.5) buffered
+ *   audio.pcm to SD precisely to enable both. BLE-only -> one organ per
+ *   recording (HEART then LUNG). If both-in-one is required, add SD back.
  * ==================================================================
  */

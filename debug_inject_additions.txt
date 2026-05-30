@@ -1,0 +1,92 @@
+══════════════════════════════════════════════════════════════════════
+ main.c ADDITIONS for the injection self-test (v8.4 → v8.5-debug)
+ Expected result on hardware: HR ≈ 85–90 BPM (PC reference 86.9 / 88.2).
+══════════════════════════════════════════════════════════════════════
+
+── 1. Near the top, with the other compile flags ────────────────────
+#define DEBUG_INJECT_BUFFER  1     /* 1 = enable the "TEST" self-test   */
+
+#if DEBUG_INJECT_BUFFER
+#include "debug_audio.h"           /* const int16_t debug_audio_pcm[80000] @ 8 kHz */
+#endif
+
+── 2. With the other volatile flags (near start_recording) ──────────
+static volatile bool start_test = false;
+
+── 3. In received(), add a branch (alongside "REC") ─────────────────
+    if (len == 3 && memcmp(data, "REC", 3) == 0) {
+        start_recording = true;
+    }
+#if DEBUG_INJECT_BUFFER
+    else if (len == 4 && memcmp(data, "TEST", 4) == 0) {
+        start_test = true;
+    }
+#endif
+
+── 4. Add this function just ABOVE record_and_stream() ──────────────
+#if DEBUG_INJECT_BUFFER
+/* Inject a known heartbeat buffer through the SAME pipelines the live
+ * capture uses (no SAADC). Confirms MFCC + normalize + quantize + TFLM
+ * end-to-end on hardware. Expected HR ≈ 85–90 BPM for the bundled clip. */
+static void run_injected_test(void)
+{
+    heart_feat_count = lung_feat_count = 0;
+    heart_frame_count = lung_frame_count = 0;
+    memset(heart_features, 0, sizeof(heart_features));
+    memset(lung_features,  0, sizeof(lung_features));
+    dsp_mfcc_reset(&heart_pipeline);
+    dsp_mfcc_reset(&lung_pipeline);
+    dc_estimate = 2048;
+    tx_seq = 0;
+
+    char hdr[40];
+    snprintf(hdr, sizeof(hdr), "START:%u:DEBUG\n", (uint32_t)(DEBUG_AUDIO_LEN * 2));
+    ble_send_blocking(hdr, strlen(hdr));
+    k_sleep(K_MSEC(10));
+    LOG_INF("INJECT TEST: feeding %u known samples (expect HR~85-90)",
+            (unsigned)DEBUG_AUDIO_LEN);
+
+    led_cyan();
+    uint32_t done = 0;
+    while (done < DEBUG_AUDIO_LEN) {
+        uint32_t use = (DEBUG_AUDIO_LEN - done < HALF_BUF_SAMPLES)
+                       ? (DEBUG_AUDIO_LEN - done) : HALF_BUF_SAMPLES;
+        int16_t *chunk = (int16_t *)&debug_audio_pcm[done];   /* flash, read-only */
+        dsp_mfcc_feed_chunk(&heart_pipeline, chunk, (int)use);
+        dsp_mfcc_feed_chunk(&lung_pipeline,  chunk, (int)use);
+        send_audio_block(chunk, use);   /* stream so the host can verify the clip */
+        done += use;
+    }
+
+    ble_send_blocking("finished\n", 9);
+    LOG_INF("INJECT TEST: frames h=%d l=%d", heart_frame_count, lung_frame_count);
+    run_inference_and_report();
+    led_green();
+}
+#endif
+
+── 5. In main()'s while(true) loop, add after the REC check ─────────
+#if DEBUG_INJECT_BUFFER
+        if (is_connected && mtu_exchanged && start_test && !analog_recording) {
+            start_test = false;
+            run_injected_test();
+        }
+#endif
+
+── 6. Trigger it from the host ──────────────────────────────────────
+  • receiver: at the prompt, the device responds to a "TEST" NUS write.
+    Quick way: temporarily send b"TEST" instead of b"REC", OR add a 't'
+    command to receiver_v84.py:
+        elif cmd == "t":
+            await client.write_gatt_char(NUS_RX_CHAR_UUID, b"TEST", response=False)
+            ... then reuse the same _wait_for_completion / _save_session path.
+
+  • Or, for the very simplest check, just watch the SERIAL log after
+    sending TEST — you'll see "heart: HR = 8x.x BPM".
+
+── Flash note ───────────────────────────────────────────────────────
+  debug_audio.h adds ~160 KB of .rodata (80000 int16 in flash). With the
+  models (~50 KB) and lung MFCC tables (~114 KB) this should still fit in
+  the nRF52840's 1 MB. If the build overflows flash, regenerate the buffer
+  at 4 kHz and upsample x2 on-device (halves it to ~80 KB) — ask and I'll
+  provide that variant. Set DEBUG_INJECT_BUFFER 0 to remove it for release.

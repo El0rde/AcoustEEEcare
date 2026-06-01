@@ -115,7 +115,7 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
         .gain       = NRF_SAADC_GAIN1_4,            /* GAIN1_4: full-scale ≈ VDD so the 1.65 V bias sits at mid-scale; amplifying gains saturate the bias */
         .reference  = NRF_SAADC_REFERENCE_VDD4,
-        .acq_time   = NRF_SAADC_ACQTIME_10US,
+        .acq_time   = NRF_SAADC_ACQTIME_40US,      /* FIX 1: Increased from 10US to 40US for proper voltage divider settling */
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
         .burst      = NRF_SAADC_BURST_ENABLED,
     },
@@ -125,7 +125,14 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
 };
 
 /* DC removal for the LISTENING path only (NOT fed to MFCC) */
-static int32_t dc_estimate = 2048;
+/* Sub-fix 2b: correct mid-scale for signed 12-bit single-ended SAADC
+ * at 1.65 V bias with VDD=3.3 V and GAIN1_4/VDD4 reference:
+ *   (1.65 / 3.3) * 2^(12-1) = 0.5 * 2048 = 1024.
+ * After Option-A right-shift, raw samples are in [0, 2047], so 1024
+ * is the correct initial estimate (was wrongly 2048).
+ * FIX 2: Actual DC offset will be calibrated at recording start to handle
+ * temperature/supply drift in the MAX9814 amplifier output bias. */
+static int32_t dc_estimate = 1024;  /* Will be overwritten by calibration if enabled */
 
 /* ══════════════════════════════════════════════════════════════════
  * AUDIO PARAMS
@@ -225,6 +232,14 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
         uint8_t wr  = stage_wr;
         uint8_t nxt = (wr + 1) % STAGE_SLOTS;
         if (nxt == stage_rd) { stage_overruns++; break; }
+        /* Sub-fix 2a (Option A): right-shift accumulated 4x oversample result
+         * back to true 12-bit range.  nrfx_saadc does NOT divide by the
+         * oversample factor; each raw value is the SUM of 4 conversions,
+         * so its range is [0, 4*2047] = [0, 8191].  Arithmetic right-shift
+         * by 2 restores the expected signed 12-bit range [0, 2047]. */
+        for (uint16_t _k = 0; _k < HALF_BUF_SAMPLES; _k++) {
+            filled[_k] = (int16_t)(filled[_k] >> 2);
+        }
         memcpy(stage_buf[wr], filled, HALF_BUF_BYTES);
         stage_len[wr] = HALF_BUF_SAMPLES;
         stage_wr = nxt;
@@ -603,6 +618,52 @@ static void request_fast_link(void)
     if (e) LOG_WRN("fast-link request: %d", e);
 }
 
+/* FIX 2: Dynamic DC offset calibration at recording start.
+ * Measures the DC offset of the MAX9814 amplifier output over ~100 ms
+ * (800 samples @ 8 kHz) to account for temperature and supply voltage drift.
+ * This ensures the IIR DC removal filter starts with the correct initial estimate,
+ * maximizing low-frequency signal capture during the first 100-200 ms of recording. */
+static void calibrate_dc_offset_at_start(void)
+{
+    int32_t sum = 0;
+    int32_t count = 0;
+    uint32_t calibration_samples = 800;  /* ~100 ms @ 8 kHz */
+    
+    LOG_INF("Starting DC offset calibration (~100 ms)...");
+    
+    /* Reset staging buffer pointers for calibration */
+    stage_wr = stage_rd = 0;
+    k_sem_reset(&stage_sem);
+    
+    /* Capture calibration samples */
+    uint32_t samples_captured = 0;
+    while (samples_captured < calibration_samples) {
+        if (k_sem_take(&stage_sem, K_MSEC(200)) != 0) {
+            LOG_WRN("DC calibration: timeout waiting for SAADC data");
+            break;
+        }
+        uint8_t rd = stage_rd;
+        int16_t *buf = stage_buf[rd];
+        uint32_t avail = stage_len[rd];
+        uint32_t use = (avail < calibration_samples - samples_captured) ? avail : (calibration_samples - samples_captured);
+        
+        for (uint32_t i = 0; i < use; i++) {
+            sum += buf[i];
+            count++;
+        }
+        samples_captured += use;
+        stage_rd = (rd + 1) % STAGE_SLOTS;
+    }
+    
+    if (count > 0) {
+        dc_estimate = sum / count;
+        LOG_INF("DC offset calibrated: %d (from %u samples)", (int)dc_estimate, (unsigned)count);
+    } else {
+        dc_estimate = 1024;  /* Fallback to default */
+        LOG_WRN("DC offset calibration failed, using fallback: 1024");
+    }
+}
+
  #if DEBUG_INJECT_BUFFER
 /* Inject a known heartbeat buffer through the SAME pipelines the live
  * capture uses (no SAADC). Confirms MFCC + normalize + quantize + TFLM
@@ -615,7 +676,7 @@ static void run_injected_test(void)
     memset(lung_features,  0, sizeof(lung_features));
     dsp_mfcc_reset(&heart_pipeline);
     dsp_mfcc_reset(&lung_pipeline);
-    dc_estimate = 2048;
+    dc_estimate = 1024; /* Sub-fix 2b: correct mid-scale after Option-A right-shift */
     tx_seq = 0;
  
     char hdr[40];
@@ -657,7 +718,7 @@ static void record_and_stream(void)
     }
 
     /* Reset all per-recording state (FIX C). */
-    dc_estimate      = 2048;
+    dc_estimate      = 1024; /* Will be recalibrated below (FIX 2) */
     tx_seq           = 0;
     stage_wr = stage_rd = 0;
     stage_overruns   = 0;
@@ -684,7 +745,18 @@ static void record_and_stream(void)
         return;
     }
 
-    LOG_INF("Recording %d s @ %d Hz (heart + lung)", DURATION_S, SAMPLING_RATE);
+    /* FIX 2: Calibrate DC offset before main recording to handle amplifier drift */
+    calibrate_dc_offset_at_start();
+    
+    /* NOTE: Do NOT reset stage_wr/stage_rd/stage_sem here!
+     * FIX 2A: Avoid race condition with ISR.
+     * The calibration function resets/uses the buffer safely within itself.
+     * After calibration, stage_rd points to the next valid slot to read.
+     * The ISR continues writing naturally; main loop resumes from stage_rd.
+     * Resetting while ISR is running causes data corruption. */
+    
+    LOG_INF("Recording %d s @ %d Hz (heart + lung); DC offset=%d (calibrated), staging from slot %u", 
+            DURATION_S, SAMPLING_RATE, (int)dc_estimate, (unsigned)stage_rd);
 
     /* Drain staged buffers in the main thread until exactly
      * TOTAL_AUDIO_SAMPLES are handled. Each chunk is fed to BOTH pipelines

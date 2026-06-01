@@ -49,7 +49,7 @@ from scipy.fft import fft, fftfreq
 # ▼▼▼  EDIT THESE SETTINGS  ▼▼▼
 # ══════════════════════════════════════════════════════════════
 
-RECORDINGS_DIR = r"D:\zephyrdev\AcoustEEEcare\recording_v84_oversampled_gain1_4_10us_battery_thin_silicon_2"
+RECORDINGS_DIR = r"D:\zephyrdev\AcoustEEEcare\recording_v84_oversampled_testing_1"
 
 WAV_FILE = None
 

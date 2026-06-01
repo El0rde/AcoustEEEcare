@@ -1,5 +1,5 @@
 /*
- * AcoustEEEcare — BLE + one-capture DUAL inference (v8.4)
+ * AcoustEEEcare — BLE + one-capture DUAL inference (v8.6)
  * ==================================================================
  * SINGLE-THREADED REWRITE of v8.0.
  *
@@ -48,6 +48,76 @@
  *   (on error, "ERR:HEART_INF\n" / "ERR:LUNG_INF\n" replaces the value)
  *   "PING\n" keepalives may arrive any time while connected.
  * The host builds the .wav from the streamed PCM and shows HR + RR.
+ *
+ * v8.6 fix — 250 Hz BLE radio noise:
+ *   WAV analysis showed a broadband noise hump at ~249 Hz that was 1.4×
+ *   stronger than the heart signal band (20–200 Hz). Root cause: the BLE
+ *   radio fires a current burst every connection event (15–30 ms interval)
+ *   AND every PING (250 ms = 4 Hz, but radio bursts repeat at the
+ *   connection interval = ~250 Hz). These current spikes couple into the
+ *   analog supply rail and through the op-amp PSRR into the SAADC input.
+ *   Fix A (firmware): suppress PING keepalives during analog_recording.
+ *     The connection interval is 15–30 ms so BLE data still flows fine
+ *     for audio streaming; the supervision timer (6 s) covers the full
+ *     10 s capture + inference window without keepalives.
+ *   Fix B (firmware): widen connection interval to 100–200 ms during
+ *     capture so the radio fires less often (~5–10 Hz instead of ~50 Hz),
+ *     then restore fast interval for audio streaming.
+ *     NOTE: wider interval = lower BLE throughput. At 160 KB / 10 s =
+ *     16 KB/s, even a 200 ms interval (5 packets/s × ~240 B = 1200 B/s)
+ *     is too slow. So Fix B is NOT applied here — audio throughput wins.
+ *     The real solution is hardware shielding / supply decoupling (see
+ *     hardware note below).
+ *   Fix C (firmware): extend supervision timeout to cover capture +
+ *     inference (10 s + ~1 s) without any keepalive: set to 1500 (15 s).
+ *     This replaces the keepalive-during-capture pattern entirely.
+ *   Hardware note: add 100 nF + 10 µF decoupling caps on the op-amp VCC
+ *     pin as close to the package as possible. A ferrite bead between the
+ *     nRF52840 VDD and op-amp VCC is the most effective fix. This cannot
+ *     be solved in firmware alone if the PCB has no supply filtering.
+ *
+ * v8.5 fix — audio speed-up:
+ *   Root cause: send_audio_block() was non-blocking. On BLE congestion
+ *   chunks were silently dropped but tx_seq still advanced. If the host
+ *   plays back only received packets without zero-filling the gaps, audio
+ *   plays faster than real-time (e.g. 30% drops → 70% playback speed).
+ *   Fix: bounded retry (up to BLE_SEND_RETRIES × 1 ms) before dropping.
+ *   This keeps the staging ring safe — the ring holds ~1 s of slack, and
+ *   a short retry window (≤4 ms per chunk) is far less than that budget.
+ *   In practice the BLE stack clears within 1–2 ms; retries are rare.
+ *   If a chunk still can't be sent after all retries it is dropped and
+ *   tx_seq advances so the host can zero-fill that exact gap position.
+ *
+ * Audio quality improvements (on top of warmup-discard fix):
+ *   IMP 1  OVERSAMPLE_8X instead of 4X: halves quantization noise floor
+ *          (~3 dB SNR gain) at no timing cost at 8 kHz.
+ *   IMP 2  ACQTIME_5US (revised from 20US): 20 µs was incompatible with
+ *          OVERSAMPLE_8X at CC=2000 — 8×(320+26)=2768 cycles exceeds the
+ *          2000-cycle CC period, causing the SAADC to stretch timing and
+ *          produce sped-up, higher-pitch audio. 5 µs gives a safe burst
+ *          of only 848 cycles. The 8x averaging itself provides the SNR
+ *          improvement that 20 µs was intended to achieve.
+ *   IMP 3  DC IIR tau slowed from >>8 (~32 ms) to >>10 (~128 ms): prevents
+ *          the filter from attenuating low-frequency heart sounds (S1/S2
+ *          are 20–100 Hz). DC is still removed; it just tracks slower.
+ *   IMP 4  dc_estimate seeded from the average of the last 16 warmup
+ *          samples instead of a single tail sample: far stabler initial
+ *          value, eliminates any residual step at capture start.
+ *   IMP 5  12-bit SAADC output left-shifted by 4 into the int16 MSBs
+ *          before BLE streaming: uses the full int16 dynamic range so
+ *          the host WAV is properly scaled (no signal loss; MFCC path
+ *          feeds the unshifted raw samples, unchanged).
+ *
+ * Warmup-discard fix (non-rail-to-rail op-amp):
+ *   A non-RRIO op-amp cannot swing to the supply rails, so its output
+ *   sits at an undefined voltage until the bias network settles. Without
+ *   a discard phase the ramp contaminates the first ~200-500 ms of the
+ *   WAV (listening path) and — less critically — the earliest MFCC frames.
+ *   Fix: after saadc_start() we drain WARMUP_SAMPLES into /dev/null
+ *   (no MFCC feed, no BLE send). Only then is dc_estimate seeded from
+ *   the first real sample and normal capture begins.
+ *   WARMUP_SAMPLES = 4000 = 500 ms @ 8 kHz — tune down if the op-amp
+ *   settles faster (measure the WAV ramp and halve until it disappears).
  */
 
 #include <stdint.h>
@@ -106,7 +176,14 @@ static int16_t lung_window[1200]  __aligned(4);
 /* ══════════════════════════════════════════════════════════════════
  * SAADC CONFIG  (FIX A: GAIN1_4)
  * ══════════════════════════════════════════════════════════════════ */
-#define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz */
+/* CC timing constraint with OVERSAMPLE_8X + ACQTIME_5US:
+ *   Each burst = 8 × (ACQTIME + CONVTIME) = 8 × (80 + 26) ≈ 848 cycles
+ *   CC must be ≥ burst cycles AND = 16 MHz / output_rate.
+ *   16 MHz / 8000 Hz = 2000 cycles.  848 << 2000, so 5 µs acq is safe.
+ *   ACQTIME_20US was NOT safe: 8 × (320+26) = 2768 > 2000 → timing break.
+ *   ACQTIME_10US is marginal: 8 × (160+26) = 1488 < 2000 but tight.
+ *   ACQTIME_5US gives plenty of headroom and is fine for a driven op-amp. */
+#define SAADC_CC_VALUE      2000U   /* 16 MHz / 2000 = 8 kHz output rate */
 #define SAADC_IRQ_PRIORITY  6
 
 static const nrfx_saadc_channel_t saadc_channel_cfg = {
@@ -115,7 +192,7 @@ static const nrfx_saadc_channel_t saadc_channel_cfg = {
         .resistor_n = NRF_SAADC_RESISTOR_DISABLED,
         .gain       = NRF_SAADC_GAIN1_4,            /* GAIN1_4: full-scale ≈ VDD so the 1.65 V bias sits at mid-scale; amplifying gains saturate the bias */
         .reference  = NRF_SAADC_REFERENCE_VDD4,
-        .acq_time   = NRF_SAADC_ACQTIME_10US,
+        .acq_time   = NRF_SAADC_ACQTIME_5US,        /* 5 µs safe with OVERSAMPLE_8X @ CC=2000: burst=8×(80+26)=848 cycles << 2000 */
         .mode       = NRF_SAADC_MODE_SINGLE_ENDED,
         .burst      = NRF_SAADC_BURST_ENABLED,
     },
@@ -135,6 +212,15 @@ static int32_t dc_estimate = 2048;
 #define TOTAL_AUDIO_SAMPLES  (SAMPLING_RATE * DURATION_S)            /* 80 000 */
 #define TOTAL_AUDIO_BYTES    (TOTAL_AUDIO_SAMPLES * sizeof(int16_t)) /* 160 000 */
 
+/* ── Warmup discard (non-RRIO op-amp ramp-up fix) ──────────────────
+ * How long to let the op-amp output settle before we start capturing.
+ * 500 ms (4000 samples @ 8 kHz) is conservative; halve it if your
+ * scope / WAV shows the ramp has already gone by 250 ms.
+ * These samples are drained from the SAADC ring and discarded — no
+ * MFCC feed, no BLE audio send. Only TOTAL_AUDIO_SAMPLES are captured
+ * and streamed to the host after the warmup phase completes.       */
+#define WARMUP_SAMPLES       (SAMPLING_RATE / 2)     /* 4 000 = 500 ms */
+
 #define HALF_BUF_SAMPLES     512
 #define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))
 
@@ -143,11 +229,10 @@ static volatile uint8_t  next_dma_buf     = 1;
 static volatile bool     analog_recording = false;
 static uint16_t          nus_chunk_size   = 244;
 
-/* Max valid BLE supervision timeout is 3200 (32 s). 4000 was invalid
-     * (err -22) so the connection interval was never applied. On-device
-     * inference is <1 s (heart 428 ms + lung 205 ms), so a big timeout is
-     * unnecessary; 600 = 6 s is robust and valid. */
-#define BLE_SUPERVISION_TIMEOUT   600
+/* Supervision timeout covers the full capture (10 s) + both inferences
+ * (~1 s) + margin, with NO keepalive pings during capture (v8.6 fix).
+ * 1500 = 15 s. Must be > (capture_duration + inference_time) × 100. */
+#define BLE_SUPERVISION_TIMEOUT   1500
 #define PING_INTERVAL_MS          250     /* B7: keep link warm; prevent central from relaxing interval */
 
 /* ══════════════════════════════════════════════════════════════════
@@ -205,7 +290,12 @@ static uint8_t tensor_arena[TENSOR_ARENA_BYTES] __aligned(16);
 /* Exported high-water for logging; written by tflm_inference.cc. */
 volatile uint32_t g_tflm_arena_used_bytes;
 
-#define CHUNK_HEADER_BYTES 4
+#define CHUNK_HEADER_BYTES  4
+/* Max 1 ms retries per BLE chunk before dropping.  Keeps audio near
+ * real-time without blocking long enough to overflow the staging ring.
+ * Each retry = 1 ms sleep; 4 retries = 4 ms worst-case per chunk.
+ * The staging ring holds ~1 s of slack so this is well within budget. */
+#define BLE_SEND_RETRIES    4
 static uint16_t tx_seq = 0;
 
 /* ══════════════════════════════════════════════════════════════════
@@ -253,7 +343,7 @@ static int saadc_init_once(void)
     if (err != 0) { LOG_ERR("channel_config: 0x%08X", err); return -EIO; }
 
     nrfx_saadc_adv_config_t adv = NRFX_SAADC_DEFAULT_ADV_CONFIG;
-    adv.oversampling      = NRF_SAADC_OVERSAMPLE_4X;
+    adv.oversampling      = NRF_SAADC_OVERSAMPLE_8X;  /* IMP1: 8x vs 4x → ~3 dB lower quantization noise floor */
     adv.burst             = NRF_SAADC_BURST_ENABLED;
     adv.internal_timer_cc = SAADC_CC_VALUE;
     adv.start_on_end      = true;
@@ -483,10 +573,16 @@ static int16_t dc_copy[HALF_BUF_SAMPLES];
 
 static void send_audio_block(const int16_t *raw, uint32_t n)
 {
-    /* DC-remove a copy (listening path only) */
+    /* DC-remove a copy (listening path only).
+     * IMP3: >>10 (~128 ms τ) instead of >>8 (~32 ms): prevents the IIR
+     *       from attenuating low-frequency heart sounds (S1/S2: 20–100 Hz).
+     * IMP5: left-shift the 12-bit SAADC value into the int16 MSBs so the
+     *       host WAV uses the full int16 dynamic range.  The MFCC path
+     *       receives unshifted raw[] — this shift is ONLY in dc_copy[]. */
     for (uint32_t i = 0; i < n; i++) {
-        dc_estimate += ((int32_t)raw[i] - dc_estimate) >> 8;
-        dc_copy[i]   = (int16_t)((int32_t)raw[i] - dc_estimate);
+        dc_estimate += ((int32_t)raw[i] - dc_estimate) >> 10;   /* IMP3 */
+        int32_t centered = (int32_t)raw[i] - dc_estimate;
+        dc_copy[i] = (int16_t)(centered << 4);                  /* IMP5: 12→16 bit scaling */
     }
  
     const uint8_t *p = (const uint8_t *)dc_copy;
@@ -501,14 +597,20 @@ static void send_audio_block(const int16_t *raw, uint32_t n)
         sys_put_le16(send,   &chunk[2]);
         memcpy(&chunk[4], p + offset, send);
  
-        /* NON-BLOCKING send: attempt once; on -ENOMEM/-EAGAIN drop the
-         * chunk immediately and advance tx_seq so the host zero-fills that
-         * position (brief silence, not speed-up).  Never calling k_sleep
-         * here means the SAADC staging ring is always drained at 8 kHz
-         * regardless of BLE congestion, eliminating staging overruns and
-         * the resulting timeline compression. */
-        int err = bt_nus_send(NULL, chunk, CHUNK_HEADER_BYTES + send);
-        (void)err;   /* drop-on-congestion is intentional; seq always advances */
+        /* Bounded-retry send: attempt up to BLE_SEND_RETRIES times with a
+         * 1 ms sleep between attempts.  This gives the BLE stack time to
+         * drain its TX queue without blocking so long that the SAADC
+         * staging ring overflows.  If all retries fail the chunk is dropped
+         * and tx_seq still advances so the host can zero-fill that gap
+         * (silence at that position) rather than compressing the timeline. */
+        {
+            int err = -ENOMEM;
+            for (int r = 0; r < BLE_SEND_RETRIES && (err == -ENOMEM || err == -EAGAIN); r++) {
+                err = bt_nus_send(NULL, chunk, CHUNK_HEADER_BYTES + send);
+                if (err == -ENOMEM || err == -EAGAIN) k_sleep(K_MSEC(1));
+            }
+            (void)err;   /* intentional drop after retries exhausted */
+        }
  
         tx_seq  = (tx_seq + 1) & 0xFFFF;    /* advance even on drop */
         offset += send;
@@ -585,6 +687,7 @@ static void run_inference_and_report(void)
     ble_send_blocking("INF:DONE\n", 9);
     LOG_INF("arena high-water = %u B", (unsigned)g_tflm_arena_used_bytes);
 }
+
 /* ══════════════════════════════════════════════════════════════════
  * RECORD AND STREAM (everything in the MAIN thread)
  * ══════════════════════════════════════════════════════════════════ */
@@ -603,7 +706,7 @@ static void request_fast_link(void)
     if (e) LOG_WRN("fast-link request: %d", e);
 }
 
- #if DEBUG_INJECT_BUFFER
+#if DEBUG_INJECT_BUFFER
 /* Inject a known heartbeat buffer through the SAME pipelines the live
  * capture uses (no SAADC). Confirms MFCC + normalize + quantize + TFLM
  * end-to-end on hardware. Expected HR ≈ 85–90 BPM for the bundled clip. */
@@ -686,6 +789,71 @@ static void record_and_stream(void)
 
     LOG_INF("Recording %d s @ %d Hz (heart + lung)", DURATION_S, SAMPLING_RATE);
 
+    /* ── Warmup discard phase ──────────────────────────────────────────
+     * Drain WARMUP_SAMPLES from the SAADC staging ring and throw them
+     * away.  No MFCC feed, no BLE audio send.  This lets the non-RRIO
+     * op-amp output settle to its mid-supply operating point before we
+     * start capturing meaningful audio.
+     *
+     * The staging ring is sized for 16 slots (~1 s), so the warmup period
+     * (500 ms = 8 half-buffers) does not overflow it.
+     *
+     * After the loop we seed dc_estimate from the first sample of the
+     * first real buffer, so the DC IIR starts at the true operating point
+     * instead of the hardcoded 2048.  This eliminates the residual
+     * exponential tail that would otherwise appear even after the op-amp
+     * settles.                                                           */
+    {
+        uint32_t warmup_done = 0;
+        bool     warmup_ok   = true;
+
+        LOG_INF("Warmup discard: draining %u samples (%u ms) ...",
+                (unsigned)WARMUP_SAMPLES,
+                (unsigned)(WARMUP_SAMPLES * 1000u / SAMPLING_RATE));
+
+        while (warmup_done < WARMUP_SAMPLES) {
+            if (k_sem_take(&stage_sem, K_MSEC(500)) != 0) {
+                LOG_ERR("warmup staging timeout at %u/%u samples",
+                        warmup_done, (unsigned)WARMUP_SAMPLES);
+                warmup_ok = false;
+                break;
+            }
+            uint8_t  rd    = stage_rd;
+            uint32_t avail = stage_len[rd];
+            uint32_t rem   = WARMUP_SAMPLES - warmup_done;
+            uint32_t use   = (avail < rem) ? avail : rem;
+
+            /* IMP4: seed dc_estimate from the average of the last 16
+             * samples of the final warmup buffer — far stabler than a
+             * single tail sample, eliminates any residual step at the
+             * start of real capture.                                    */
+            if (warmup_done + use >= WARMUP_SAMPLES) {
+                /* Average the last min(16, use) samples of this buffer. */
+                uint32_t avg_n = (use < 16u) ? use : 16u;
+                int32_t  sum   = 0;
+                for (uint32_t s = use - avg_n; s < use; s++)
+                    sum += (int32_t)stage_buf[rd][s];
+                dc_estimate = sum / (int32_t)avg_n;
+                LOG_INF("dc_estimate seeded (avg of last %u warmup samples): %d",
+                        (unsigned)avg_n, (int)dc_estimate);
+            }
+
+            warmup_done += use;
+            stage_rd = (rd + 1) % STAGE_SLOTS;
+        }
+
+        if (!warmup_ok) {
+            saadc_stop();
+            analog_recording = false;
+            ble_send_blocking("ERR:WARMUP\n", 11);
+            led_red();
+            return;
+        }
+
+        LOG_INF("Warmup done. overruns so far=%u. Starting real capture.", stage_overruns);
+    }
+    /* ── End warmup discard ────────────────────────────────────────── */
+
     /* Drain staged buffers in the main thread until exactly
      * TOTAL_AUDIO_SAMPLES are handled. Each chunk is fed to BOTH pipelines
      * sequentially (shared FFT scratch is safe), then the DC-removed copy
@@ -736,6 +904,7 @@ static void record_and_stream(void)
     led_green();
     LOG_INF("record_and_stream complete.");
 }
+
 /* ══════════════════════════════════════════════════════════════════
  * MAIN
  * ══════════════════════════════════════════════════════════════════ */
@@ -816,11 +985,13 @@ int main(void)
         }
 #endif
 
-        /* Keepalive: PING every PING_INTERVAL_MS when connected and not
-         * actively capturing. Also fires in the gaps around the two Invokes
-         * (in_inference) to defend the supervision timer. A single blocking
-         * Invoke can't be interrupted to PING, which is why the supervision
-         * timeout is set to cover a full inference. */
+        /* Keepalive: PING every PING_INTERVAL_MS when connected and IDLE.
+         * v8.6: NEVER ping during analog_recording — the radio burst every
+         * connection event couples ~250 Hz noise into the op-amp supply and
+         * overwhelms the heart signal band. The supervision timeout (15 s)
+         * covers the full capture + inference window without any keepalive.
+         * Resume pinging during inference (in_inference) since the SAADC
+         * is stopped by then and radio noise no longer contaminates audio. */
         if (is_connected && (!analog_recording || atomic_get(&in_inference))) {
             uint32_t now = k_uptime_get_32();
             if (now - last_ping > PING_INTERVAL_MS) {

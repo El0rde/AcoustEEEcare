@@ -100,24 +100,19 @@
  *   IMP 3  DC IIR tau slowed from >>8 (~32 ms) to >>10 (~128 ms): prevents
  *          the filter from attenuating low-frequency heart sounds (S1/S2
  *          are 20–100 Hz). DC is still removed; it just tracks slower.
- *   IMP 4  dc_estimate seeded from the average of the last 16 warmup
- *          samples instead of a single tail sample: far stabler initial
- *          value, eliminates any residual step at capture start.
+ *   IMP 4  (removed — was warmup-buffer seed; no longer applicable with
+ *          RRIO op-amp; dc_estimate resets to 2048 and converges via IIR)
  *   IMP 5  12-bit SAADC output left-shifted by 4 into the int16 MSBs
  *          before BLE streaming: uses the full int16 dynamic range so
  *          the host WAV is properly scaled (no signal loss; MFCC path
  *          feeds the unshifted raw samples, unchanged).
  *
- * Warmup-discard fix (non-rail-to-rail op-amp):
- *   A non-RRIO op-amp cannot swing to the supply rails, so its output
- *   sits at an undefined voltage until the bias network settles. Without
- *   a discard phase the ramp contaminates the first ~200-500 ms of the
- *   WAV (listening path) and — less critically — the earliest MFCC frames.
- *   Fix: after saadc_start() we drain WARMUP_SAMPLES into /dev/null
- *   (no MFCC feed, no BLE send). Only then is dc_estimate seeded from
- *   the first real sample and normal capture begins.
- *   WARMUP_SAMPLES = 4000 = 500 ms @ 8 kHz — tune down if the op-amp
- *   settles faster (measure the WAV ramp and halve until it disappears).
+ * Warmup-discard fix (REMOVED — RRIO op-amp):
+ *   The original warmup discard was needed for a non-RRIO op-amp whose
+ *   output ramps from an undefined voltage to mid-supply over ~200–500 ms.
+ *   With a rail-to-rail op-amp the output settles within microseconds, so
+ *   the discard phase has been removed. The DC IIR (tau ~128 ms) will
+ *   converge to the true operating point within the first few frames.
  */
 
 #include <stdint.h>
@@ -212,15 +207,6 @@ static int32_t dc_estimate = 2048;
 #define TOTAL_AUDIO_SAMPLES  (SAMPLING_RATE * DURATION_S)            /* 80 000 */
 #define TOTAL_AUDIO_BYTES    (TOTAL_AUDIO_SAMPLES * sizeof(int16_t)) /* 160 000 */
 
-/* ── Warmup discard (non-RRIO op-amp ramp-up fix) ──────────────────
- * How long to let the op-amp output settle before we start capturing.
- * 500 ms (4000 samples @ 8 kHz) is conservative; halve it if your
- * scope / WAV shows the ramp has already gone by 250 ms.
- * These samples are drained from the SAADC ring and discarded — no
- * MFCC feed, no BLE audio send. Only TOTAL_AUDIO_SAMPLES are captured
- * and streamed to the host after the warmup phase completes.       */
-#define WARMUP_SAMPLES       (SAMPLING_RATE / 2)     /* 4 000 = 500 ms */
-
 #define HALF_BUF_SAMPLES     512
 #define HALF_BUF_BYTES       (HALF_BUF_SAMPLES * sizeof(int16_t))
 
@@ -239,9 +225,9 @@ static uint16_t          nus_chunk_size   = 244;
  * ISR -> MAIN STAGING RING
  *   The ISR copies each completed half-buffer into one of STAGE_SLOTS
  *   staging buffers and gives stage_sem. The MAIN thread drains them.
- *   8 slots = ~512 ms of slack, plenty to cover BLE send + FFT time.
+ *   16 slots = ~1 s of slack, plenty to cover BLE send + FFT time.
  * ══════════════════════════════════════════════════════════════════ */
-#define STAGE_SLOTS   16      /* ~1 s of slack (was 8 = 512 ms) */
+#define STAGE_SLOTS   16      /* ~1 s of slack */
 static int16_t  stage_buf[STAGE_SLOTS][HALF_BUF_SAMPLES];
 static uint16_t stage_len[STAGE_SLOTS];
 static volatile uint8_t stage_wr;
@@ -619,14 +605,14 @@ static void send_audio_block(const int16_t *raw, uint32_t n)
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * Stream all stored MFCC frames
+ * Run inference on stored MFCC features and report over BLE
  * ══════════════════════════════════════════════════════════════════ */
 /* Run on-device inference on the normalized feature store for the active
  * organ and report the result over BLE.
  *
- *   heart -> "INFER:HEART:<HR>\n"   (HR clipped [40,180])
- *   lung  -> "INFER:LUNG:<RR>\n"    (RR clipped [6,50])
- *   error -> "INFER:ERR:<rc>\n"
+ *   heart -> "HR:<bpm>\n"   (HR clipped [40,180])
+ *   lung  -> "RR:<bpm>\n"   (RR clipped [6,50])
+ *   error -> "ERR:HEART_INF\n" / "ERR:LUNG_INF\n"
  *
  * The normalized features were filled by mfcc_frame_cb during capture.
  * TFLM quantizes them with the model's own int8 input scale/zp. */
@@ -789,70 +775,10 @@ static void record_and_stream(void)
 
     LOG_INF("Recording %d s @ %d Hz (heart + lung)", DURATION_S, SAMPLING_RATE);
 
-    /* ── Warmup discard phase ──────────────────────────────────────────
-     * Drain WARMUP_SAMPLES from the SAADC staging ring and throw them
-     * away.  No MFCC feed, no BLE audio send.  This lets the non-RRIO
-     * op-amp output settle to its mid-supply operating point before we
-     * start capturing meaningful audio.
-     *
-     * The staging ring is sized for 16 slots (~1 s), so the warmup period
-     * (500 ms = 8 half-buffers) does not overflow it.
-     *
-     * After the loop we seed dc_estimate from the first sample of the
-     * first real buffer, so the DC IIR starts at the true operating point
-     * instead of the hardcoded 2048.  This eliminates the residual
-     * exponential tail that would otherwise appear even after the op-amp
-     * settles.                                                           */
-    {
-        uint32_t warmup_done = 0;
-        bool     warmup_ok   = true;
-
-        LOG_INF("Warmup discard: draining %u samples (%u ms) ...",
-                (unsigned)WARMUP_SAMPLES,
-                (unsigned)(WARMUP_SAMPLES * 1000u / SAMPLING_RATE));
-
-        while (warmup_done < WARMUP_SAMPLES) {
-            if (k_sem_take(&stage_sem, K_MSEC(500)) != 0) {
-                LOG_ERR("warmup staging timeout at %u/%u samples",
-                        warmup_done, (unsigned)WARMUP_SAMPLES);
-                warmup_ok = false;
-                break;
-            }
-            uint8_t  rd    = stage_rd;
-            uint32_t avail = stage_len[rd];
-            uint32_t rem   = WARMUP_SAMPLES - warmup_done;
-            uint32_t use   = (avail < rem) ? avail : rem;
-
-            /* IMP4: seed dc_estimate from the average of the last 16
-             * samples of the final warmup buffer — far stabler than a
-             * single tail sample, eliminates any residual step at the
-             * start of real capture.                                    */
-            if (warmup_done + use >= WARMUP_SAMPLES) {
-                /* Average the last min(16, use) samples of this buffer. */
-                uint32_t avg_n = (use < 16u) ? use : 16u;
-                int32_t  sum   = 0;
-                for (uint32_t s = use - avg_n; s < use; s++)
-                    sum += (int32_t)stage_buf[rd][s];
-                dc_estimate = sum / (int32_t)avg_n;
-                LOG_INF("dc_estimate seeded (avg of last %u warmup samples): %d",
-                        (unsigned)avg_n, (int)dc_estimate);
-            }
-
-            warmup_done += use;
-            stage_rd = (rd + 1) % STAGE_SLOTS;
-        }
-
-        if (!warmup_ok) {
-            saadc_stop();
-            analog_recording = false;
-            ble_send_blocking("ERR:WARMUP\n", 11);
-            led_red();
-            return;
-        }
-
-        LOG_INF("Warmup done. overruns so far=%u. Starting real capture.", stage_overruns);
-    }
-    /* ── End warmup discard ────────────────────────────────────────── */
+    /* dc_estimate was reset to 2048 above. With a RRIO op-amp the output
+     * settles to mid-supply within microseconds — no warmup discard needed.
+     * The IIR (>>10, ~128 ms τ) converges to the true DC level within the
+     * first few frames of real capture. */
 
     /* Drain staged buffers in the main thread until exactly
      * TOTAL_AUDIO_SAMPLES are handled. Each chunk is fed to BOTH pipelines
@@ -967,7 +893,7 @@ int main(void)
     }
 
     led_red();
-    LOG_INF("AcoustEEEcare v8.4 ready — one-capture dual inference");
+    LOG_INF("AcoustEEEcare v8.6 ready — one-capture dual inference (RRIO op-amp)");
 
     uint32_t last_ping = 0;
     while (true) {

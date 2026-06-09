@@ -1,5 +1,0 @@
-subject   : TEST123
-activity  : WALKING
-timestamp : 2026-06-01T02:53:13.402430
-HR_bpm    : 113.4
-RR_bpm    : 23.4

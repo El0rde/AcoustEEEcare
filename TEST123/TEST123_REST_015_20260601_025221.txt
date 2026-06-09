@@ -1,5 +1,0 @@
-subject   : TEST123
-activity  : REST
-timestamp : 2026-06-01T02:52:21.659111
-HR_bpm    : 117.2
-RR_bpm    : 23.0
